@@ -1,0 +1,131 @@
+# SkyGuard Configuration
+# https://github.com/skyguard/skyguard
+#
+# All services support an optional "enabled: false" flag to disable without removing.
+# Restart the container after any config change: docker compose restart
+
+general:
+  log_level: "info"       # debug | info | warn | error
+  data_dir: "/data"       # SQLite DB + GeoIP DB location
+
+# ── Stealth Services ──────────────────────────────────────────────────────────
+# Real services hidden behind a random port.
+# Nmap sees the port as "filtered". Only clients sending the correct
+# protocol signature within the timeout are forwarded to the real service.
+stealth_services:
+  - name: "ssh"
+    enabled: true                        # set false to disable without deleting
+    listen_port: 9911                    # public-facing port clients connect to
+    real_target: "127.0.0.1:22"         # where the real sshd listens
+    protocol_signature: "SSH-2.0-"      # first bytes a real SSH client sends
+    timeout: "5s"                        # drop connection if no matching data arrives
+    allowed_countries: []               # e.g. ["TR","US"] to restrict by GeoIP country
+
+# ── Honeypot Services ─────────────────────────────────────────────────────────
+# Fake services that log attacker activity and contribute to threat scoring.
+# Toggle individual honeypots with "enabled: true/false" + restart.
+honeypot_services:
+  - name: "fake-ssh"
+    enabled: true
+    port: 22
+    type: "ssh"
+    banner: "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"
+    max_auth_attempts: 3    # log N credential attempts then close connection
+    fake_shell: false       # true = give attackers a fake interactive shell
+
+  - name: "fake-ftp"
+    enabled: true
+    port: 21
+    type: "ftp"
+    banner: "ProFTPD 1.3.5e Server (Debian) ready."
+
+  - name: "fake-mysql"
+    enabled: true
+    port: 3306
+    type: "mysql"
+    banner: "5.7.42-0ubuntu0.18.04.1"   # MySQL version string shown in handshake
+
+  - name: "fake-http"
+    enabled: true
+    port: 80
+    type: "http"
+    server_header: "Apache/2.4.41 (Ubuntu)"
+
+  - name: "fake-http-alt"
+    enabled: false          # disabled by default — enable if you don't use 8080
+    port: 8080
+    type: "http"
+    server_header: "nginx/1.18.0"
+
+# ── Passthrough Services ──────────────────────────────────────────────────────
+# Analyse and log traffic, then forward to the real backend unchanged.
+passthrough_services:
+  - name: "web"
+    listen_port: 443
+    real_target: "127.0.0.1:8443"   # your actual HTTPS backend
+
+# ── Analysis ──────────────────────────────────────────────────────────────────
+analysis:
+  geoip:
+    enabled: false                        # requires GeoLite2-City.mmdb in data_dir
+    db_path: "/data/GeoLite2-City.mmdb"
+
+  rate_limit:
+    max_per_minute: 20
+    max_per_hour: 200
+
+  port_scan:
+    window: "60s"     # time window for counting distinct ports
+    threshold: 5      # distinct ports within window → flagged as port scan
+
+  auto_ban:
+    enabled: true
+    score_threshold: 50     # ban IP when its threat score reaches this value
+    ban_duration: "24h"     # e.g. "1h", "24h", "168h" (7 days), "0s" = permanent
+    method: "none"          # "none" | "iptables" | "ufw"
+
+    # Points added to an IP's threat score on each event
+    scoring:
+      honeypot_connection: 10
+      failed_credential: 15
+      port_scan_detected: 25
+      blacklisted_country: 5
+      rate_limit_exceeded: 20
+
+# ── Whitelist ─────────────────────────────────────────────────────────────────
+# These IPs are NEVER banned or rate-limited and bypass all checks.
+# Add your home/office IP here before enabling auto-ban.
+whitelist:
+  ips:
+    - "127.0.0.1"
+    - "::1"
+    # - "YOUR_HOME_IP"
+    # - "YOUR_OFFICE_IP"
+  countries: []  # e.g. ["TR"] to whitelist an entire country
+
+# ── Blacklist ─────────────────────────────────────────────────────────────────
+# Connections from these are dropped immediately. Use ISO 3166-1 alpha-2 codes.
+blacklist:
+  countries: []
+    # - "CN"
+    # - "RU"
+    # - "KP"
+  ips: []
+    # - "1.2.3.4"
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+# Always bind to 127.0.0.1 and access via SSH tunnel:
+#   ssh -L 9090:127.0.0.1:9090 user@your-server
+dashboard:
+  enabled: true
+  listen: "127.0.0.1:9090"
+  auth:
+    username: "admin"
+    password: "CHANGE_ME_NOW"   # use a strong password
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  database: "sqlite"
+  db_path: "/data/skyguard.db"
+  retention_days: 90      # delete records older than N days
+  log_first_bytes: 512    # capture first N bytes of each connection payload

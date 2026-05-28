@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  skyguard:
+    build: .
+    container_name: skyguard
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./data:/data
+      - ./configs/skyguard.yaml:/etc/skyguard/skyguard.yaml:ro
+    environment:
+      - SKYGUARD_CONFIG=/etc/skyguard/skyguard.yaml
+      - TZ=Europe/Istanbul
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9090"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

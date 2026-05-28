@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SkyGuard Dashboard</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --border:    #21262d;
+      --accent:    #58a6ff;
+      --green:     #3fb950;
+      --red:       #f85149;
+      --yellow:    #d29922;
+      --purple:    #bc8cff;
+      --text:      #c9d1d9;
+      --muted:     #8b949e;
+      --mono:      'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    }
+
+    html, body { height: 100%; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    /* ── Header ───────────────────────────────────── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      height: 52px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .logo svg { flex-shrink: 0; }
+
+    .header-meta {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .header-meta span { display: flex; align-items: center; gap: 6px; }
+
+    .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green);
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
+    }
+
+    /* ── Main layout ──────────────────────────────── */
+    main {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    /* ── Stat cards ───────────────────────────────── */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+    }
+
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      transition: border-color 0.2s;
+    }
+
+    .stat-card:hover { border-color: var(--accent); }
+
+    .stat-label {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .stat-value {
+      font-size: 32px;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .stat-card:nth-child(1) .stat-value { color: var(--accent); }
+    .stat-card:nth-child(2) .stat-value { color: var(--red); }
+    .stat-card:nth-child(3) .stat-value { color: var(--yellow); }
+    .stat-card:nth-child(4) .stat-value { color: var(--purple); }
+
+    .stat-sub {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    /* ── Section ──────────────────────────────────── */
+    .section-title {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .section-title::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+
+    /* ── Table card ───────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .card-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .card-title {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text);
+    }
+
+    .badge {
+      font-size: 10px;
+      padding: 2px 8px;
+      border-radius: 12px;
+      background: var(--border);
+      color: var(--muted);
+    }
+
+    /* ── Table ────────────────────────────────────── */
+    .table-wrap { overflow-x: auto; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    thead th {
+      padding: 8px 16px;
+      text-align: left;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      transition: background 0.1s;
+    }
+
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: rgba(88, 166, 255, 0.04); }
+
+    tbody td {
+      padding: 9px 16px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    /* ── Pill badges ──────────────────────────────── */
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .pill-honeypot { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+    .pill-stealth  { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
+    .pill-banned   { background: rgba(248, 81, 73, 0.2);  color: var(--red); }
+    .pill-allowed  { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+    .pill-pass     { background: rgba(188, 140, 255, 0.15); color: var(--purple); }
+
+    /* ── Score bar ────────────────────────────────── */
+    .score-wrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .score-bar {
+      width: 60px;
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    .score-fill {
+      height: 100%;
+      border-radius: 2px;
+      background: var(--red);
+      transition: width 0.4s ease;
+    }
+
+    .score-fill.medium { background: var(--yellow); }
+    .score-fill.low    { background: var(--green); }
+
+    /* ── Two-column grid ──────────────────────────── */
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+    /* ── Empty state ──────────────────────────────── */
+    .empty {
+      padding: 32px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    /* ── IP ───────────────────────────────────────── */
+    .ip { color: var(--accent); }
+    .ts { color: var(--muted); font-size: 11px; }
+    .country { color: var(--text); }
+    .mono { font-family: var(--mono); }
+
+    /* ── Last updated ─────────────────────────────── */
+    #last-updated {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    /* ── Responsive ───────────────────────────────── */
+    @media (max-width: 900px) {
+      .stats-grid { grid-template-columns: repeat(2, 1fr); }
+      .two-col    { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 480px) {
+      .stats-grid { grid-template-columns: 1fr 1fr; }
+      main        { padding: 12px; }
+    }
+
+    /* ── Scrollbar ────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+    </svg>
+    SkyGuard
+  </div>
+  <div class="header-meta">
+    <span><span class="dot"></span> Live</span>
+    <span>Uptime: <strong id="uptime">—</strong></span>
+    <span id="last-updated">—</span>
+  </div>
+</header>
+
+<main>
+  <!-- Stats row -->
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-label">Total Connections</div>
+      <div class="stat-value" id="stat-total">—</div>
+      <div class="stat-sub" id="stat-today">— today</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Banned IPs</div>
+      <div class="stat-value" id="stat-banned">—</div>
+      <div class="stat-sub" id="stat-bans-today">— in last 24h</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Honeypot Hits</div>
+      <div class="stat-value" id="stat-honeypot">—</div>
+      <div class="stat-sub" id="stat-creds">— credential attempts</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Unique Countries</div>
+      <div class="stat-value" id="stat-countries">—</div>
+      <div class="stat-sub" id="stat-unique-ips">— unique IPs</div>
+    </div>
+  </div>
+
+  <!-- Recent connections -->
+  <div>
+    <div class="section-title">Recent Connections</div>
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Connection Log</span>
+        <span class="badge" id="conn-count">0</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>IP Address</th>
+              <th>Port</th>
+              <th>Country</th>
+              <th>Action</th>
+              <th>Service</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody id="connections-body">
+            <tr><td colspan="6" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Top attackers + Top credentials -->
+  <div class="two-col">
+    <div>
+      <div class="section-title">Top Attackers</div>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">By Score</span>
+          <span class="badge" id="attackers-count">0</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>IP Address</th>
+                <th>Score</th>
+                <th>Country</th>
+                <th>Honey</th>
+                <th>Creds</th>
+              </tr>
+            </thead>
+            <tbody id="attackers-body">
+              <tr><td colspan="5" class="empty">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-title">Top Credentials</div>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Username / Password Attempts</span>
+          <span class="badge" id="creds-count">0</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Username</th>
+                <th>Password</th>
+                <th>Count</th>
+                <th>Service</th>
+              </tr>
+            </thead>
+            <tbody id="credentials-body">
+              <tr><td colspan="4" class="empty">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Banned IPs -->
+  <div>
+    <div class="section-title">Active Bans</div>
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Banned IPs</span>
+        <span class="badge" id="banned-count">0</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>IP Address</th>
+              <th>Reason</th>
+              <th>Score</th>
+              <th>Banned At</th>
+              <th>Expires</th>
+            </tr>
+          </thead>
+          <tbody id="banned-body">
+            <tr><td colspan="5" class="empty">No active bans.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+  'use strict';
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  function $(id) { return document.getElementById(id); }
+
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function fmtDate(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return d.toLocaleString('en-GB', { dateStyle: 'short', timeStyle: 'medium' });
+  }
+
+  function relTime(iso) {
+    if (!iso) return '—';
+    const diff = Math.round((new Date(iso) - Date.now()) / 1000);
+    if (diff <= 0) return 'expired';
+    if (diff < 60)  return `${diff}s`;
+    if (diff < 3600) return `${Math.round(diff / 60)}m`;
+    return `${Math.round(diff / 3600)}h`;
+  }
+
+  function fmtUptime(seconds) {
+    if (!seconds && seconds !== 0) return '—';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+
+  function scorePillClass(score) {
+    if (score >= 50) return '';      // red (default)
+    if (score >= 20) return 'medium';
+    return 'low';
+  }
+
+  function actionPill(action) {
+    const map = {
+      honeypot: 'pill-honeypot',
+      banned:   'pill-banned',
+      stealth:  'pill-stealth',
+      allowed:  'pill-allowed',
+      pass:     'pill-pass',
+    };
+    const cls = map[action] || 'pill-pass';
+    return `<span class="pill ${cls}">${action || '—'}</span>`;
+  }
+
+  function empty(cols, msg) {
+    return `<tr><td colspan="${cols}" class="empty">${msg}</td></tr>`;
+  }
+
+  // ── Fetch wrapper ──────────────────────────────────────────────────────────
+
+  async function apiFetch(path) {
+    try {
+      const r = await fetch(path, { credentials: 'same-origin' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return await r.json();
+    } catch (e) {
+      console.warn(`[SkyGuard] fetch ${path}:`, e.message);
+      return null;
+    }
+  }
+
+  // ── Render functions ───────────────────────────────────────────────────────
+
+  function renderStats(data) {
+    if (!data) return;
+    $('stat-total').textContent     = (data.total_connections ?? '—').toLocaleString();
+    $('stat-today').textContent     = `${(data.connections_today ?? 0).toLocaleString()} today`;
+    $('stat-banned').textContent    = (data.active_bans ?? '—').toLocaleString();
+    $('stat-bans-today').textContent = `${(data.bans_today ?? 0).toLocaleString()} in last 24h`;
+    $('stat-honeypot').textContent  = (data.honeypot_hits ?? '—').toLocaleString();
+    $('stat-creds').textContent     = `${(data.credential_attempts ?? 0).toLocaleString()} credential attempts`;
+    $('stat-countries').textContent = (data.unique_countries ?? '—').toLocaleString();
+    $('stat-unique-ips').textContent = `${(data.unique_ips ?? 0).toLocaleString()} unique IPs`;
+    if (data.uptime_seconds != null) {
+      $('uptime').textContent = fmtUptime(data.uptime_seconds);
+    }
+  }
+
+  function renderConnections(rows) {
+    const tbody = $('connections-body');
+    if (!rows || rows.length === 0) {
+      tbody.innerHTML = empty(6, 'No connections recorded yet.');
+      $('conn-count').textContent = '0';
+      return;
+    }
+    $('conn-count').textContent = rows.length;
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td class="ip">${r.ip || '—'}</td>
+        <td>${r.port || '—'}</td>
+        <td class="country">${r.country || '—'}</td>
+        <td>${actionPill(r.action)}</td>
+        <td>${r.service || '—'}</td>
+        <td class="ts">${fmtDate(r.created_at)}</td>
+      </tr>`).join('');
+  }
+
+  function renderAttackers(rows) {
+    const tbody = $('attackers-body');
+    if (!rows || rows.length === 0) {
+      tbody.innerHTML = empty(5, 'No attackers yet.');
+      $('attackers-count').textContent = '0';
+      return;
+    }
+    $('attackers-count').textContent = rows.length;
+    const maxScore = rows[0]?.score || 1;
+    tbody.innerHTML = rows.map(r => {
+      const pct = Math.min(100, Math.round((r.score / maxScore) * 100));
+      const cls = scorePillClass(r.score);
+      return `
+      <tr>
+        <td class="ip">${r.ip || '—'}</td>
+        <td>
+          <div class="score-wrap">
+            <span>${r.score ?? '—'}</span>
+            <div class="score-bar"><div class="score-fill ${cls}" style="width:${pct}%"></div></div>
+          </div>
+        </td>
+        <td class="country">${r.country || '—'}</td>
+        <td>${r.honeypot_hits ?? 0}</td>
+        <td>${r.credential_attempts ?? 0}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function renderCredentials(rows) {
+    const tbody = $('credentials-body');
+    if (!rows || rows.length === 0) {
+      tbody.innerHTML = empty(4, 'No credentials captured yet.');
+      $('creds-count').textContent = '0';
+      return;
+    }
+    $('creds-count').textContent = rows.length;
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td class="mono">${escHtml(r.username || '')}</td>
+        <td class="mono">${escHtml(r.password || '')}</td>
+        <td>${r.count ?? '—'}</td>
+        <td>${r.service || '—'}</td>
+      </tr>`).join('');
+  }
+
+  function renderBanned(rows) {
+    const tbody = $('banned-body');
+    if (!rows || rows.length === 0) {
+      tbody.innerHTML = empty(5, 'No active bans.');
+      $('banned-count').textContent = '0';
+      return;
+    }
+    $('banned-count').textContent = rows.length;
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td class="ip">${r.ip || '—'}</td>
+        <td>${r.reason || '—'}</td>
+        <td>${r.score ?? '—'}</td>
+        <td class="ts">${fmtDate(r.banned_at)}</td>
+        <td class="ts">${r.expires_at ? relTime(r.expires_at) : 'permanent'}</td>
+      </tr>`).join('');
+  }
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  // ── Polling ────────────────────────────────────────────────────────────────
+
+  async function fetchAll() {
+    const [stats, conns, attackers, creds, banned] = await Promise.all([
+      apiFetch('/api/stats'),
+      apiFetch('/api/connections?limit=50'),
+      apiFetch('/api/attackers?limit=20'),
+      apiFetch('/api/credentials?limit=20'),
+      apiFetch('/api/banned?limit=50'),
+    ]);
+
+    renderStats(stats);
+    renderConnections(conns);
+    renderAttackers(attackers);
+    renderCredentials(creds);
+    renderBanned(banned);
+
+    $('last-updated').textContent = `Updated ${fmtTime(new Date().toISOString())}`;
+  }
+
+  // Initial load + 10-second polling
+  fetchAll();
+  setInterval(fetchAll, 10_000);
+</script>
+</body>
+</html>
