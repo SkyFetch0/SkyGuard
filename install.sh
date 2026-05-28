@@ -12,6 +12,18 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# Interactive vs unattended apt behaviour:
+#   - On a real terminal we leave debconf interactive so package prompts (e.g.
+#     iptables-persistent's "Save current IPv4 rules?") are SHOWN and you can
+#     answer them. Output is never redirected, so nothing hangs invisibly.
+#   - When piped (e.g. curl ... | bash) there is no TTY to answer prompts, so we
+#     fall back to noninteractive defaults to avoid a silent hang.
+if [ -t 0 ]; then
+    export DEBIAN_FRONTEND=readline
+else
+    export DEBIAN_FRONTEND=noninteractive
+fi
+
 # ── colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
@@ -398,16 +410,16 @@ fi
 
 case "$OS_ID" in
     ubuntu|debian|linuxmint|pop)
-        PKG_MGR="apt"; PKG_UPDATE="apt-get update -qq"; PKG_INSTALL="apt-get install -y -qq"
+        PKG_MGR="apt"; PKG_UPDATE="apt-get update"; PKG_INSTALL="apt-get install -y"
         IPTABLES_RULES_FILE="/etc/iptables/rules.v4"; IPTABLES_SERVICE="netfilter-persistent"
         ;;
     centos|rhel|rocky|almalinux|ol)
-        PKG_MGR="yum"; PKG_UPDATE="yum makecache -q"; PKG_INSTALL="yum install -y -q"
+        PKG_MGR="yum"; PKG_UPDATE="yum makecache"; PKG_INSTALL="yum install -y"
         IPTABLES_RULES_FILE="/etc/sysconfig/iptables"; IPTABLES_SERVICE="iptables"
-        command -v dnf &>/dev/null && { PKG_MGR="dnf"; PKG_UPDATE="dnf makecache -q"; PKG_INSTALL="dnf install -y -q"; }
+        command -v dnf &>/dev/null && { PKG_MGR="dnf"; PKG_UPDATE="dnf makecache"; PKG_INSTALL="dnf install -y"; }
         ;;
     fedora)
-        PKG_MGR="dnf"; PKG_UPDATE="dnf makecache -q"; PKG_INSTALL="dnf install -y -q"
+        PKG_MGR="dnf"; PKG_UPDATE="dnf makecache"; PKG_INSTALL="dnf install -y"
         IPTABLES_RULES_FILE="/etc/sysconfig/iptables"; IPTABLES_SERVICE="iptables"
         ;;
     arch|manjaro)
@@ -416,9 +428,9 @@ case "$OS_ID" in
         ;;
     *)
         warn "$(t err_unknown_os "$OS_ID")"
-        if   command -v apt-get &>/dev/null; then PKG_MGR="apt";   PKG_UPDATE="apt-get update -qq";  PKG_INSTALL="apt-get install -y -qq"; IPTABLES_RULES_FILE="/etc/iptables/rules.v4";    IPTABLES_SERVICE="netfilter-persistent"
-        elif command -v dnf     &>/dev/null; then PKG_MGR="dnf";   PKG_UPDATE="dnf makecache -q";    PKG_INSTALL="dnf install -y -q";       IPTABLES_RULES_FILE="/etc/sysconfig/iptables";  IPTABLES_SERVICE="iptables"
-        elif command -v yum     &>/dev/null; then PKG_MGR="yum";   PKG_UPDATE="yum makecache -q";    PKG_INSTALL="yum install -y -q";       IPTABLES_RULES_FILE="/etc/sysconfig/iptables";  IPTABLES_SERVICE="iptables"
+        if   command -v apt-get &>/dev/null; then PKG_MGR="apt";   PKG_UPDATE="apt-get update";  PKG_INSTALL="apt-get install -y"; IPTABLES_RULES_FILE="/etc/iptables/rules.v4";    IPTABLES_SERVICE="netfilter-persistent"
+        elif command -v dnf     &>/dev/null; then PKG_MGR="dnf";   PKG_UPDATE="dnf makecache";    PKG_INSTALL="dnf install -y";       IPTABLES_RULES_FILE="/etc/sysconfig/iptables";  IPTABLES_SERVICE="iptables"
+        elif command -v yum     &>/dev/null; then PKG_MGR="yum";   PKG_UPDATE="yum makecache";    PKG_INSTALL="yum install -y";       IPTABLES_RULES_FILE="/etc/sysconfig/iptables";  IPTABLES_SERVICE="iptables"
         else die "$(t err_no_pkg_mgr)"; fi
         ;;
 esac
@@ -580,6 +592,25 @@ GEO_VAL=$( $GEOIP_ENABLED && t sum_geoip_enabled || t sum_geoip_disabled)
 echo -e "  $(t sum_geoip)       : ${BOLD}${GEO_VAL}${RESET}"
 echo
 
+# Warn about the port-22 bind conflict: if stealth forwards to the real sshd on
+# :22 AND a honeypot is told to bind :22, the honeypot listener cannot start
+# while the real sshd still holds 0.0.0.0:22 — SkyGuard would crash-loop.
+if $ENABLE_STEALTH_SSH && $HONEYPOT_SSH; then
+    echo
+    if [[ "$SKYGUARD_LANG" == "tr" ]]; then
+        warn "DİKKAT: Stealth SSH + port 22 honeypot birlikte seçili."
+        warn "Gerçek sshd 0.0.0.0:22'yi tutuyorsa honeypot 22'yi bağlayamaz; SkyGuard başlamaz."
+        warn "Çözüm: /etc/ssh/sshd_config içine 'ListenAddress 127.0.0.1' ekleyip 'systemctl restart ssh'."
+        warn "Önce 'ssh -p ${STEALTH_SSH_PORT}' ile bağlanabildiğinizi DOĞRULAYIN, yoksa kilitlenirsiniz."
+    else
+        warn "WARNING: Both Stealth SSH and the port-22 honeypot are enabled."
+        warn "If the real sshd holds 0.0.0.0:22, the honeypot cannot bind :22 and SkyGuard won't start."
+        warn "Fix: add 'ListenAddress 127.0.0.1' to /etc/ssh/sshd_config, then 'systemctl restart ssh'."
+        warn "Verify 'ssh -p ${STEALTH_SSH_PORT}' works BEFORE relying on it, or you may lock yourself out."
+    fi
+    echo
+fi
+
 confirm "$(t sec_proceed)" || { info "$(t aborted)"; exit 0; }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -587,12 +618,14 @@ confirm "$(t sec_proceed)" || { info "$(t aborted)"; exit 0; }
 # ═════════════════════════════════════════════════════════════════════════════
 section "$(t sec_phase1)"
 info "$(t pkg_updating)"
-eval "$PKG_UPDATE" &>/dev/null
+# Output is shown (not redirected) so you can watch progress and answer any
+# prompts; a failure aborts the script instead of being silently swallowed.
+eval "$PKG_UPDATE" || die "package cache update failed — check the output above"
 
 case "$PKG_MGR" in
-    apt)   eval "$PKG_INSTALL curl wget ca-certificates gnupg lsb-release iptables iptables-persistent netfilter-persistent" &>/dev/null || true ;;
-    yum|dnf) eval "$PKG_INSTALL curl wget ca-certificates iptables iptables-services" &>/dev/null || true ;;
-    pacman) eval "$PKG_INSTALL curl wget ca-certificates iptables" &>/dev/null || true ;;
+    apt)     eval "$PKG_INSTALL curl wget ca-certificates gnupg lsb-release openssl iptables iptables-persistent netfilter-persistent" || die "package installation failed" ;;
+    yum|dnf) eval "$PKG_INSTALL curl wget ca-certificates openssl iptables iptables-services" || die "package installation failed" ;;
+    pacman)  eval "$PKG_INSTALL curl wget ca-certificates openssl iptables" || die "package installation failed" ;;
 esac
 ok "$(t pkg_ok)"
 
@@ -602,26 +635,26 @@ ok "$(t pkg_ok)"
 section "$(t sec_phase2)"
 
 install_docker_apt() {
-    apt-get remove -y docker docker-engine docker.io containerd runc &>/dev/null || true
+    apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
     install -m 0755 -d /etc/apt/keyrings
     curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${OS_ID} $(. /etc/os-release && echo "${VERSION_CODENAME}") stable" \
         | tee /etc/apt/sources.list.d/docker.list > /dev/null
-    apt-get update -qq
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    apt-get update
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 }
 install_docker_rhel() {
-    eval "$PKG_INSTALL yum-utils" &>/dev/null || true
+    eval "$PKG_INSTALL yum-utils" || true
     if command -v dnf &>/dev/null; then
-        dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo &>/dev/null
-        dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin &>/dev/null
+        dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     else
-        yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo &>/dev/null
-        yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin &>/dev/null
+        yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     fi
 }
-install_docker_arch() { pacman -S --noconfirm --needed docker docker-compose &>/dev/null; }
+install_docker_arch() { pacman -S --noconfirm --needed docker docker-compose; }
 
 if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
     DOCKER_VER=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "unknown")
@@ -831,7 +864,15 @@ command -v ip6tables &>/dev/null && {
 # ═════════════════════════════════════════════════════════════════════════════
 section "$(t sec_phase6)"
 TZ_VAL=$(cat /etc/timezone 2>/dev/null || timedatectl show --value -p Timezone 2>/dev/null || echo "UTC")
-HEALTH_AUTH_B64=$(echo -n "${DASHBOARD_USER}:${DASHBOARD_PASS}" | base64 2>/dev/null || echo "")
+
+# The healthcheck depends on the dashboard. When the dashboard is disabled,
+# probing it would always fail and mark the container unhealthy, so fall back to
+# a liveness check on PID 1.
+if $DASHBOARD_ENABLED; then
+    HEALTH_TEST="wget -qO- 'http://${DASHBOARD_USER}:${DASHBOARD_PASS}@127.0.0.1:${DASHBOARD_PORT}/api/stats' >/dev/null 2>&1 || exit 1"
+else
+    HEALTH_TEST="kill -0 1 >/dev/null 2>&1 || exit 1"
+fi
 
 cat > "${INSTALL_DIR}/docker-compose.yml" <<COMPOSE
 version: '3.8'
@@ -857,7 +898,7 @@ services:
         max-size: "50m"
         max-file: "5"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- 'http://${DASHBOARD_USER}:${DASHBOARD_PASS}@127.0.0.1:${DASHBOARD_PORT}/api/stats' >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "${HEALTH_TEST}"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -873,9 +914,15 @@ ok "$(t compose_generated "${INSTALL_DIR}/docker-compose.yml")"
 section "$(t sec_phase7)"
 cd "${INSTALL_DIR}"
 info "$(t docker_building)"
-if docker compose build --no-cache 2>&1 | tee /tmp/skyguard-build.log | grep -E "^#[0-9]|DONE|ERROR" | tail -15; then
+# Show full build output live (so downloads/steps are visible) and keep a log.
+# Note: pipefail makes the previous grep-filtered form fail spuriously when the
+# build succeeds but no line matches the filter, so we stream the raw output.
+if docker compose build --no-cache 2>&1 | tee /tmp/skyguard-build.log; then
     ok "$(t docker_build_ok)"
 else
+    echo
+    warn "Build failed — last 40 lines of /tmp/skyguard-build.log:"
+    tail -n 40 /tmp/skyguard-build.log
     die "$(t docker_build_fail)"
 fi
 
@@ -943,7 +990,7 @@ DATA_DIR="${DATA_DIR}"
 wget -qO /tmp/GeoLite2-City.tar.gz \
   "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=\${LICENSE_KEY}&suffix=tar.gz" \
   && tar -xzf /tmp/GeoLite2-City.tar.gz --wildcards '*.mmdb' --strip-components=1 -C "\${DATA_DIR}/" \
-  && docker exec skyguard kill -HUP 1 2>/dev/null || true
+  && docker restart skyguard >/dev/null 2>&1 || true
 rm -f /tmp/GeoLite2-City.tar.gz
 CRON
     chmod +x /etc/cron.monthly/skyguard-geoip-update
