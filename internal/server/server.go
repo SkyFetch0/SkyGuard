@@ -35,6 +35,7 @@ type Server struct {
 	firewall  firewall.Firewall
 	proxy     *proxy.Proxy
 	dash      *dashboard.Dashboard
+	settings  *storage.Settings
 	logger    *slog.Logger
 	listeners []net.Listener
 	mu        sync.Mutex
@@ -70,6 +71,17 @@ func New(cfg *config.Config, db *storage.DB, logger *slog.Logger) (*Server, erro
 
 	prx := proxy.New(logger)
 
+	// Runtime settings: seed from config, override with anything stored in the
+	// DB, so the dashboard can change auto-ban params without a restart.
+	settings, err := db.LoadSettings(storage.AutoBanSettings{
+		Enabled:        cfg.Analysis.AutoBan.Enabled,
+		ScoreThreshold: cfg.Analysis.AutoBan.ScoreThreshold,
+		BanDuration:    cfg.Analysis.AutoBan.BanDuration,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("loading settings: %w", err)
+	}
+
 	s := &Server{
 		cfg:      cfg,
 		db:       db,
@@ -79,12 +91,13 @@ func New(cfg *config.Config, db *storage.DB, logger *slog.Logger) (*Server, erro
 		detector: detector,
 		firewall: fw,
 		proxy:    prx,
+		settings: settings,
 		logger:   logger,
 		sem:      make(chan struct{}, maxConcurrentConns),
 	}
 
 	if cfg.Dashboard.Enabled {
-		s.dash = dashboard.New(cfg.Dashboard, db, fw, logger)
+		s.dash = dashboard.New(cfg.Dashboard, db, fw, settings, logger)
 	}
 
 	return s, nil
@@ -368,7 +381,7 @@ func (s *Server) handleConnection(conn net.Conn, portType string, portHandler in
 	}
 	if banned {
 		s.logger.Debug("dropping banned IP", "ip", sourceIP)
-		_ = s.firewall.BanIP(sourceIP, s.cfg.Analysis.AutoBan.BanDuration)
+		_ = s.firewall.BanIP(sourceIP, s.settings.AutoBan().BanDuration)
 		s.logConn(sourceIP, destPort, "", "", portType, "dropped", "banned")
 		return
 	}
@@ -497,22 +510,23 @@ func (s *Server) routeConnection(conn net.Conn, portType string, portHandler int
 	}
 }
 
-// shouldBanAndBan checks the current score for ip and applies a ban if the
-// auto-ban threshold has been reached.
+// shouldBanAndBan checks the current score for ip against the (runtime-adjustable)
+// auto-ban settings and applies a ban if the threshold has been reached.
 func (s *Server) shouldBanAndBan(ip, reason string) {
-	if !s.cfg.Analysis.AutoBan.Enabled {
+	ab := s.settings.AutoBan()
+	if !ab.Enabled {
 		return
 	}
-	should, err := s.scorer.ShouldBan(ip)
+	score, err := s.scorer.GetScore(ip)
 	if err != nil {
 		s.logger.Error("scorer error", "ip", ip, "error", err)
 		return
 	}
-	if !should {
+	if score < ab.ScoreThreshold {
 		return
 	}
 
-	dur := s.cfg.Analysis.AutoBan.BanDuration
+	dur := ab.BanDuration
 	if err := s.db.BanIP(ip, reason, dur, false); err != nil {
 		s.logger.Error("db ban error", "ip", ip, "error", err)
 	}

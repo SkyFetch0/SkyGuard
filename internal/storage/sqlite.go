@@ -115,6 +115,14 @@ func (d *DB) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_ip_scores_score
 			ON ip_scores (score DESC)`,
+
+		// ----------------------------------------------------------------
+		// settings (mutable runtime configuration, key/value)
+		// ----------------------------------------------------------------
+		`CREATE TABLE IF NOT EXISTS settings (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)`,
 	}
 
 	for _, stmt := range statements {

@@ -90,6 +90,51 @@ func (d *Dashboard) handleCredentials(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, creds)
 }
 
+// handleSettings exposes (GET) and updates (POST) the runtime auto-ban settings.
+func (d *Dashboard) handleSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		ab := d.settings.AutoBan()
+		jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"auto_ban_enabled": ab.Enabled,
+			"score_threshold":  ab.ScoreThreshold,
+			"ban_duration":     ab.BanDuration.String(),
+		})
+	case http.MethodPost:
+		if !sameOriginRequest(r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		ab := d.settings.AutoBan()
+		ab.Enabled = r.FormValue("auto_ban_enabled") == "1" || strings.EqualFold(r.FormValue("auto_ban_enabled"), "true")
+		if v := r.FormValue("score_threshold"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 {
+				http.Error(w, "invalid score_threshold", http.StatusBadRequest)
+				return
+			}
+			ab.ScoreThreshold = n
+		}
+		if v := r.FormValue("ban_duration"); v != "" {
+			dur, err := time.ParseDuration(v)
+			if err != nil || dur < 0 {
+				http.Error(w, "invalid ban_duration (use e.g. 30m, 1h, 24h)", http.StatusBadRequest)
+				return
+			}
+			ab.BanDuration = dur
+		}
+		if err := d.settings.SetAutoBan(ab); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		d.logger.Info("auto-ban settings updated via dashboard",
+			"enabled", ab.Enabled, "threshold", ab.ScoreThreshold, "duration", ab.BanDuration)
+		jsonResponse(w, http.StatusOK, map[string]interface{}{"ok": true})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 // handleFirewall returns the configured backend and a snapshot of its rules.
 func (d *Dashboard) handleFirewall(w http.ResponseWriter, r *http.Request) {
 	rules, err := d.fw.List()
@@ -308,11 +353,27 @@ const indexHTML = `<!DOCTYPE html>
       <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
         <input id="ban-ip" placeholder="IP address (e.g. 1.2.3.4)" style="flex:1;min-width:180px;padding:.5rem;border-radius:.4rem;border:1px solid #334155;background:#0f172a;color:#e2e8f0">
         <input id="ban-dur" placeholder="duration (default 24h)" style="width:170px;padding:.5rem;border-radius:.4rem;border:1px solid #334155;background:#0f172a;color:#e2e8f0">
+        <label style="font-size:.8rem;color:#94a3b8;display:flex;align-items:center;gap:.3rem"><input type="checkbox" id="ban-perm"> permanent</label>
         <button class="refresh-btn" onclick="banIP()">Ban IP</button>
       </div>
       <div id="ban-msg" style="font-size:.8rem;color:#94a3b8;margin-top:.5rem"></div>
     </div>
     <pre id="fw-rules" style="background:#1e293b;border:1px solid #334155;border-radius:.75rem;padding:1rem;overflow:auto;font-size:.8rem;color:#cbd5e1;white-space:pre-wrap;margin:0"></pre>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h2>Auto-Ban Settings</h2></div>
+    <div class="card">
+      <div style="display:flex;gap:1.25rem;flex-wrap:wrap;align-items:center">
+        <label style="display:flex;align-items:center;gap:.4rem;font-size:.9rem"><input type="checkbox" id="set-enabled"> Enabled</label>
+        <label style="display:flex;align-items:center;gap:.4rem;font-size:.9rem">Threshold
+          <input id="set-threshold" type="number" min="1" style="width:90px;padding:.4rem;border-radius:.4rem;border:1px solid #334155;background:#0f172a;color:#e2e8f0"></label>
+        <label style="display:flex;align-items:center;gap:.4rem;font-size:.9rem">Ban duration
+          <input id="set-duration" placeholder="1h" style="width:110px;padding:.4rem;border-radius:.4rem;border:1px solid #334155;background:#0f172a;color:#e2e8f0"></label>
+        <button class="refresh-btn" onclick="saveSettings()">Save</button>
+      </div>
+      <div id="set-msg" style="font-size:.8rem;color:#94a3b8;margin-top:.5rem">Ban duration: e.g. 30m, 1h, 24h, 168h. 0s = permanent.</div>
+    </div>
   </div>
 </main>
 
@@ -379,12 +440,35 @@ async function loadFirewall(){
 async function banIP(){
   const ip=document.getElementById('ban-ip').value.trim();
   const dur=document.getElementById('ban-dur').value.trim();
+  const perm=document.getElementById('ban-perm').checked;
   const msg=document.getElementById('ban-msg');
   if(!ip){msg.textContent='Enter an IP address.';return;}
-  const r=await postForm('/api/ban',dur?{ip:ip,duration:dur}:{ip:ip});
-  msg.textContent=r.ok?('Banned '+ip):('Failed: '+(await r.text()));
-  if(r.ok){document.getElementById('ban-ip').value='';document.getElementById('ban-dur').value='';}
+  const data={ip:ip};
+  if(dur)data.duration=dur;
+  if(perm)data.permanent='1';
+  const r=await postForm('/api/ban',data);
+  msg.textContent=r.ok?('Banned '+ip+(perm?' (permanent)':'')):('Failed: '+(await r.text()));
+  if(r.ok){document.getElementById('ban-ip').value='';document.getElementById('ban-dur').value='';document.getElementById('ban-perm').checked=false;}
   loadBanned();loadFirewall();
+}
+
+async function loadSettings(){
+  const s=await fetchJSON('/api/settings');
+  document.getElementById('set-enabled').checked=!!s.auto_ban_enabled;
+  document.getElementById('set-threshold').value=s.score_threshold||0;
+  document.getElementById('set-duration').value=s.ban_duration||'';
+}
+
+async function saveSettings(){
+  const msg=document.getElementById('set-msg');
+  const data={
+    auto_ban_enabled:document.getElementById('set-enabled').checked?'1':'0',
+    score_threshold:document.getElementById('set-threshold').value.trim(),
+    ban_duration:document.getElementById('set-duration').value.trim()
+  };
+  const r=await postForm('/api/settings',data);
+  msg.textContent=r.ok?('Saved ✓'):('Failed: '+(await r.text()));
+  loadSettings();
 }
 
 async function unbanIP(ip){
@@ -392,7 +476,7 @@ async function unbanIP(ip){
   if(r.ok){loadBanned();loadFirewall();}
 }
 
-function loadAll(){loadStats();loadConnections();loadAttackers();loadCredentials();loadBanned();loadFirewall();}
+function loadAll(){loadStats();loadConnections();loadAttackers();loadCredentials();loadBanned();loadFirewall();loadSettings();}
 loadAll();
 setInterval(loadAll,15000);
 </script>
