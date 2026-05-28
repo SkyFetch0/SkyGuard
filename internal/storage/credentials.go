@@ -122,7 +122,7 @@ func (d *DB) GetCredentialsByIP(ip string) ([]*Credential, error) {
 func (d *DB) CleanOldCredentials(days int) error {
 	const query = `
 		DELETE FROM credentials
-		WHERE  timestamp < datetime('now', ? || ' days')`
+		WHERE  datetime(timestamp) < datetime('now', ? || ' days')`
 
 	if _, err := d.db.Exec(query, fmt.Sprintf("-%d", days)); err != nil {
 		return fmt.Errorf("cleaning old credentials: %w", err)

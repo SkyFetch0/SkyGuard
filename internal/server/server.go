@@ -215,10 +215,13 @@ func (s *Server) addListener(ln net.Listener) {
 	s.mu.Unlock()
 }
 
-// cleanupLoop removes expired ban records from the database once per hour.
+// cleanupLoop runs once a minute. It lifts firewall rules for bans that have
+// expired (so a temporary ban is actually released at the kernel level, not
+// just removed from the DB), purges the expired ban rows, and enforces data
+// retention. The 1-minute cadence keeps ban expiry reasonably prompt.
 func (s *Server) cleanupLoop(ctx context.Context) {
 	defer s.wg.Done()
-	ticker := time.NewTicker(time.Hour)
+	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -226,9 +229,8 @@ func (s *Server) cleanupLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := s.db.CleanExpiredBans(); err != nil {
-				s.logger.Error("failed to clean expired bans", "error", err)
-			}
+			s.releaseExpiredBans()
+
 			// Enforce data retention so the database does not grow unbounded.
 			if days := s.cfg.Logging.RetentionDays; days > 0 {
 				if err := s.db.CleanOldConnections(days); err != nil {
@@ -239,6 +241,26 @@ func (s *Server) cleanupLoop(ctx context.Context) {
 				}
 			}
 		}
+	}
+}
+
+// releaseExpiredBans removes the firewall rule for every expired ban before
+// deleting the rows, so the actual block is lifted when the ban duration ends.
+func (s *Server) releaseExpiredBans() {
+	expired, err := s.db.GetExpiredBans()
+	if err != nil {
+		s.logger.Error("failed to list expired bans", "error", err)
+		return
+	}
+	for _, ip := range expired {
+		if err := s.firewall.UnbanIP(ip); err != nil {
+			s.logger.Warn("failed to remove firewall rule for expired ban", "ip", ip, "error", err)
+			continue
+		}
+		s.logger.Info("expired ban lifted from firewall", "ip", ip)
+	}
+	if err := s.db.CleanExpiredBans(); err != nil {
+		s.logger.Error("failed to clean expired bans", "error", err)
 	}
 }
 

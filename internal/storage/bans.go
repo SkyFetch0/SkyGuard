@@ -139,13 +139,47 @@ func (d *DB) GetBannedIPs() ([]*BannedIP, error) {
 	return results, nil
 }
 
+// GetExpiredBans returns the IPs of all non-permanent bans whose expiry has
+// already passed. Callers use this to lift the corresponding firewall rules
+// before the rows are purged by CleanExpiredBans.
+func (d *DB) GetExpiredBans() ([]string, error) {
+	// datetime() normalises the stored RFC3339 string ("...T...Z") before
+	// comparing; a raw string compare against datetime('now') (space-separated)
+	// would mis-order same-day timestamps at the 'T' vs ' ' character.
+	const query = `
+		SELECT ip
+		FROM   banned_ips
+		WHERE  permanent = 0
+		  AND  expires_at IS NOT NULL
+		  AND  datetime(expires_at) < datetime('now')`
+
+	rows, err := d.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("querying expired bans: %w", err)
+	}
+	defer rows.Close()
+
+	var ips []string
+	for rows.Next() {
+		var ip string
+		if err := rows.Scan(&ip); err != nil {
+			return nil, fmt.Errorf("scanning expired ban row: %w", err)
+		}
+		ips = append(ips, ip)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating expired ban rows: %w", err)
+	}
+	return ips, nil
+}
+
 // CleanExpiredBans removes all non-permanent ban records that have already expired.
 func (d *DB) CleanExpiredBans() error {
 	const query = `
 		DELETE FROM banned_ips
 		WHERE  permanent = 0
 		  AND  expires_at IS NOT NULL
-		  AND  expires_at < datetime('now')`
+		  AND  datetime(expires_at) < datetime('now')`
 
 	_, err := d.db.Exec(query)
 	if err != nil {

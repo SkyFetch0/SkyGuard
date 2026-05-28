@@ -92,7 +92,7 @@ func (d *DB) GetConnectionsByIP(ip string, limit int) ([]*Connection, error) {
 func (d *DB) CleanOldConnections(days int) error {
 	const query = `
 		DELETE FROM connections
-		WHERE  timestamp < datetime('now', ? || ' days')`
+		WHERE  datetime(timestamp) < datetime('now', ? || ' days')`
 
 	if _, err := d.db.Exec(query, fmt.Sprintf("-%d", days)); err != nil {
 		return fmt.Errorf("cleaning old connections: %w", err)
