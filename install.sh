@@ -753,7 +753,9 @@ cat > "${CONFIG_FILE}" <<YAML
 
 general:
   log_level: "info"
-  data_dir: "${DATA_DIR}"
+  # In-container path: the host's ${DATA_DIR} is bind-mounted to /data (see
+  # docker-compose.yml), so all runtime paths below must reference /data.
+  data_dir: "/data"
 
 stealth_services:
 $(_stealth_yaml)
@@ -764,7 +766,7 @@ $(_passthrough_yaml)
 analysis:
   geoip:
     enabled: ${GEOIP_ENABLED}
-    db_path: "${DATA_DIR}/GeoLite2-City.mmdb"
+    db_path: "/data/GeoLite2-City.mmdb"
   rate_limit:
     max_per_minute: ${RATE_LIMIT_PER_MINUTE}
     max_per_hour: ${RATE_LIMIT_PER_HOUR}
@@ -795,7 +797,7 @@ dashboard:
 
 logging:
   database: "sqlite"
-  db_path: "${DATA_DIR}/skyguard.db"
+  db_path: "/data/skyguard.db"
   retention_days: ${LOG_RETENTION}
   log_first_bytes: 512
 YAML
@@ -824,16 +826,22 @@ open_port() {
     info "$(t iptables_open "$port" "$proto")"
 }
 
-if $ENABLE_STEALTH_SSH; then
-    open_port "${STEALTH_SSH_PORT}"
-    if ! $HONEYPOT_SSH; then
-        iptables -C INPUT -p tcp --dport 22 -j DROP 2>/dev/null || \
-            iptables -A INPUT -p tcp --dport 22 -j DROP
-        warn "$(t iptables_block22 "$STEALTH_SSH_PORT")"
-    fi
+# Reconcile the port-22 rule deterministically. Repeated installs — or flipping
+# the SSH-honeypot choice between runs — must never leave a stale ACCEPT
+# shadowing a DROP (or vice versa), which would silently keep real SSH exposed.
+# Strip both first, then add exactly what this config needs.
+while iptables -C INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null; do iptables -D INPUT -p tcp --dport 22 -j ACCEPT; done
+while iptables -C INPUT -p tcp --dport 22 -j DROP   2>/dev/null; do iptables -D INPUT -p tcp --dport 22 -j DROP;   done
+
+$ENABLE_STEALTH_SSH && open_port "${STEALTH_SSH_PORT}"
+
+if $HONEYPOT_SSH; then
+    open_port 22                                       # fake SSH must be reachable
+elif $ENABLE_STEALTH_SSH; then
+    iptables -A INPUT -p tcp --dport 22 -j DROP        # hide real SSH; use stealth port
+    warn "$(t iptables_block22 "$STEALTH_SSH_PORT")"
 fi
 
-$HONEYPOT_SSH      && open_port 22
 $HONEYPOT_FTP      && open_port 21
 $HONEYPOT_MYSQL    && open_port 3306
 $HONEYPOT_HTTP     && open_port 80
