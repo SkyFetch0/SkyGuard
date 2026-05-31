@@ -809,6 +809,13 @@ ok "$(t config_written "$CONFIG_FILE")"
 # ═════════════════════════════════════════════════════════════════════════════
 section "$(t sec_phase5)"
 
+# Snapshot the pristine iptables ruleset BEFORE we touch it, so uninstall.sh can
+# fully restore it. Only created once (never overwritten on re-runs).
+if [[ ! -f "${CONFIG_DIR}/iptables.pre-skyguard.bak" ]] && command -v iptables-save &>/dev/null; then
+    mkdir -p "${CONFIG_DIR}"
+    iptables-save > "${CONFIG_DIR}/iptables.pre-skyguard.bak" 2>/dev/null || true
+fi
+
 iptables -N SKYGUARD 2>/dev/null || iptables -F SKYGUARD
 iptables -C INPUT -j SKYGUARD 2>/dev/null || iptables -I INPUT 1 -j SKYGUARD
 iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -A INPUT -i lo -j ACCEPT
