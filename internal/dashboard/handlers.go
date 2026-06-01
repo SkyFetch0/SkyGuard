@@ -232,16 +232,22 @@ func (d *Dashboard) handleUnban(w http.ResponseWriter, r *http.Request) {
 }
 
 // sameOriginRequest is a lightweight CSRF guard for state-changing endpoints.
-// The dashboard JS sends the X-SkyGuard-Request header, which a cross-origin
-// page cannot add to a "simple" request without triggering a CORS preflight
-// (that the browser would then block). Modern browsers' Sec-Fetch-Site header
-// is also accepted as a same-origin signal.
+// Two independent signals are checked; either alone is sufficient:
+//
+//  1. X-SkyGuard-Request custom header — browsers block cross-origin pages from
+//     adding custom headers to non-preflighted requests, so its mere presence
+//     proves same-origin intent.
+//
+//  2. Sec-Fetch-Site: "same-origin" or "same-site" — set by the browser on
+//     same-origin fetch/XHR calls. "none" is deliberately excluded: browsers
+//     send Sec-Fetch-Site: none for top-level navigations (address bar, form
+//     submissions) which could be used in CSRF attacks from a malicious page.
 func sameOriginRequest(r *http.Request) bool {
 	if r.Header.Get("X-SkyGuard-Request") != "" {
 		return true
 	}
 	switch r.Header.Get("Sec-Fetch-Site") {
-	case "same-origin", "same-site", "none":
+	case "same-origin", "same-site":
 		return true
 	}
 	return false

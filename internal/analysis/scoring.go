@@ -38,6 +38,8 @@ func NewScorer(db *storage.DB, cfg config.AutoBanConfig) *Scorer {
 }
 
 // Record adds the score for event to ip and persists the updated total.
+// It also increments the relevant activity counter column so the dashboard's
+// "Top Attackers" table reflects real hit/attempt/connection counts.
 // Returns the new cumulative score.
 func (s *Scorer) Record(ip, country string, event ScoreEvent, port int) (int, error) {
 	s.mu.Lock()
@@ -50,17 +52,31 @@ func (s *Scorer) Record(ip, country string, event ScoreEvent, port int) (int, er
 
 	db := s.db.DB()
 
-	// Upsert the ip_scores row, incrementing counters based on event type.
+	// Upsert the score and country in a single atomic statement.
 	_, err := db.Exec(`
 		INSERT INTO ip_scores (ip, score, country, last_seen)
 		VALUES (?, ?, ?, datetime('now'))
 		ON CONFLICT(ip) DO UPDATE SET
-			score    = score + excluded.score,
-			country  = CASE WHEN excluded.country != '' THEN excluded.country ELSE country END,
+			score     = score + excluded.score,
+			country   = CASE WHEN excluded.country != '' THEN excluded.country ELSE country END,
 			last_seen = datetime('now')
 	`, ip, delta, country)
 	if err != nil {
 		return 0, fmt.Errorf("upserting ip score for %s: %w", ip, err)
+	}
+
+	// Increment the per-event activity counter. Pass delta=0 so that
+	// UpdateScore only touches the named counter, not the score again.
+	if field := counterFieldForEvent(event); field != "" {
+		if err := s.db.UpdateScore(ip, 0, field); err != nil {
+			// Non-fatal: score is already persisted; counter update is best-effort.
+			_ = err
+		}
+	}
+
+	// total_connections tracks every scored event regardless of type.
+	if err := s.db.UpdateScore(ip, 0, "total_connections"); err != nil {
+		_ = err
 	}
 
 	var total int
@@ -69,6 +85,20 @@ func (s *Scorer) Record(ip, country string, event ScoreEvent, port int) (int, er
 	}
 
 	return total, nil
+}
+
+// counterFieldForEvent maps a ScoreEvent to the ip_scores column that should
+// be incremented alongside the score. Returns "" for events with no dedicated
+// counter column.
+func counterFieldForEvent(event ScoreEvent) string {
+	switch event {
+	case EventHoneypotConnection:
+		return "honeypot_hits"
+	case EventFailedCredential:
+		return "credential_attempts"
+	default:
+		return ""
+	}
 }
 
 // ShouldBan reports whether ip's current score meets or exceeds the threshold.

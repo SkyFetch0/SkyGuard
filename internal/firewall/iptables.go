@@ -1,7 +1,6 @@
 package firewall
 
 import (
-	"bytes"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -48,16 +47,24 @@ func (i *IPTablesFirewall) UnbanIP(ip string) error {
 	return nil
 }
 
-// IsBanned reports whether ip appears in the INPUT chain's numeric listing.
+// IsBanned reports whether ip has an exact DROP rule in the INPUT chain.
+// It uses "iptables -C" (rule check) which exits 0 only when the exact rule
+// exists, avoiding the substring false-positive of grep-style matching where
+// "1.2.3.4" would match "1.2.3.40" in plain text output.
 func (i *IPTablesFirewall) IsBanned(ip string) (bool, error) {
 	if err := validateIP(ip); err != nil {
 		return false, err
 	}
-	out, err := exec.Command("iptables", "-L", "INPUT", "-n").Output()
-	if err != nil {
-		return false, fmt.Errorf("iptables -L INPUT -n: %w", err)
+	err := exec.Command("iptables", "-C", "INPUT", "-s", ip, "-j", "DROP").Run()
+	if err == nil {
+		return true, nil
 	}
-	return bytes.Contains(out, []byte(ip)), nil
+	// iptables -C exits with code 1 when the rule does not exist — that is not
+	// an error condition; any other exit code indicates a real problem.
+	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("iptables -C INPUT -s %s -j DROP: %w", ip, err)
 }
 
 // BanIPPermanent is identical to BanIP for iptables.

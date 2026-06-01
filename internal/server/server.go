@@ -192,7 +192,8 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
-	// Periodic maintenance: clean up expired bans once per hour.
+	// Periodic maintenance: clean up expired bans, purge old records, enforce
+	// data retention. Runs every minute so temporary bans are lifted promptly.
 	s.wg.Add(1)
 	go s.cleanupLoop(ctx)
 
@@ -228,7 +229,7 @@ func (s *Server) addListener(ln net.Listener) {
 	s.mu.Unlock()
 }
 
-// cleanupLoop runs once a minute. It lifts firewall rules for bans that have
+// cleanupLoop runs every minute. It lifts firewall rules for bans that have
 // expired (so a temporary ban is actually released at the kernel level, not
 // just removed from the DB), purges the expired ban rows, and enforces data
 // retention. The 1-minute cadence keeps ban expiry reasonably prompt.
@@ -365,10 +366,12 @@ func (s *Server) handleConnection(conn net.Conn, portType string, portHandler in
 
 	_, destPort, _ := net.SplitHostPort(conn.LocalAddr().String())
 
-	// 1. Whitelist – always allow.
+	// 1. Whitelist – always allow, but still log so the operator can see their
+	// own infrastructure's traffic patterns in the dashboard.
 	for _, wIP := range s.cfg.Whitelist.IPs {
 		// Normalize whitelist entry for comparison.
 		if normalizeIP(wIP) == sourceIP {
+			s.logConn(sourceIP, destPort, "", "", portType, "forwarded", "whitelisted_ip")
 			s.routeConnection(conn, portType, portHandler, sourceIP)
 			return
 		}
