@@ -113,6 +113,9 @@ func (d *Dashboard) routes() http.Handler {
 	mux.HandleFunc("/api/ban", d.handleBan)
 	mux.HandleFunc("/api/unban", d.handleUnban)
 	mux.HandleFunc("/api/settings", d.handleSettings)
+	mux.HandleFunc("/api/timeline", d.handleTimeline)
+	mux.HandleFunc("/api/search", d.handleSearch)
+	mux.HandleFunc("/api/export", d.handleExport)
 
 	var handler http.Handler = mux
 	if d.cfg.Auth.Username != "" && d.cfg.Auth.Password != "" {
