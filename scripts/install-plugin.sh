@@ -20,7 +20,7 @@ die()     { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 # ── Defaults ────────────────────────────────────────────────────────────────
 SKYGUARD_DIR="${SKYGUARD_DIR:-/opt/skyguard}"
 CONFIG_DIR="/etc/skyguard"
-DATA_DIR="/data"
+DATA_DIR="/var/lib/skyguard"   # host path; mounted at /data inside the container
 COMPOSE_FILE="docker-compose.yml"
 IMAGE_NAME="skyguard:latest"
 SERVICE_NAME="skyguard"
@@ -55,12 +55,14 @@ check_docker() {
       apt-get update -qq
       apt-get install -y -qq ca-certificates curl gnupg lsb-release
       mkdir -p /etc/apt/keyrings
-      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      # shellcheck source=/dev/null
+      local repo_os codename
+      codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")
+      if grep -qi ubuntu /etc/os-release; then repo_os=ubuntu; else repo_os=debian; fi
+      curl -fsSL "https://download.docker.com/linux/${repo_os}/gpg" \
+        | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
       echo \
-        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-        https://download.docker.com/linux/ubuntu \
-        $(lsb_release -cs) stable" \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${repo_os} ${codename} stable" \
         | tee /etc/apt/sources.list.d/docker.list > /dev/null
       apt-get update -qq
       apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
@@ -84,11 +86,11 @@ check_docker() {
     DOCKER_COMPOSE="docker-compose"
   else
     warn "docker compose plugin not found. Installing..."
-    DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.docker}"
+    DOCKER_CONFIG="/usr/local/lib/docker"   # system-wide, also visible to systemd
     mkdir -p "$DOCKER_CONFIG/cli-plugins"
-    COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest \
-      | grep -oP '"tag_name": "\K[^"]+' | head -1 || echo "v2.27.0")
-    curl -SL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" \
+    COMPOSE_VERSION="v2.29.7"
+    # Release assets are lower-case (docker-compose-linux-x86_64).
+    curl -fSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-$(uname -m)" \
       -o "$DOCKER_CONFIG/cli-plugins/docker-compose"
     chmod +x "$DOCKER_CONFIG/cli-plugins/docker-compose"
     DOCKER_COMPOSE="docker compose"
@@ -133,6 +135,7 @@ create_config() {
 
   while true; do
     read -rsp "$(echo -e "${CYAN}Dashboard password: ${RESET}")" DASH_PASS; echo
+    if [[ "$DASH_PASS" == *[\"\\]* ]]; then warn "Password must not contain quotes or backslashes."; continue; fi
     [[ ${#DASH_PASS} -ge 8 ]] && break
     warn "Password must be at least 8 characters."
   done
@@ -166,23 +169,25 @@ create_config() {
 
 general:
   log_level: "info"
-  data_dir: "$DATA_DIR"
+  data_dir: "/data"        # container path (host: $DATA_DIR)
 
 stealth_services:
   - name: "ssh"
     listen_port: $STEALTH_PORT
     real_target: "127.0.0.1:22"
     protocol_signature: "SSH-2.0-"
-    timeout: 10s
+    timeout: "10s"
     allowed_countries: []
 
 honeypot_services:
+  # Disabled: the real sshd owns port 22 (stealth forwards to it). Use
+  # scripts/enable-ssh-honeypot.sh to move sshd and enable this safely.
   - name: "fake-ssh"
+    enabled: false
     port: 22
     type: "ssh"
     banner: "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"
     max_auth_attempts: 3
-    fake_shell: false
 
   - name: "fake-ftp"
     port: 21
@@ -201,13 +206,14 @@ honeypot_services:
 
 passthrough_services:
   - name: "web"
+    enabled: false
     listen_port: 443
     real_target: "127.0.0.1:8443"
 
 analysis:
   geoip:
     enabled: $GEOIP_ENABLED
-    db_path: "$DATA_DIR/GeoLite2-City.mmdb"
+    db_path: "/data/GeoLite2-City.mmdb"
   rate_limit:
     max_per_minute: 20
     max_per_hour: 200
@@ -215,7 +221,8 @@ analysis:
     enabled: true
     score_threshold: 50
     ban_duration: "24h"
-    method: "none"
+    method: "iptables"
+    iptables_backend: "auto"
     scoring:
       honeypot_connection: 10
       failed_credential: 15
@@ -236,17 +243,17 @@ dashboard:
   enabled: true
   listen: "127.0.0.1:9090"
   auth:
-    username: "$DASH_USER"
-    password: "$DASH_PASS"
+    username: "${DASH_USER//\"/}"
+    password: "${DASH_PASS//\"/}"
 
 logging:
   database: "sqlite"
-  db_path: "$DATA_DIR/skyguard.db"
+  db_path: "/data/skyguard.db"
   retention_days: 90
   log_first_bytes: 512
 YAML
 
-  chmod 640 "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
   success "Config written to $CONFIG_FILE"
 }
 
@@ -264,13 +271,15 @@ write_compose() {
   COMPOSE_PATH="$SKYGUARD_DIR/$COMPOSE_FILE"
   info "Writing $COMPOSE_PATH..."
   cat > "$COMPOSE_PATH" <<COMPOSE
-version: "3.9"
 services:
   skyguard:
     image: $IMAGE_NAME
     container_name: $SERVICE_NAME
     restart: unless-stopped
     network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     volumes:
       - $CONFIG_DIR/skyguard.yaml:/etc/skyguard/skyguard.yaml:ro
       - $DATA_DIR:/data
@@ -281,6 +290,11 @@ services:
       options:
         max-size: "50m"
         max-file: "5"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/skyguard", "-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 COMPOSE
   success "docker-compose.yml written."
 }
@@ -303,10 +317,8 @@ RemainAfterExit=yes
 WorkingDirectory=$SKYGUARD_DIR
 ExecStart=/usr/bin/env bash -c '${DOCKER_COMPOSE} -f $SKYGUARD_DIR/$COMPOSE_FILE up -d'
 ExecStop=/usr/bin/env bash -c '${DOCKER_COMPOSE} -f $SKYGUARD_DIR/$COMPOSE_FILE down'
-ExecReload=/usr/bin/env bash -c '${DOCKER_COMPOSE} -f $SKYGUARD_DIR/$COMPOSE_FILE pull && ${DOCKER_COMPOSE} -f $SKYGUARD_DIR/$COMPOSE_FILE up -d'
+ExecReload=/usr/bin/env bash -c '${DOCKER_COMPOSE} -f $SKYGUARD_DIR/$COMPOSE_FILE up -d --force-recreate'
 TimeoutStartSec=120
-Restart=on-failure
-RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
@@ -338,7 +350,7 @@ healthcheck() {
     if docker ps --filter "name=$SERVICE_NAME" --filter "status=running" | grep -q "$SERVICE_NAME"; then
       # Give it a few more seconds then check dashboard
       sleep 3
-      if curl -sf --max-time 5 "http://127.0.0.1:9090/api/stats" -o /dev/null 2>/dev/null; then
+      if curl -sf --max-time 5 "http://127.0.0.1:9090/healthz" -o /dev/null 2>/dev/null; then
         success "SkyGuard dashboard responding at http://127.0.0.1:9090"
         return 0
       fi
@@ -379,6 +391,10 @@ main() {
   fi
 
   build_image
+  # Reject a broken config before it turns into a crash-looping container.
+  docker run --rm --entrypoint /usr/local/bin/skyguard \
+    -v "$CONFIG_DIR/skyguard.yaml:/etc/skyguard/skyguard.yaml:ro" "$IMAGE_NAME" \
+    -check-config -config /etc/skyguard/skyguard.yaml || die "Invalid config: $CONFIG_DIR/skyguard.yaml"
   write_compose
   install_systemd
   start_container
@@ -386,4 +402,4 @@ main() {
   print_summary
 }
 
-main
+main "$@"

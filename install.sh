@@ -30,11 +30,12 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
 # ── parse --lang flag (must happen before any i18n call) ─────────────────────
 SKYGUARD_LANG="${SKYGUARD_LANG:-en}"
-for arg in "$@"; do
-    case "$arg" in
-        --lang=*) SKYGUARD_LANG="${arg#--lang=}" ;;
-        --lang)   shift; SKYGUARD_LANG="${1:-en}" ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --lang=*) SKYGUARD_LANG="${1#--lang=}" ;;
+        --lang)   SKYGUARD_LANG="${2:-en}"; shift ;;
     esac
+    shift
 done
 # Normalise: accept "tr", "TR", "turkish", "türkçe"
 case "${SKYGUARD_LANG,,}" in
@@ -82,7 +83,7 @@ declare -A I18N_EN=(
     [q_country_hint]="Common codes: CN RU KP IR BY VN ID"
     [sec_stealth_ssh]="Stealth SSH"
     [stealth_desc1]="Stealth SSH hides your real SSH behind a random port."
-    [stealth_desc2]="Nmap sees the port as 'filtered'. Only real SSH clients are forwarded."
+    [stealth_desc2]="Scanners get no banner (nmap shows 'tcpwrapped'). Only real SSH clients are forwarded."
     [q_enable_stealth]="Enable Stealth SSH?"
     [q_stealth_port]="Public port for stealth SSH (clients connect here)"
     [q_real_ssh_port]="Actual SSH daemon port (currently listening on)"
@@ -183,6 +184,20 @@ declare -A I18N_EN=(
     [err_no_pkg_mgr]="No supported package manager found (apt/dnf/yum)."
     [err_unknown_os]="Unrecognised OS: '%s'. Attempting generic setup (apt/yum auto-detect)."
     [err_no_docker_auto]="Cannot auto-install Docker on this system. Please install manually: https://docs.docker.com/engine/install/"
+
+    # validation / safety
+    [invalid_value]="Invalid value '%s' — using default %s"
+    [port_in_use]="Port %s is already used by '%s' — %s will be disabled."
+    [fake_ssh_hint]="Port 22 belongs to the real sshd. After installation run scripts/enable-ssh-honeypot.sh to move sshd and enable the SSH honeypot safely."
+    [stealth_port_busy]="Stealth port %s is already in use by '%s'. Choose another port."
+    [ban_method_info]="Firewall method: iptables (SkyGuard runs in Docker; it adds its own SKYGUARD chain on the host and leaves ufw/firewalld rules alone)."
+    [config_invalid]="Generated configuration was rejected by SkyGuard:"
+    [stealth_ok]="Stealth SSH answers on port %s (forwarded to the real sshd)."
+    [stealth_fail]="Stealth SSH did not answer on port %s — port 22 is left OPEN so you cannot lock yourself out."
+    [q_block_22]="Block direct access to port 22 now? (keep this session open and test 'ssh -p %s' from a second terminal first)"
+    [block22_later]="Port 22 left open. To hide it later: iptables -I INPUT ! -i lo -p tcp --dport 22 -j DROP"
+    [fw_frontend]="Detected firewall front-end: %s — ports will be opened through it."
+    [pass_newline]="The password must not contain quotes, backslashes or newlines."
 )
 
 # ── Turkish strings ───────────────────────────────────────────────────────────
@@ -220,7 +235,7 @@ declare -A I18N_TR=(
     [q_country_hint]="Yaygın kodlar: CN RU KP IR BY VN ID"
     [sec_stealth_ssh]="Stealth SSH"
     [stealth_desc1]="Stealth SSH, gerçek SSH'ınızı rastgele bir port arkasına gizler."
-    [stealth_desc2]="Nmap portu 'filtered' olarak görür. Yalnızca gerçek SSH istemcileri yönlendirilir."
+    [stealth_desc2]="Tarayıcılar hiçbir banner alamaz (nmap 'tcpwrapped' gösterir). Yalnızca gerçek SSH istemcileri yönlendirilir."
     [q_enable_stealth]="Stealth SSH etkinleştirilsin mi?"
     [q_stealth_port]="Stealth SSH için genel port (istemciler buraya bağlanır)"
     [q_real_ssh_port]="Gerçek SSH daemon portu (şu an dinleniyor)"
@@ -321,6 +336,20 @@ declare -A I18N_TR=(
     [err_no_pkg_mgr]="Desteklenen paket yöneticisi bulunamadı (apt/dnf/yum)."
     [err_unknown_os]="Tanımlanamayan OS: '%s'. Genel kurulum deneniyor (apt/yum otomatik tespit)."
     [err_no_docker_auto]="Bu sistemde Docker otomatik kurulamaz. Lütfen manuel kurun: https://docs.docker.com/engine/install/"
+
+    # doğrulama / güvenlik
+    [invalid_value]="Geçersiz değer '%s' — varsayılan %s kullanılıyor"
+    [port_in_use]="Port %s zaten '%s' tarafından kullanılıyor — %s devre dışı bırakılacak."
+    [fake_ssh_hint]="Port 22 gerçek sshd'ye ait. Kurulumdan sonra sshd'yi taşıyıp SSH honeypot'u güvenle açmak için scripts/enable-ssh-honeypot.sh çalıştırın."
+    [stealth_port_busy]="Stealth portu %s zaten '%s' tarafından kullanılıyor. Başka bir port seçin."
+    [ban_method_info]="Güvenlik duvarı yöntemi: iptables (SkyGuard Docker içinde çalışır; host'ta kendi SKYGUARD zincirini kullanır, ufw/firewalld kurallarına dokunmaz)."
+    [config_invalid]="Oluşturulan yapılandırma SkyGuard tarafından reddedildi:"
+    [stealth_ok]="Stealth SSH %s portunda yanıt veriyor (gerçek sshd'ye yönlendiriliyor)."
+    [stealth_fail]="Stealth SSH %s portunda yanıt vermedi — kilitlenmemeniz için port 22 AÇIK bırakıldı."
+    [q_block_22]="Port 22'ye doğrudan erişim şimdi kapatılsın mı? (bu oturumu açık tutun ve önce ikinci bir terminalden 'ssh -p %s' deneyin)"
+    [block22_later]="Port 22 açık bırakıldı. Sonradan gizlemek için: iptables -I INPUT ! -i lo -p tcp --dport 22 -j DROP"
+    [fw_frontend]="Tespit edilen güvenlik duvarı arayüzü: %s — portlar onun üzerinden açılacak."
+    [pass_newline]="Parola tırnak, ters eğik çizgi veya satır sonu içeremez."
 )
 
 # ── Translation function ───────────────────────────────────────────────────────
@@ -371,8 +400,46 @@ prompt_secret() {
     local msg="$1"
     local val
     read -rsp "$(echo -e "${YELLOW}[?]${RESET}    ${msg}: ")" val
-    echo
-    echo "$val"
+    # The newline goes to stderr: stdout is captured by $(...), and a stray
+    # leading newline used to end up inside the stored dashboard password.
+    echo >&2
+    printf '%s' "$val"
+}
+
+# prompt_match MSG DEFAULT REGEX — re-uses the default when the answer does
+# not match REGEX, so a typo cannot produce a config SkyGuard refuses to load.
+prompt_match() {
+    local msg="$1" default="$2" re="$3" val
+    val=$(prompt "$msg" "$default")
+    if [[ "$val" =~ $re ]]; then
+        echo "$val"
+    else
+        warn "$(t invalid_value "$val" "$default")" >&2
+        echo "$default"
+    fi
+}
+RE_PORT='^([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$'
+RE_INT='^[1-9][0-9]*$'
+RE_DURATION='^(0|([0-9]+d)?([0-9]+(h|m|s))*)$'
+RE_HOSTPORT='^[A-Za-z0-9._:-]+:[0-9]+$'
+
+# yaml_str VALUE — double-quoted YAML scalar with \ and " escaped.
+yaml_str() {
+    local v="${1//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '"%s"' "$v"
+}
+
+# port_owner PORT — prints the process listening on TCP PORT (empty if free).
+# A listener that belongs to SkyGuard itself (re-install) counts as free.
+port_owner() {
+    local port="$1" line proc
+    command -v ss &>/dev/null || return 0
+    line=$(ss -Htlnp "sport = :${port}" 2>/dev/null | head -1 || true)
+    [[ -z "$line" ]] && return 0
+    proc=$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$line")
+    [[ "$proc" == "skyguard" ]] && return 0
+    echo "${proc:-unknown}"
 }
 
 # ── root check ────────────────────────────────────────────────────────────────
@@ -477,7 +544,7 @@ echo
 info "$(t q_country_hint)"
 BLACKLIST_COUNTRIES=""
 if confirm "$(t q_blacklist_countries)" "n"; then
-    BLACKLIST_COUNTRIES=$(prompt "$(t q_blacklist_codes)" "CN RU KP")
+    BLACKLIST_COUNTRIES=$(prompt "$(t q_blacklist_codes)" "CN RU KP" | tr '[:lower:],' '[:upper:] ')
 fi
 
 # -- stealth SSH --
@@ -491,8 +558,13 @@ REAL_SSH_HOST="127.0.0.1"
 REAL_SSH_PORT="22"
 if confirm "$(t q_enable_stealth)"; then
     ENABLE_STEALTH_SSH=true
-    STEALTH_SSH_PORT=$(prompt "$(t q_stealth_port)" "9911")
-    REAL_SSH_PORT=$(prompt "$(t q_real_ssh_port)" "22")
+    while true; do
+        STEALTH_SSH_PORT=$(prompt_match "$(t q_stealth_port)" "9911" "$RE_PORT")
+        owner=$(port_owner "$STEALTH_SSH_PORT")
+        [[ -z "$owner" ]] && break
+        warn "$(t stealth_port_busy "$STEALTH_SSH_PORT" "$owner")"
+    done
+    REAL_SSH_PORT=$(prompt_match "$(t q_real_ssh_port)" "22" "$RE_PORT")
     info "$(t stealth_note "$STEALTH_SSH_PORT" "$PUBLIC_IP")"
 fi
 
@@ -512,7 +584,7 @@ PASSTHROUGH_HTTPS=false
 PASSTHROUGH_HTTPS_TARGET="127.0.0.1:8443"
 if confirm "$(t q_passthrough_https)" "n"; then
     PASSTHROUGH_HTTPS=true
-    PASSTHROUGH_HTTPS_TARGET=$(prompt "$(t q_passthrough_target)" "127.0.0.1:8443")
+    PASSTHROUGH_HTTPS_TARGET=$(prompt_match "$(t q_passthrough_target)" "127.0.0.1:8443" "$RE_HOSTPORT")
 fi
 
 # -- GeoIP --
@@ -530,13 +602,11 @@ AUTO_BAN_THRESHOLD=50
 AUTO_BAN_DURATION="24h"
 if confirm "$(t q_enable_autoban)"; then
     AUTO_BAN_ENABLED=true
-    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        AUTO_BAN_METHOD=$(prompt "$(t q_ban_method) (ufw/iptables)" "ufw")
-    else
-        AUTO_BAN_METHOD=$(prompt "$(t q_ban_method) (iptables/ufw)" "iptables")
-    fi
-    AUTO_BAN_THRESHOLD=$(prompt "$(t q_ban_threshold)" "50")
-    AUTO_BAN_DURATION=$(prompt "$(t q_ban_duration)" "24h")
+    # ufw inside the container would only edit the container's own rules, so
+    # the Docker deployment always uses iptables (SkyGuard's own chain).
+    info "$(t ban_method_info)"
+    AUTO_BAN_THRESHOLD=$(prompt_match "$(t q_ban_threshold)" "50" "$RE_INT")
+    AUTO_BAN_DURATION=$(prompt_match "$(t q_ban_duration)" "24h" "$RE_DURATION")
 fi
 
 # -- dashboard --
@@ -547,10 +617,13 @@ DASHBOARD_USER="admin"
 DASHBOARD_PASS=""
 if confirm "$(t q_enable_dashboard "$DASHBOARD_PORT")"; then
     DASHBOARD_ENABLED=true
-    DASHBOARD_USER=$(prompt "$(t q_dash_user)" "admin")
+    DASHBOARD_USER=$(prompt_match "$(t q_dash_user)" "admin" '^[A-Za-z0-9._@-]+$')
     while true; do
         DASHBOARD_PASS=$(prompt_secret "$(t q_dash_pass)")
         CONFIRM_PASS=$(prompt_secret "$(t q_dash_pass_confirm)")
+        if [[ "$DASHBOARD_PASS" == *[\"\\$'\n']* ]]; then
+            warn "$(t pass_newline)"; continue
+        fi
         [[ "$DASHBOARD_PASS" == "$CONFIRM_PASS" ]] && break
         warn "$(t dash_pass_mismatch)"
     done
@@ -560,7 +633,34 @@ if confirm "$(t q_enable_dashboard "$DASHBOARD_PORT")"; then
     fi
 fi
 
-LOG_RETENTION=$(prompt "$(t q_log_retention)" "90")
+LOG_RETENTION=$(prompt_match "$(t q_log_retention)" "90" "$RE_INT")
+
+# -- port conflicts --
+# A honeypot cannot bind a port another process already holds; SkyGuard would
+# refuse to start (the old installer only printed a warning and then
+# crash-looped). Disable the conflicting honeypot instead.
+check_port() {  # VAR PORT LABEL
+    local var="$1" port="$2" label="$3" owner
+    ${!var} || return 0
+    owner=$(port_owner "$port")
+    if [[ -n "$owner" ]]; then
+        warn "$(t port_in_use "$port" "$owner" "$label")"
+        printf -v "$var" false
+        [[ "$port" == 22 ]] && warn "$(t fake_ssh_hint)"
+    fi
+    return 0
+}
+if $ENABLE_STEALTH_SSH && $HONEYPOT_SSH && [[ "$REAL_SSH_PORT" == 22 ]]; then
+    # Stealth forwards to the real sshd on :22, so the honeypot cannot have it.
+    warn "$(t fake_ssh_hint)"
+    HONEYPOT_SSH=false
+fi
+check_port HONEYPOT_SSH      22   "Fake SSH"
+check_port HONEYPOT_FTP      21   "Fake FTP"
+check_port HONEYPOT_MYSQL    3306 "Fake MySQL"
+check_port HONEYPOT_HTTP     80   "Fake HTTP"
+check_port HONEYPOT_HTTP_ALT 8080 "Fake HTTP-Alt"
+check_port PASSTHROUGH_HTTPS 443  "HTTPS passthrough"
 RATE_LIMIT_PER_MINUTE=20
 RATE_LIMIT_PER_HOUR=200
 
@@ -592,25 +692,6 @@ GEO_VAL=$( $GEOIP_ENABLED && t sum_geoip_enabled || t sum_geoip_disabled)
 echo -e "  $(t sum_geoip)       : ${BOLD}${GEO_VAL}${RESET}"
 echo
 
-# Warn about the port-22 bind conflict: if stealth forwards to the real sshd on
-# :22 AND a honeypot is told to bind :22, the honeypot listener cannot start
-# while the real sshd still holds 0.0.0.0:22 — SkyGuard would crash-loop.
-if $ENABLE_STEALTH_SSH && $HONEYPOT_SSH; then
-    echo
-    if [[ "$SKYGUARD_LANG" == "tr" ]]; then
-        warn "DİKKAT: Stealth SSH + port 22 honeypot birlikte seçili."
-        warn "Gerçek sshd 0.0.0.0:22'yi tutuyorsa honeypot 22'yi bağlayamaz; SkyGuard başlamaz."
-        warn "Çözüm: /etc/ssh/sshd_config içine 'ListenAddress 127.0.0.1' ekleyip 'systemctl restart ssh'."
-        warn "Önce 'ssh -p ${STEALTH_SSH_PORT}' ile bağlanabildiğinizi DOĞRULAYIN, yoksa kilitlenirsiniz."
-    else
-        warn "WARNING: Both Stealth SSH and the port-22 honeypot are enabled."
-        warn "If the real sshd holds 0.0.0.0:22, the honeypot cannot bind :22 and SkyGuard won't start."
-        warn "Fix: add 'ListenAddress 127.0.0.1' to /etc/ssh/sshd_config, then 'systemctl restart ssh'."
-        warn "Verify 'ssh -p ${STEALTH_SSH_PORT}' works BEFORE relying on it, or you may lock yourself out."
-    fi
-    echo
-fi
-
 confirm "$(t sec_proceed)" || { info "$(t aborted)"; exit 0; }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -622,10 +703,28 @@ info "$(t pkg_updating)"
 # prompts; a failure aborts the script instead of being silently swallowed.
 eval "$PKG_UPDATE" || die "package cache update failed — check the output above"
 
+# firewalld (RHEL family) and ufw (Ubuntu) manage the ruleset themselves;
+# installing/enabling iptables-services next to firewalld makes them fight
+# over the rules at boot, so only add the persistence service when neither
+# front-end is active.
+FW_FRONTEND="iptables"
+if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    FW_FRONTEND="ufw"
+elif systemctl is-active --quiet firewalld 2>/dev/null; then
+    FW_FRONTEND="firewalld"
+fi
+# Keep an existing iptables flavour (e.g. Arch's iptables-nft would conflict
+# with the "iptables" package).
+IPT_PKG=""; command -v iptables &>/dev/null || IPT_PKG="iptables"
 case "$PKG_MGR" in
-    apt)     eval "$PKG_INSTALL curl wget ca-certificates gnupg lsb-release openssl iptables iptables-persistent netfilter-persistent" || die "package installation failed" ;;
-    yum|dnf) eval "$PKG_INSTALL curl wget ca-certificates openssl iptables iptables-services" || die "package installation failed" ;;
-    pacman)  eval "$PKG_INSTALL curl wget ca-certificates openssl iptables" || die "package installation failed" ;;
+    apt)
+        PERSIST_PKGS=""; [[ "$FW_FRONTEND" == "iptables" ]] && PERSIST_PKGS="iptables-persistent netfilter-persistent"
+        eval "$PKG_INSTALL curl wget ca-certificates gnupg openssl sqlite3 iproute2 iptables $PERSIST_PKGS" || die "package installation failed" ;;
+    yum|dnf)
+        PERSIST_PKGS=""; [[ "$FW_FRONTEND" == "iptables" ]] && PERSIST_PKGS="iptables-services"
+        eval "$PKG_INSTALL curl wget ca-certificates openssl sqlite iproute $IPT_PKG $PERSIST_PKGS" || die "package installation failed" ;;
+    pacman)
+        eval "$PKG_INSTALL curl wget ca-certificates openssl sqlite iproute2 $IPT_PKG" || die "package installation failed" ;;
 esac
 ok "$(t pkg_ok)"
 
@@ -635,26 +734,42 @@ ok "$(t pkg_ok)"
 section "$(t sec_phase2)"
 
 install_docker_apt() {
+    # Docker only publishes repos for debian / ubuntu (and raspbian); derived
+    # distros (Mint, Pop!_OS, ...) must use their Ubuntu/Debian base codename.
+    local repo_os codename
+    # shellcheck source=/dev/null
+    codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")
+    case "$OS_ID" in
+        ubuntu|debian|raspbian) repo_os="$OS_ID" ;;
+        *) if grep -qi ubuntu /etc/os-release; then repo_os="ubuntu"; else repo_os="debian"; fi ;;
+    esac
+    [[ -n "$codename" ]] || die "$(t err_no_docker_auto)"
     apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
     install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    curl -fsSL "https://download.docker.com/linux/${repo_os}/gpg" | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${OS_ID} $(. /etc/os-release && echo "${VERSION_CODENAME}") stable" \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${repo_os} ${codename} stable" \
         | tee /etc/apt/sources.list.d/docker.list > /dev/null
     apt-get update
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 }
 install_docker_rhel() {
-    eval "$PKG_INSTALL yum-utils" || true
+    local repo="centos"
+    case "$OS_ID" in fedora) repo="fedora" ;; rhel) repo="rhel" ;; esac
+    local url="https://download.docker.com/linux/${repo}/docker-ce.repo"
     if command -v dnf &>/dev/null; then
-        dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        dnf install -y dnf-plugins-core || true
+        # dnf5 (Fedora 41+) changed the config-manager syntax.
+        dnf config-manager addrepo --from-repofile="$url" 2>/dev/null \
+            || dnf config-manager --add-repo "$url"
         dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     else
-        yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        yum install -y yum-utils
+        yum-config-manager --add-repo "$url"
         yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     fi
 }
-install_docker_arch() { pacman -S --noconfirm --needed docker docker-compose; }
+install_docker_arch() { pacman -S --noconfirm --needed docker docker-compose docker-buildx; }
 
 if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
     DOCKER_VER=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "unknown")
@@ -671,13 +786,18 @@ else
     ok "$(t docker_ok)"
 fi
 
-if ! docker compose version &>/dev/null 2>&1; then
-    if ! command -v docker-compose &>/dev/null; then
-        COMPOSE_VER="v2.27.1"
-        curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VER}/docker-compose-$(uname -s)-$(uname -m)" \
-            -o /usr/local/bin/docker-compose
-        chmod +x /usr/local/bin/docker-compose
-    fi
+# Everything below (and the systemd unit) uses "docker compose", so a missing
+# v2 plugin is installed as a CLI plugin rather than as the legacy
+# docker-compose binary (which "docker compose" would never find).
+if ! docker compose version &>/dev/null; then
+    COMPOSE_VER="v2.29.7"
+    PLUGIN_DIR="/usr/local/lib/docker/cli-plugins"
+    mkdir -p "$PLUGIN_DIR"
+    # Release assets are lower-case: docker-compose-linux-x86_64 / -aarch64.
+    curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VER}/docker-compose-linux-$(uname -m)" \
+        -o "${PLUGIN_DIR}/docker-compose" || die "could not download docker compose"
+    chmod +x "${PLUGIN_DIR}/docker-compose"
+    docker compose version &>/dev/null || die "docker compose is still unavailable"
 fi
 ok "$(t compose_ok)"
 
@@ -712,19 +832,30 @@ _whitelist_yaml() {
     echo "    - \"127.0.0.1\""; echo "    - \"::1\""
     [[ -n "$OWN_IP" ]] && echo "    - \"${OWN_IP}\"  # your public IP"
     if [[ -n "$EXTRA_WHITELIST_IPS" ]]; then
-        IFS=',' read -ra EX <<< "$EXTRA_WHITELIST_IPS"
-        for ip in "${EX[@]}"; do ip_c=$(echo "$ip"|tr -d ' '); [[ -n "$ip_c" ]] && echo "    - \"${ip_c}\""; done
+        local ip EX
+        IFS=', ' read -ra EX <<< "$EXTRA_WHITELIST_IPS"
+        for ip in "${EX[@]}"; do
+            [[ -z "$ip" ]] && continue
+            if [[ "$ip" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]]; then
+                echo "    - \"${ip}\""
+            else
+                warn "$(t invalid_value "$ip" "-")" >&2
+            fi
+        done
     fi
     echo "  countries: []"
 }
 
 _blacklist_yaml() {
     echo "  ips: []"
-    if [[ -n "$BLACKLIST_COUNTRIES" ]]; then
-        echo "  countries:"
-        read -ra CCS <<< "$BLACKLIST_COUNTRIES"
-        for cc in "${CCS[@]}"; do echo "    - \"${cc}\""; done
-    else echo "  countries: []"; fi
+    local cc CCS out=""
+    # The script runs with IFS=$'\n\t'; split on spaces explicitly, otherwise
+    # "CN RU KP" became one bogus country code.
+    IFS=' ' read -ra CCS <<< "$BLACKLIST_COUNTRIES"
+    for cc in "${CCS[@]}"; do
+        [[ "$cc" =~ ^[A-Z]{2}$ ]] && out+="    - \"${cc}\""$'\n'
+    done
+    if [[ -n "$out" ]]; then echo "  countries:"; printf '%s' "$out"; else echo "  countries: []"; fi
 }
 
 _honeypot_yaml() {
@@ -742,7 +873,7 @@ _stealth_yaml() {
 }
 
 _passthrough_yaml() {
-    $PASSTHROUGH_HTTPS && printf "  - name: \"web\"\n    listen_port: 443\n    real_target: \"%s\"\n\n" "$PASSTHROUGH_HTTPS_TARGET"
+    $PASSTHROUGH_HTTPS && printf "  - name: \"web\"\n    listen_port: 443\n    real_target: %s\n\n" "$(yaml_str "$PASSTHROUGH_HTTPS_TARGET")"
     return 0
 }
 
@@ -775,6 +906,7 @@ analysis:
     score_threshold: ${AUTO_BAN_THRESHOLD}
     ban_duration: "${AUTO_BAN_DURATION}"
     method: "${AUTO_BAN_METHOD}"
+    iptables_backend: "auto"
     scoring:
       honeypot_connection: 10
       failed_credential: 15
@@ -792,8 +924,8 @@ dashboard:
   enabled: ${DASHBOARD_ENABLED}
   listen: "127.0.0.1:${DASHBOARD_PORT}"
   auth:
-    username: "${DASHBOARD_USER}"
-    password: "${DASHBOARD_PASS}"
+    username: $(yaml_str "${DASHBOARD_USER}")
+    password: $(yaml_str "${DASHBOARD_PASS}")
 
 logging:
   database: "sqlite"
@@ -816,63 +948,75 @@ if [[ ! -f "${CONFIG_DIR}/iptables.pre-skyguard.bak" ]] && command -v iptables-s
     iptables-save > "${CONFIG_DIR}/iptables.pre-skyguard.bak" 2>/dev/null || true
 fi
 
-iptables -N SKYGUARD 2>/dev/null || iptables -F SKYGUARD
+# SkyGuard (inside the container) creates and manages the SKYGUARD chain
+# itself; we only make sure the jump exists early so bans win over ACCEPTs.
+iptables -N SKYGUARD 2>/dev/null || true
 iptables -C INPUT -j SKYGUARD 2>/dev/null || iptables -I INPUT 1 -j SKYGUARD
-iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -A INPUT -i lo -j ACCEPT
-iptables -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-[[ -n "$OWN_IP" ]] && {
-    iptables -C INPUT -s "${OWN_IP}" -j ACCEPT 2>/dev/null || iptables -I INPUT 2 -s "${OWN_IP}" -j ACCEPT
-}
+[[ "$FW_FRONTEND" != "iptables" ]] && info "$(t fw_frontend "$FW_FRONTEND")"
+
+# Record what we open so uninstall.sh can undo exactly that (restoring an old
+# iptables snapshot would also wipe rules Docker/ufw added since).
+FW_STATE="${CONFIG_DIR}/firewall.state"
+echo "frontend=${FW_FRONTEND}" >> "$FW_STATE"
 
 open_port() {
     local port="$1" proto="${2:-tcp}"
-    iptables -C INPUT -p "${proto}" --dport "${port}" -j ACCEPT 2>/dev/null || \
-        iptables -A INPUT -p "${proto}" --dport "${port}" -j ACCEPT
+    case "$FW_FRONTEND" in
+        ufw)       ufw allow "${port}/${proto}" >/dev/null ;;
+        firewalld) firewall-cmd --quiet --permanent --add-port="${port}/${proto}" ;;
+        *)         iptables -C INPUT -p "${proto}" --dport "${port}" -j ACCEPT 2>/dev/null || \
+                       iptables -A INPUT -p "${proto}" --dport "${port}" -j ACCEPT ;;
+    esac
+    echo "port=${port}/${proto}" >> "$FW_STATE"
     info "$(t iptables_open "$port" "$proto")"
 }
 
-# Reconcile the port-22 rule deterministically. Repeated installs — or flipping
-# the SSH-honeypot choice between runs — must never leave a stale ACCEPT
-# shadowing a DROP (or vice versa), which would silently keep real SSH exposed.
-# Strip both first, then add exactly what this config needs.
-while iptables -C INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null; do iptables -D INPUT -p tcp --dport 22 -j ACCEPT; done
-while iptables -C INPUT -p tcp --dport 22 -j DROP   2>/dev/null; do iptables -D INPUT -p tcp --dport 22 -j DROP;   done
-
-$ENABLE_STEALTH_SSH && open_port "${STEALTH_SSH_PORT}"
-
-if $HONEYPOT_SSH; then
-    open_port 22                                       # fake SSH must be reachable
-elif $ENABLE_STEALTH_SSH; then
-    iptables -A INPUT -p tcp --dport 22 -j DROP        # hide real SSH; use stealth port
-    warn "$(t iptables_block22 "$STEALTH_SSH_PORT")"
+if [[ "$FW_FRONTEND" == "iptables" ]]; then
+    iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || iptables -A INPUT -i lo -j ACCEPT
+    iptables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    [[ -n "$OWN_IP" && "$OWN_IP" != *:* ]] && {
+        iptables -C INPUT -s "${OWN_IP}" -j ACCEPT 2>/dev/null || iptables -I INPUT 2 -s "${OWN_IP}" -j ACCEPT
+    }
 fi
 
+# Remove port-22 rules left by earlier runs; whether 22 gets blocked is
+# decided only after the stealth port has been verified (end of phase 7).
+while iptables -C INPUT -p tcp --dport 22 -j DROP 2>/dev/null; do iptables -D INPUT -p tcp --dport 22 -j DROP; done
+while iptables -C INPUT ! -i lo -p tcp --dport 22 -j DROP 2>/dev/null; do iptables -D INPUT ! -i lo -p tcp --dport 22 -j DROP; done
+
+$ENABLE_STEALTH_SSH && open_port "${STEALTH_SSH_PORT}"
+$HONEYPOT_SSH      && open_port 22
 $HONEYPOT_FTP      && open_port 21
 $HONEYPOT_MYSQL    && open_port 3306
 $HONEYPOT_HTTP     && open_port 80
 $HONEYPOT_HTTP_ALT && open_port 8080
 $PASSTHROUGH_HTTPS && open_port 443
+[[ "$FW_FRONTEND" == "firewalld" ]] && firewall-cmd --quiet --reload
 info "$(t iptables_dash_safe "$DASHBOARD_PORT")"
-iptables -C INPUT -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null || \
-    iptables -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
 
-mkdir -p "$(dirname "${IPTABLES_RULES_FILE}")"
-iptables-save > "${IPTABLES_RULES_FILE}"
-case "$PKG_MGR" in
-    apt)     command -v netfilter-persistent &>/dev/null && netfilter-persistent save &>/dev/null || true ;;
-    yum|dnf) systemctl enable iptables &>/dev/null || true; service iptables save &>/dev/null || true ;;
-    pacman)  systemctl enable iptables &>/dev/null || true ;;
-esac
-ok "$(t iptables_saved "$IPTABLES_RULES_FILE")"
-
-command -v ip6tables &>/dev/null && {
-    ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null || ip6tables -A INPUT -i lo -j ACCEPT
-    ip6tables -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-        ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-    info "$(t ip6_applied)"
+save_iptables() {
+    [[ "$FW_FRONTEND" == "iptables" ]] || return 0
+    mkdir -p "$(dirname "${IPTABLES_RULES_FILE}")"
+    iptables-save > "${IPTABLES_RULES_FILE}"
+    command -v ip6tables-save &>/dev/null && [[ "$IPTABLES_RULES_FILE" == */rules.v4 ]] && \
+        ip6tables-save > "${IPTABLES_RULES_FILE%rules.v4}rules.v6"
+    case "$PKG_MGR" in
+        apt)     command -v netfilter-persistent &>/dev/null && netfilter-persistent save &>/dev/null || true ;;
+        yum|dnf) systemctl enable iptables &>/dev/null || true ;;
+        pacman)  systemctl enable iptables &>/dev/null || true ;;
+    esac
+    ok "$(t iptables_saved "$IPTABLES_RULES_FILE")"
 }
+save_iptables
+
+if command -v ip6tables &>/dev/null && [[ "$FW_FRONTEND" == "iptables" ]]; then
+    ip6tables -C INPUT -i lo -j ACCEPT 2>/dev/null || ip6tables -A INPUT -i lo -j ACCEPT
+    ip6tables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+        ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    info "$(t ip6_applied)"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  PHASE 6 — docker-compose.yml
@@ -880,17 +1024,7 @@ command -v ip6tables &>/dev/null && {
 section "$(t sec_phase6)"
 TZ_VAL=$(cat /etc/timezone 2>/dev/null || timedatectl show --value -p Timezone 2>/dev/null || echo "UTC")
 
-# The healthcheck depends on the dashboard. When the dashboard is disabled,
-# probing it would always fail and mark the container unhealthy, so fall back to
-# a liveness check on PID 1.
-if $DASHBOARD_ENABLED; then
-    HEALTH_TEST="wget -qO- 'http://${DASHBOARD_USER}:${DASHBOARD_PASS}@127.0.0.1:${DASHBOARD_PORT}/api/stats' >/dev/null 2>&1 || exit 1"
-else
-    HEALTH_TEST="kill -0 1 >/dev/null 2>&1 || exit 1"
-fi
-
 cat > "${INSTALL_DIR}/docker-compose.yml" <<COMPOSE
-version: '3.8'
 services:
   skyguard:
     build: .
@@ -913,14 +1047,14 @@ services:
         max-size: "50m"
         max-file: "5"
     healthcheck:
-      test: ["CMD-SHELL", "${HEALTH_TEST}"]
+      # Probes the unauthenticated /healthz endpoint — no password in this file.
+      test: ["CMD", "/usr/local/bin/skyguard", "-healthcheck"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 15s
 COMPOSE
-# The compose file embeds the dashboard password (healthcheck) — restrict it.
-chmod 600 "${INSTALL_DIR}/docker-compose.yml"
+chmod 640 "${INSTALL_DIR}/docker-compose.yml"
 ok "$(t compose_generated "${INSTALL_DIR}/docker-compose.yml")"
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -932,13 +1066,23 @@ info "$(t docker_building)"
 # Show full build output live (so downloads/steps are visible) and keep a log.
 # Note: pipefail makes the previous grep-filtered form fail spuriously when the
 # build succeeds but no line matches the filter, so we stream the raw output.
-if docker compose build --no-cache 2>&1 | tee /tmp/skyguard-build.log; then
+if docker compose build --pull 2>&1 | tee /tmp/skyguard-build.log; then
     ok "$(t docker_build_ok)"
 else
     echo
     warn "Build failed — last 40 lines of /tmp/skyguard-build.log:"
     tail -n 40 /tmp/skyguard-build.log
     die "$(t docker_build_fail)"
+fi
+
+# Validate the generated config with the freshly built binary before starting,
+# instead of discovering a typo through a crash-looping container.
+if ! CHECK_OUT=$(docker run --rm --entrypoint /usr/local/bin/skyguard \
+        -v "${CONFIG_FILE}:/etc/skyguard/skyguard.yaml:ro" skyguard:latest \
+        -check-config -config /etc/skyguard/skyguard.yaml 2>&1); then
+    warn "$(t config_invalid)"
+    echo "$CHECK_OUT"
+    die "fix ${CONFIG_FILE} and re-run, or start manually: cd ${INSTALL_DIR} && docker compose up -d"
 fi
 
 info "$(t docker_starting)"
@@ -953,7 +1097,36 @@ while [[ $WAITED -lt $MAX_WAIT ]]; do
     sleep 2; ((WAITED+=2))
 done
 
-docker ps | grep -q "skyguard" && ok "$(t docker_running)" || die "$(t docker_fail)"
+if [[ "$(docker inspect --format='{{.State.Running}}' skyguard 2>/dev/null)" == "true" ]]; then
+    ok "$(t docker_running)"
+else
+    docker logs --tail=30 skyguard 2>&1 || true
+    die "$(t docker_fail)"
+fi
+
+# Only hide the real SSH port after proving the stealth path reaches sshd.
+# (The old installer dropped port 22 before SkyGuard was even running.)
+if $ENABLE_STEALTH_SSH && ! $HONEYPOT_SSH; then
+    sleep 1
+    if timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/${STEALTH_SSH_PORT}; printf 'SSH-2.0-SkyGuardInstaller\r\n' >&3; head -c 8 <&3" 2>/dev/null | grep -q '^SSH-'; then
+        ok "$(t stealth_ok "$STEALTH_SSH_PORT")"
+        if [[ "$REAL_SSH_PORT" == 22 ]] && confirm "$(t q_block_22 "$STEALTH_SSH_PORT")" "n"; then
+            case "$FW_FRONTEND" in
+                ufw)       ufw deny 22/tcp >/dev/null; ufw delete allow 22/tcp >/dev/null 2>&1 || true; ufw delete allow OpenSSH >/dev/null 2>&1 || true ;;
+                firewalld) firewall-cmd --quiet --permanent --remove-service=ssh; firewall-cmd --quiet --reload ;;
+                *)         iptables -C INPUT ! -i lo -p tcp --dport 22 -j DROP 2>/dev/null || \
+                               iptables -I INPUT 2 ! -i lo -p tcp --dport 22 -j DROP
+                           save_iptables ;;
+            esac
+            echo "block22=1" >> "$FW_STATE"
+            warn "$(t iptables_block22 "$STEALTH_SSH_PORT")"
+        else
+            info "$(t block22_later)"
+        fi
+    else
+        warn "$(t stealth_fail "$STEALTH_SSH_PORT")"
+    fi
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  PHASE 8 — Systemd Watchdog
@@ -1025,7 +1198,8 @@ ${LOG_DIR}/*.log {
     notifempty
 }
 LOGROTATE
-echo "0 3 * * * root sqlite3 ${DATA_DIR}/skyguard.db \".backup '${DATA_DIR}/skyguard.db.bak'\" 2>/dev/null || true" \
+# Online backup (safe while SkyGuard writes, thanks to WAL + sqlite's .backup).
+echo "0 3 * * * root command -v sqlite3 >/dev/null && sqlite3 ${DATA_DIR}/skyguard.db \".timeout 10000\" \".backup '${DATA_DIR}/skyguard.db.bak'\"" \
     > /etc/cron.d/skyguard-backup
 ok "$(t logrotate_ok)"
 
@@ -1061,10 +1235,11 @@ echo
 echo -e "  ${CYAN}$(t final_useful)${RESET}"
 echo -e "    docker logs skyguard -f"
 echo -e "    docker exec -it skyguard sh"
-echo -e "    iptables -L SKYGUARD -n --line-numbers"
+echo -e "    iptables -S SKYGUARD        # active bans"
+echo -e "    docker exec skyguard skyguard -check-config"
 echo
 $GEOIP_ENABLED && { echo -e "  ${YELLOW}⚠  $(t final_geoip_warn "$DATA_DIR")${RESET}"; echo; }
 echo -e "  ${CYAN}$(t final_listeners)${RESET}"
-docker exec skyguard sh -c "wget -qO- 'http://${DASHBOARD_USER}:${DASHBOARD_PASS}@127.0.0.1:${DASHBOARD_PORT}/api/stats' 2>/dev/null" || true
+ss -Htlnp 2>/dev/null | grep '"skyguard"' | awk '{print "    " $4}' || true
 echo
 ok "$(t final_done)"

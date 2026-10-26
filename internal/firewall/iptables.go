@@ -5,87 +5,236 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
-	"time"
+	"sync"
 )
 
-// IPTablesFirewall implements Firewall via the iptables command-line tool.
+// Chain is the dedicated chain that holds SkyGuard's DROP rules. It is jumped
+// to from the top of INPUT, so bans take precedence over ACCEPT rules and the
+// whole set can be removed with a single flush (uninstall.sh does this).
+const Chain = "SKYGUARD"
+
+// IPTablesFirewall implements Firewall via iptables / ip6tables.
 type IPTablesFirewall struct {
-	logger *slog.Logger
+	logger  *slog.Logger
+	run     runner
+	v4, v6  string // binaries; v6 is "" when IPv6 is unavailable
+	backend string // "legacy", "nft" or "default"
+
+	// mu serialises invocations. iptables also takes the xtables lock (-w),
+	// but serialising here keeps check-then-insert sequences atomic.
+	mu sync.Mutex
 }
 
-// BanIP inserts a DROP rule for ip at the top of the INPUT chain.
-// Idempotent: if a matching rule already exists it is not added again, so a
-// banned IP that keeps reconnecting cannot grow the rule table unbounded.
-func (i *IPTablesFirewall) BanIP(ip string, _ time.Duration) error {
-	if err := validateIP(ip); err != nil {
-		return err
+func newIPTables(backend string, logger *slog.Logger, run runner) (*IPTablesFirewall, error) {
+	f := &IPTablesFirewall{logger: logger, run: run}
+	f.v4, f.v6, f.backend = selectBinaries(backend, run)
+	if f.v4 == "" {
+		return nil, fmt.Errorf("iptables binary not found (install the iptables package)")
 	}
-	// "-C" returns exit code 0 when the rule already exists.
-	if exec.Command("iptables", "-C", "INPUT", "-s", ip, "-j", "DROP").Run() == nil {
-		return nil
+	if err := f.ensureChain(f.v4); err != nil {
+		return nil, fmt.Errorf("iptables: %w (does the process have CAP_NET_ADMIN / run as root?)", err)
 	}
-	if err := runCmd("iptables", "-I", "INPUT", "-s", ip, "-j", "DROP"); err != nil {
-		return fmt.Errorf("iptables ban %s: %w", ip, err)
+	if f.v6 != "" {
+		if err := f.ensureChain(f.v6); err != nil {
+			logger.Warn("ip6tables unavailable, IPv6 addresses cannot be banned", "error", err)
+			f.v6 = ""
+		}
 	}
-	if i.logger != nil {
-		i.logger.Info("iptables ban applied", "ip", ip)
-	}
-	return nil
+	logger.Info("iptables firewall ready", "backend", f.backend, "iptables", f.v4, "ip6tables", f.v6, "chain", Chain)
+	return f, nil
 }
 
-// UnbanIP deletes the DROP rule for ip from the INPUT chain.
-func (i *IPTablesFirewall) UnbanIP(ip string) error {
-	if err := validateIP(ip); err != nil {
-		return err
+// selectBinaries picks the iptables flavour. Rules written with iptables-nft
+// are invisible to iptables-legacy (and vice versa), so in "auto" mode we use
+// whichever backend already holds the host's rules — the same heuristic
+// Kubernetes' iptables-wrapper uses.
+func selectBinaries(backend string, run runner) (v4, v6, chosen string) {
+	have := func(bin string) bool { _, err := exec.LookPath(bin); return err == nil }
+	pick := func(suffix string) (string, string) {
+		a, b := "iptables"+suffix, "ip6tables"+suffix
+		if !have(a) {
+			return "", ""
+		}
+		if !have(b) {
+			b = ""
+		}
+		return a, b
 	}
-	if err := runCmd("iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"); err != nil {
-		return fmt.Errorf("iptables unban %s: %w", ip, err)
+
+	switch backend {
+	case "legacy":
+		if a, b := pick("-legacy"); a != "" {
+			return a, b, "legacy"
+		}
+	case "nft":
+		if a, b := pick("-nft"); a != "" {
+			return a, b, "nft"
+		}
+	default: // auto
+		if have("iptables-legacy") && have("iptables-nft") {
+			if countRules(run, "iptables-legacy-save") > countRules(run, "iptables-nft-save") {
+				a, b := pick("-legacy")
+				return a, b, "legacy"
+			}
+			a, b := pick("-nft")
+			return a, b, "nft"
+		}
 	}
-	if i.logger != nil {
-		i.logger.Info("iptables ban removed", "ip", ip)
-	}
-	return nil
+	a, b := pick("")
+	return a, b, "default"
 }
 
-// IsBanned reports whether ip has an exact DROP rule in the INPUT chain.
-// It uses "iptables -C" (rule check) which exits 0 only when the exact rule
-// exists, avoiding the substring false-positive of grep-style matching where
-// "1.2.3.4" would match "1.2.3.40" in plain text output.
-func (i *IPTablesFirewall) IsBanned(ip string) (bool, error) {
-	if err := validateIP(ip); err != nil {
-		return false, err
+func countRules(run runner, saveBin string) int {
+	if _, err := exec.LookPath(saveBin); err != nil {
+		return 0
 	}
-	err := exec.Command("iptables", "-C", "INPUT", "-s", ip, "-j", "DROP").Run()
+	out, err := run(saveBin)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, l := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(l, "-A ") || strings.HasPrefix(l, ":") {
+			n++
+		}
+	}
+	return n
+}
+
+// ipt runs bin with the xtables lock wait flag prepended.
+func (f *IPTablesFirewall) ipt(bin string, args ...string) ([]byte, error) {
+	return f.run(bin, append([]string{"-w", "5"}, args...)...)
+}
+
+// exists runs an iptables -C check. Exit status 1 means "no such rule".
+func (f *IPTablesFirewall) exists(bin string, rule ...string) (bool, error) {
+	out, err := f.ipt(bin, append([]string{"-C"}, rule...)...)
 	if err == nil {
 		return true, nil
 	}
-	// iptables -C exits with code 1 when the rule does not exist — that is not
-	// an error condition; any other exit code indicates a real problem.
-	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+	if exitCode(err) == 1 {
 		return false, nil
 	}
-	return false, fmt.Errorf("iptables -C INPUT -s %s -j DROP: %w", ip, err)
+	return false, fmt.Errorf("%s -C %s: %w (%s)", bin, strings.Join(rule, " "), err, strings.TrimSpace(string(out)))
 }
 
-// BanIPPermanent is identical to BanIP for iptables.
-func (i *IPTablesFirewall) BanIPPermanent(ip string) error {
-	if err := i.BanIP(ip, 0); err != nil {
+func (f *IPTablesFirewall) ensureChain(bin string) error {
+	if _, err := f.ipt(bin, "-S", Chain); err != nil {
+		if out, err := f.ipt(bin, "-N", Chain); err != nil {
+			return fmt.Errorf("%s -N %s: %w (%s)", bin, Chain, err, strings.TrimSpace(string(out)))
+		}
+	}
+	ok, err := f.exists(bin, "INPUT", "-j", Chain)
+	if err != nil {
 		return err
 	}
-	if i.logger != nil {
-		i.logger.Info("iptables permanent ban applied", "ip", ip)
+	if !ok {
+		if out, err := f.ipt(bin, "-I", "INPUT", "1", "-j", Chain); err != nil {
+			return fmt.Errorf("%s -I INPUT -j %s: %w (%s)", bin, Chain, err, strings.TrimSpace(string(out)))
+		}
 	}
 	return nil
 }
 
-// Method implements Firewall.
-func (i *IPTablesFirewall) Method() string { return "iptables" }
-
-// List returns the numbered rules of the INPUT chain.
-func (i *IPTablesFirewall) List() ([]string, error) {
-	out, err := exec.Command("iptables", "-L", "INPUT", "-n", "--line-numbers").CombinedOutput()
+func (f *IPTablesFirewall) binFor(ip string) (string, string, error) {
+	canon, v6, err := parseIP(ip)
 	if err != nil {
-		return nil, fmt.Errorf("iptables -L INPUT: %w (output: %s)", err, strings.TrimSpace(string(out)))
+		return "", "", err
 	}
-	return splitNonEmptyLines(string(out)), nil
+	if v6 {
+		if f.v6 == "" {
+			return "", "", fmt.Errorf("cannot ban IPv6 address %s: ip6tables unavailable", canon)
+		}
+		return f.v6, canon, nil
+	}
+	return f.v4, canon, nil
+}
+
+// Ban inserts a DROP rule for ip at the top of the SKYGUARD chain (idempotent).
+func (f *IPTablesFirewall) Ban(ip string) error {
+	bin, canon, err := f.binFor(ip)
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	ok, err := f.exists(bin, Chain, "-s", canon, "-j", "DROP")
+	if err != nil {
+		return err
+	}
+	if ok {
+		return nil
+	}
+	if out, err := f.ipt(bin, "-I", Chain, "1", "-s", canon, "-j", "DROP"); err != nil {
+		return fmt.Errorf("%s ban %s: %w (%s)", bin, canon, err, strings.TrimSpace(string(out)))
+	}
+	f.logger.Info("firewall ban applied", "ip", canon, "backend", bin)
+	return nil
+}
+
+// Unban deletes every DROP rule for ip, including rules that older SkyGuard
+// versions inserted directly into INPUT.
+func (f *IPTablesFirewall) Unban(ip string) error {
+	bin, canon, err := f.binFor(ip)
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	removed := false
+	for _, chain := range []string{Chain, "INPUT"} {
+		for i := 0; i < 16; i++ { // bounded: duplicates are possible but never many
+			ok, err := f.exists(bin, chain, "-s", canon, "-j", "DROP")
+			if err != nil {
+				return err
+			}
+			if !ok {
+				break
+			}
+			if out, err := f.ipt(bin, "-D", chain, "-s", canon, "-j", "DROP"); err != nil {
+				return fmt.Errorf("%s unban %s: %w (%s)", bin, canon, err, strings.TrimSpace(string(out)))
+			}
+			removed = true
+		}
+	}
+	if removed {
+		f.logger.Info("firewall ban removed", "ip", canon, "backend", bin)
+	}
+	return nil
+}
+
+// IsBanned reports whether ip has a DROP rule in the SKYGUARD chain.
+func (f *IPTablesFirewall) IsBanned(ip string) (bool, error) {
+	bin, canon, err := f.binFor(ip)
+	if err != nil {
+		return false, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.exists(bin, Chain, "-s", canon, "-j", "DROP")
+}
+
+// Method implements Firewall.
+func (f *IPTablesFirewall) Method() string { return "iptables" }
+
+// List returns the rules of the SKYGUARD chain for both address families.
+func (f *IPTablesFirewall) List() ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	lines := []string{fmt.Sprintf("# backend: %s (%s)", f.backend, f.v4)}
+	for _, bin := range []string{f.v4, f.v6} {
+		if bin == "" {
+			continue
+		}
+		out, err := f.ipt(bin, "-S", Chain)
+		if err != nil {
+			return nil, fmt.Errorf("%s -S %s: %w (%s)", bin, Chain, err, strings.TrimSpace(string(out)))
+		}
+		lines = append(lines, "# "+bin)
+		lines = append(lines, splitNonEmptyLines(string(out))...)
+	}
+	return lines, nil
 }

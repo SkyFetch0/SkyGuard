@@ -18,12 +18,17 @@ type FTPHoneypot struct {
 	logger      *slog.Logger
 }
 
+const (
+	ftpMaxLine     = 1024
+	ftpMaxCommands = 50
+)
+
 // NewFTPHoneypot creates an FTPHoneypot.
 func NewFTPHoneypot(cfg config.HoneypotService, eventLogger *EventLogger, logger *slog.Logger) *FTPHoneypot {
 	if cfg.Banner == "" {
-		cfg.Banner = "ProFTPD 1.3.5e Server (Debian) [::ffff:127.0.0.1]"
+		cfg.Banner = "ProFTPD 1.3.5e Server (Debian)"
 	}
-	if cfg.MaxAuthAttempts == 0 {
+	if cfg.MaxAuthAttempts <= 0 {
 		cfg.MaxAuthAttempts = 3
 	}
 	return &FTPHoneypot{cfg: cfg, eventLogger: eventLogger, logger: logger}
@@ -32,76 +37,72 @@ func NewFTPHoneypot(cfg config.HoneypotService, eventLogger *EventLogger, logger
 // Type implements Handler.
 func (f *FTPHoneypot) Type() string { return "ftp" }
 
-// Handle implements Handler.
-// It presents a standard FTP greeting, collects USER/PASS pairs, always
-// rejects them, and closes after MaxAuthAttempts failures.
-func (f *FTPHoneypot) Handle(conn net.Conn, sourceIP string) error {
+// Handle presents an FTP greeting, collects USER/PASS pairs, always rejects
+// them, and closes after MaxAuthAttempts failures.
+func (f *FTPHoneypot) Handle(conn net.Conn, sess Session) error {
 	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(60 * time.Second))
+	attempts, commands := 0, 0
+	var lastCmd string
+	defer func() {
+		f.eventLogger.LogConnection(sess, "ftp",
+			fmt.Sprintf("attempts=%d commands=%d last=%q", attempts, commands, lastCmd))
+	}()
 
-	// Log the initial connection.
-	f.eventLogger.LogConnection(sourceIP, f.cfg.Port, "ftp", "new connection")
-
-	reader := bufio.NewReader(conn)
-
-	// Step 1: Send FTP service-ready banner.
-	if _, err := fmt.Fprintf(conn, "220 %s\r\n", f.cfg.Banner); err != nil {
-		return fmt.Errorf("ftp: write banner: %w", err)
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	reply := func(format string, args ...any) error {
+		_, err := fmt.Fprintf(conn, format+"\r\n", args...)
+		return err
+	}
+	if err := reply("220 %s", f.cfg.Banner); err != nil {
+		return err
 	}
 
-	attempts := 0
-	var currentUser string
-
-	for attempts < f.cfg.MaxAuthAttempts {
-		conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-		line, err := reader.ReadString('\n')
+	reader := bufio.NewReaderSize(conn, ftpMaxLine)
+	currentUser := ""
+	for attempts < f.cfg.MaxAuthAttempts && commands < ftpMaxCommands {
+		_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+		line, err := readLine(reader, ftpMaxLine)
 		if err != nil {
-			return fmt.Errorf("ftp: read command: %w", err)
+			return nil // client went away or misbehaved; already logged in defer
 		}
-		line = strings.TrimSpace(line)
-		if line == "" {
+		line = strings.TrimRight(line, "\r\n")
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
+		commands++
 
-		// FTP commands are case-insensitive; upper-case for easy matching.
-		upper := strings.ToUpper(line)
+		verb, arg, _ := strings.Cut(line, " ")
+		verb = strings.ToUpper(verb)
+		lastCmd = verb
 
-		switch {
-		case strings.HasPrefix(upper, "USER "):
-			currentUser = strings.TrimSpace(line[5:])
-			f.logger.Debug("ftp USER", "source_ip", sourceIP, "user", currentUser)
-			fmt.Fprintf(conn, "331 Password required for %s\r\n", currentUser)
-
-		case strings.HasPrefix(upper, "PASS "):
-			password := strings.TrimSpace(line[5:])
+		switch verb {
+		case "USER":
+			currentUser = strings.TrimSpace(arg)
+			_ = reply("331 Password required for %s", currentUser)
+		case "PASS":
 			attempts++
-
-			f.logger.Info("ftp credential attempt",
-				"source_ip", sourceIP,
-				"user", currentUser,
-				"pass", password,
-				"attempt", attempts,
-			)
-			f.eventLogger.LogCredential(sourceIP, f.cfg.Port, currentUser, password, "ftp")
-
-			fmt.Fprintf(conn, "530 Login incorrect.\r\n")
-
-			if attempts >= f.cfg.MaxAuthAttempts {
-				fmt.Fprintf(conn, "421 Too many failed login attempts. Goodbye.\r\n")
-				return nil
-			}
-
-		case upper == "QUIT":
-			fmt.Fprintf(conn, "221 Goodbye.\r\n")
+			f.logger.Info("ftp credential attempt", "source_ip", sess.IP, "user", currentUser, "attempt", attempts)
+			f.eventLogger.LogCredential(sess, currentUser, arg, "ftp")
+			time.Sleep(300 * time.Millisecond)
+			_ = reply("530 Login incorrect.")
+		case "QUIT":
+			_ = reply("221 Goodbye.")
 			return nil
-
+		case "SYST":
+			_ = reply("215 UNIX Type: L8")
+		case "FEAT":
+			_ = reply("211-Features:\r\n MDTM\r\n SIZE\r\n UTF8\r\n211 End")
+		case "AUTH":
+			_ = reply("500 AUTH not understood")
+		case "NOOP":
+			_ = reply("200 NOOP command successful")
 		default:
-			// Any other command before successful login.
-			fmt.Fprintf(conn, "530 Please login with USER and PASS.\r\n")
+			_ = reply("530 Please login with USER and PASS")
 		}
 	}
-
+	if attempts >= f.cfg.MaxAuthAttempts {
+		_ = reply("421 Too many failed login attempts. Goodbye.")
+	}
 	return nil
 }

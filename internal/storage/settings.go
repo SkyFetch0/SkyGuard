@@ -14,12 +14,14 @@ import (
 type AutoBanSettings struct {
 	Enabled        bool
 	ScoreThreshold int
-	BanDuration    time.Duration
+	BanDuration    time.Duration // 0 = permanent
+}
+
+func (a AutoBanSettings) fingerprint() string {
+	return fmt.Sprintf("%t|%d|%s", a.Enabled, a.ScoreThreshold, a.BanDuration)
 }
 
 // Settings is a thread-safe, DB-backed holder for mutable runtime settings.
-// Values are seeded from the config file on first start and then persisted to
-// the settings table so changes survive restarts.
 type Settings struct {
 	db      *DB
 	mu      sync.RWMutex
@@ -30,37 +32,58 @@ const (
 	keyAutoBanEnabled   = "autoban_enabled"
 	keyAutoBanThreshold = "autoban_threshold"
 	keyAutoBanDuration  = "autoban_duration"
+	// keyAutoBanSeed remembers which config-file values the stored settings
+	// were derived from. When the operator edits the YAML, the fingerprint
+	// changes and the file wins again; otherwise dashboard overrides persist.
+	keyAutoBanSeed = "autoban_config_seed"
 )
 
-// LoadSettings returns a Settings holder seeded with def, overridden by any
-// values already stored in the database, and writes the effective values back.
-func (d *DB) LoadSettings(def AutoBanSettings) (*Settings, error) {
-	s := &Settings{db: d, autoBan: def}
+// LoadSettings returns the effective runtime settings. Values changed in the
+// dashboard survive restarts, but editing the config file takes precedence
+// over them (previously the first-ever values stuck forever and later YAML
+// edits were silently ignored).
+func (d *DB) LoadSettings(fromConfig AutoBanSettings) (*Settings, error) {
+	s := &Settings{db: d, autoBan: fromConfig}
 
-	if v, ok, err := d.getSetting(keyAutoBanEnabled); err != nil {
+	seed, ok, err := d.getSetting(keyAutoBanSeed)
+	if err != nil {
 		return nil, err
+	}
+	if ok && seed == fromConfig.fingerprint() {
+		if err := s.loadStored(); err != nil {
+			return nil, err
+		}
+	}
+	if err := d.setSetting(keyAutoBanSeed, fromConfig.fingerprint()); err != nil {
+		return nil, err
+	}
+	if err := s.persist(s.autoBan); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Settings) loadStored() error {
+	if v, ok, err := s.db.getSetting(keyAutoBanEnabled); err != nil {
+		return err
 	} else if ok {
 		s.autoBan.Enabled = v == "1" || v == "true"
 	}
-	if v, ok, err := d.getSetting(keyAutoBanThreshold); err != nil {
-		return nil, err
+	if v, ok, err := s.db.getSetting(keyAutoBanThreshold); err != nil {
+		return err
 	} else if ok {
 		if n, e := strconv.Atoi(v); e == nil && n > 0 {
 			s.autoBan.ScoreThreshold = n
 		}
 	}
-	if v, ok, err := d.getSetting(keyAutoBanDuration); err != nil {
-		return nil, err
+	if v, ok, err := s.db.getSetting(keyAutoBanDuration); err != nil {
+		return err
 	} else if ok {
-		if dur, e := time.ParseDuration(v); e == nil {
+		if dur, e := time.ParseDuration(v); e == nil && dur >= 0 {
 			s.autoBan.BanDuration = dur
 		}
 	}
-
-	if err := s.persistLocked(); err != nil {
-		return nil, err
-	}
-	return s, nil
+	return nil
 }
 
 // AutoBan returns a copy of the current auto-ban settings.
@@ -80,23 +103,21 @@ func (s *Settings) SetAutoBan(v AutoBanSettings) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.persist(v); err != nil {
+		return err
+	}
 	s.autoBan = v
-	return s.persistLocked()
+	return nil
 }
 
-// persistLocked writes the current settings to the DB. Caller must hold the
-// lock (read or write) or be in a single-goroutine context (LoadSettings).
-func (s *Settings) persistLocked() error {
-	if err := s.db.setSetting(keyAutoBanEnabled, boolToStr(s.autoBan.Enabled)); err != nil {
+func (s *Settings) persist(v AutoBanSettings) error {
+	if err := s.db.setSetting(keyAutoBanEnabled, boolToStr(v.Enabled)); err != nil {
 		return err
 	}
-	if err := s.db.setSetting(keyAutoBanThreshold, strconv.Itoa(s.autoBan.ScoreThreshold)); err != nil {
+	if err := s.db.setSetting(keyAutoBanThreshold, strconv.Itoa(v.ScoreThreshold)); err != nil {
 		return err
 	}
-	if err := s.db.setSetting(keyAutoBanDuration, s.autoBan.BanDuration.String()); err != nil {
-		return err
-	}
-	return nil
+	return s.db.setSetting(keyAutoBanDuration, v.BanDuration.String())
 }
 
 func (d *DB) getSetting(key string) (string, bool, error) {

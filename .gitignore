@@ -1,0 +1,8 @@
+/bin/
+/data/
+/configs/skyguard.yaml
+*.db
+*.db-shm
+*.db-wal
+*.mmdb
+ssh_honeypot_*_key

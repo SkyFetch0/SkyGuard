@@ -16,8 +16,8 @@ type Detector struct {
 }
 
 type portScanTracker struct {
-	ports     map[int]time.Time
-	firstSeen time.Time
+	ports    map[int]time.Time
+	reported bool // a scan was already reported for the current burst
 }
 
 // NewDetector creates a Detector with the given window and port threshold.
@@ -50,9 +50,11 @@ func (d *Detector) Stop() {
 	}
 }
 
-// RecordPort notes that ip connected to port and returns true when the number
-// of distinct ports within the scan window reaches the threshold.
-func (d *Detector) RecordPort(ip string, port int) bool {
+// RecordPort notes that ip connected to port. scanning is true while the
+// number of distinct ports within the window is at or above the threshold;
+// first is true only for the connection that crossed it, so a scan is scored
+// once per burst instead of once per connection.
+func (d *Detector) RecordPort(ip string, port int) (scanning, first bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -61,10 +63,7 @@ func (d *Detector) RecordPort(ip string, port int) bool {
 
 	tracker, ok := d.portScans[ip]
 	if !ok {
-		tracker = &portScanTracker{
-			ports:     make(map[int]time.Time),
-			firstSeen: now,
-		}
+		tracker = &portScanTracker{ports: make(map[int]time.Time)}
 		d.portScans[ip] = tracker
 	}
 
@@ -77,7 +76,13 @@ func (d *Detector) RecordPort(ip string, port int) bool {
 
 	tracker.ports[port] = now
 
-	return len(tracker.ports) >= d.scanThreshold
+	if len(tracker.ports) < d.scanThreshold {
+		tracker.reported = false
+		return false, false
+	}
+	first = !tracker.reported
+	tracker.reported = true
+	return true, first
 }
 
 // cleanup runs as a background goroutine and removes trackers for IPs that

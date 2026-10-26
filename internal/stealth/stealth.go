@@ -1,7 +1,9 @@
 package stealth
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -13,32 +15,33 @@ import (
 	"github.com/skyguard/skyguard/internal/storage"
 )
 
-// Handler implements protocol-detection–based stealth port logic.
-// Legitimate clients that send the expected signature byte-prefix are
-// forwarded to the real backend; all other connections are closed silently.
+// Handler implements protocol-detection based stealth port logic.
+// Clients whose first bytes match the configured signature are forwarded to
+// the real backend; everything else is closed silently without a banner, so
+// scanners learn nothing about the service.
 type Handler struct {
 	cfg    config.StealthService
 	proxy  *proxy.Proxy
-	db     *storage.DB
 	logger *slog.Logger
 }
 
+// Recorder is called once per connection with the routing decision
+// (storage.ActionForwarded / storage.ActionDropped) and a short reason.
+type Recorder func(action, data string)
+
 // NewHandler creates a new stealth Handler.
-func NewHandler(cfg config.StealthService, prx *proxy.Proxy, db *storage.DB, logger *slog.Logger) *Handler {
-	return &Handler{
-		cfg:    cfg,
-		proxy:  prx,
-		db:     db,
-		logger: logger,
-	}
+func NewHandler(cfg config.StealthService, prx *proxy.Proxy, logger *slog.Logger) *Handler {
+	return &Handler{cfg: cfg, proxy: prx, logger: logger}
 }
 
 // Name returns the service name from config.
 func (h *Handler) Name() string { return h.cfg.Name }
 
-// IsCountryAllowed reports whether the given ISO country code is permitted to
-// access this stealth service. If AllowedCountries is empty, all countries are
-// allowed (backward-compatible with configs that omit the field).
+// RestrictsCountries reports whether allowed_countries is configured.
+func (h *Handler) RestrictsCountries() bool { return len(h.cfg.AllowedCountries) > 0 }
+
+// IsCountryAllowed reports whether the ISO country code may access this
+// service. An empty AllowedCountries list allows every country.
 func (h *Handler) IsCountryAllowed(countryCode string) bool {
 	if len(h.cfg.AllowedCountries) == 0 {
 		return true
@@ -51,73 +54,58 @@ func (h *Handler) IsCountryAllowed(countryCode string) bool {
 	return false
 }
 
-// Handle reads the first bytes from conn, checks for the configured protocol
-// signature, and either forwards the connection or closes it.
-func (h *Handler) Handle(conn net.Conn, sourceIP string) error {
-	defer func() {
-		// Ensure the connection is always closed if we return early.
-		// proxy.Forward closes it itself on success, but closing twice is safe.
-		conn.Close()
-	}()
+// Handle waits for the protocol signature and forwards or drops conn.
+func (h *Handler) Handle(conn net.Conn, sourceIP string, record Recorder) error {
+	defer conn.Close()
+
+	sig := []byte(h.cfg.ProtocolSignature)
+	if len(sig) == 0 {
+		// Without a signature there is nothing to wait for (and waiting would
+		// deadlock server-speaks-first protocols): forward straight away.
+		record(storage.ActionForwarded, "stealth: no signature configured")
+		return h.proxy.Forward(conn, h.cfg.RealTarget)
+	}
 
 	timeout := h.cfg.Timeout
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = 10 * time.Second
 	}
-
 	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
 
-	// Read the first chunk – enough to check the signature.
-	peekSize := max(len(h.cfg.ProtocolSignature), 16)
-	buf := make([]byte, peekSize)
-
-	n, err := conn.Read(buf)
+	// TCP may deliver the signature in several segments, so read exactly
+	// len(sig) bytes instead of trusting a single Read call.
+	buf := make([]byte, len(sig))
+	n, err := io.ReadFull(conn, buf)
 	if err != nil {
-		if isTimeout(err) {
-			h.logger.Info("stealth: syn scan or timeout",
-				"service", h.cfg.Name,
-				"source_ip", sourceIP,
-			)
-		} else if !isEOF(err) {
-			h.logger.Debug("stealth: read error",
-				"service", h.cfg.Name,
-				"source_ip", sourceIP,
-				"error", err,
-			)
+		reason := "stealth: read error"
+		switch {
+		case isTimeout(err):
+			reason = "stealth: no data before timeout"
+		case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+			reason = "stealth: closed by client"
 		}
+		if n > 0 {
+			reason += fmt.Sprintf(" first_bytes=%q", buf[:n])
+		}
+		h.logger.Debug(reason, "source_ip", sourceIP)
+		record(storage.ActionDropped, reason)
 		return nil
 	}
 
-	// Disable the read deadline for the forwarded connection.
+	if !bytes.Equal(buf, sig) {
+		h.logger.Info("stealth: unknown probe", "source_ip", sourceIP, "first_bytes", fmt.Sprintf("%q", buf))
+		record(storage.ActionDropped, fmt.Sprintf("stealth: signature mismatch first_bytes=%q", buf))
+		return nil
+	}
+
 	_ = conn.SetReadDeadline(time.Time{})
+	h.logger.Debug("stealth: forwarding connection", "source_ip", sourceIP, "target", h.cfg.RealTarget)
+	record(storage.ActionForwarded, "stealth: signature matched")
 
-	prefix := buf[:n]
-	sig := h.cfg.ProtocolSignature
-
-	if sig != "" && !strings.HasPrefix(string(prefix), sig) {
-		h.logger.Info("stealth: unknown probe",
-			"service", h.cfg.Name,
-			"source_ip", sourceIP,
-			"first_bytes", string(prefix),
-		)
-		return nil
-	}
-
-	h.logger.Debug("stealth: forwarding connection",
-		"service", h.cfg.Name,
-		"source_ip", sourceIP,
-		"target", h.cfg.RealTarget,
-	)
-
-	// Wrap the connection so the already-read bytes are replayed first.
-	wrapped := &prefixedConn{
-		Conn:   conn,
-		prefix: prefix,
-	}
-
-	return h.proxy.Forward(wrapped, h.cfg.RealTarget)
+	// Replay the bytes we consumed before handing the stream to the backend.
+	return h.proxy.Forward(&prefixedConn{Conn: conn, prefix: buf}, h.cfg.RealTarget)
 }
 
 // prefixedConn replays the initially peeked bytes before delegating to the
@@ -125,32 +113,26 @@ func (h *Handler) Handle(conn net.Conn, sourceIP string) error {
 type prefixedConn struct {
 	net.Conn
 	prefix []byte
-	read   int
 }
 
 func (p *prefixedConn) Read(b []byte) (int, error) {
-	if p.read < len(p.prefix) {
-		n := copy(b, p.prefix[p.read:])
-		p.read += n
+	if len(p.prefix) > 0 {
+		n := copy(b, p.prefix)
+		p.prefix = p.prefix[n:]
 		return n, nil
 	}
 	return p.Conn.Read(b)
 }
 
-// isTimeout reports whether err is a net.Error timeout.
+// CloseWrite lets the proxy half-close the client side.
+func (p *prefixedConn) CloseWrite() error {
+	if cw, ok := p.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return p.Conn.Close()
+}
+
 func isTimeout(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
-}
-
-// isEOF reports whether err signals a clean connection close.
-func isEOF(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

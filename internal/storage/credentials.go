@@ -7,74 +7,63 @@ import (
 
 // Credential represents a single authentication attempt captured by a honeypot.
 type Credential struct {
-	ID        int64
-	Timestamp time.Time
-	SourceIP  string
-	Port      int
-	Username  string
-	Password  string
-	Service   string
+	ID        int64     `json:"id"`
+	Timestamp time.Time `json:"timestamp"`
+	SourceIP  string    `json:"source_ip"`
+	Port      int       `json:"port"`
+	Username  string    `json:"username"`
+	Password  string    `json:"password"`
+	Service   string    `json:"service"`
 }
 
 // LogCredential inserts a new credential record into the database.
 func (d *DB) LogCredential(c *Credential) error {
-	const query = `
-		INSERT INTO credentials
-			(timestamp, source_ip, port, username, password, service)
-		VALUES
-			(?, ?, ?, ?, ?, ?)`
-
 	ts := c.Timestamp
 	if ts.IsZero() {
-		ts = time.Now().UTC()
+		ts = time.Now()
 	}
-
-	_, err := d.db.Exec(query,
-		ts.Format(time.RFC3339),
-		c.SourceIP,
-		c.Port,
-		c.Username,
-		c.Password,
-		c.Service,
-	)
+	_, err := d.db.Exec(`
+		INSERT INTO credentials (timestamp, source_ip, port, username, password, service)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		formatTS(ts), c.SourceIP, c.Port, c.Username, c.Password, c.Service)
 	if err != nil {
 		return fmt.Errorf("logging credential: %w", err)
 	}
 	return nil
 }
 
-// GetTopCredentials returns the most frequently attempted username/password
-// combinations, up to limit entries. Each map contains:
-//
-//	"username" string
-//	"password" string
-//	"count"    int64
-func (d *DB) GetTopCredentials(limit int) ([]map[string]interface{}, error) {
-	const query = `
-		SELECT   username, password, COUNT(*) AS cnt
-		FROM     credentials
-		GROUP BY username, password
-		ORDER BY cnt DESC
-		LIMIT    ?`
+// CredentialCount is one row of the "top credentials" report.
+type CredentialCount struct {
+	Username string    `json:"username"`
+	Password string    `json:"password"`
+	Service  string    `json:"service"`
+	Count    int64     `json:"count"`
+	LastSeen time.Time `json:"last_seen"`
+}
 
-	rows, err := d.db.Query(query, limit)
+// GetTopCredentials returns the most frequently attempted
+// service/username/password combinations.
+func (d *DB) GetTopCredentials(limit int) ([]*CredentialCount, error) {
+	rows, err := d.db.Query(`
+		SELECT   username, password, service, COUNT(*) AS cnt, MAX(timestamp)
+		FROM     credentials
+		GROUP BY service, username, password
+		ORDER BY cnt DESC, MAX(timestamp) DESC
+		LIMIT    ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("querying top credentials: %w", err)
 	}
 	defer rows.Close()
 
-	var results []map[string]interface{}
+	results := []*CredentialCount{}
 	for rows.Next() {
-		var username, password string
-		var count int64
-		if err := rows.Scan(&username, &password, &count); err != nil {
+		c := &CredentialCount{}
+		var last dbTime
+		if err := rows.Scan(&c.Username, &c.Password, &c.Service, &c.Count, &last); err != nil {
 			return nil, fmt.Errorf("scanning credential row: %w", err)
 		}
-		results = append(results, map[string]interface{}{
-			"username": username,
-			"password": password,
-			"count":    count,
-		})
+		c.LastSeen = last.Time
+		results = append(results, c)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating credential rows: %w", err)
@@ -82,34 +71,27 @@ func (d *DB) GetTopCredentials(limit int) ([]map[string]interface{}, error) {
 	return results, nil
 }
 
-// GetCredentialsByIP returns all credential records for the given source IP,
-// ordered by newest first.
-func (d *DB) GetCredentialsByIP(ip string) ([]*Credential, error) {
-	const query = `
+// GetCredentialsByIP returns the newest credential records for ip.
+func (d *DB) GetCredentialsByIP(ip string, limit int) ([]*Credential, error) {
+	rows, err := d.db.Query(`
 		SELECT id, timestamp, source_ip, port, username, password, service
 		FROM   credentials
 		WHERE  source_ip = ?
-		ORDER  BY timestamp DESC`
-
-	rows, err := d.db.Query(query, ip)
+		ORDER  BY timestamp DESC, id DESC
+		LIMIT  ?`, ip, limit)
 	if err != nil {
 		return nil, fmt.Errorf("querying credentials by IP: %w", err)
 	}
 	defer rows.Close()
 
-	var results []*Credential
+	results := []*Credential{}
 	for rows.Next() {
 		c := &Credential{}
-		var tsStr string
-		if err := rows.Scan(&c.ID, &tsStr, &c.SourceIP, &c.Port,
-			&c.Username, &c.Password, &c.Service); err != nil {
+		var ts dbTime
+		if err := rows.Scan(&c.ID, &ts, &c.SourceIP, &c.Port, &c.Username, &c.Password, &c.Service); err != nil {
 			return nil, fmt.Errorf("scanning credential row: %w", err)
 		}
-		ts, err := parseTimestamp(tsStr)
-		if err != nil {
-			return nil, err
-		}
-		c.Timestamp = ts
+		c.Timestamp = ts.Time
 		results = append(results, c)
 	}
 	if err := rows.Err(); err != nil {
@@ -119,26 +101,12 @@ func (d *DB) GetCredentialsByIP(ip string) ([]*Credential, error) {
 }
 
 // CleanOldCredentials deletes credential records older than days days.
-func (d *DB) CleanOldCredentials(days int) error {
-	const query = `
-		DELETE FROM credentials
-		WHERE  datetime(timestamp) < datetime('now', ? || ' days')`
-
-	if _, err := d.db.Exec(query, fmt.Sprintf("-%d", days)); err != nil {
-		return fmt.Errorf("cleaning old credentials: %w", err)
-	}
-	return nil
-}
-
-// parseTimestamp tries RFC3339 then the plain SQLite datetime format.
-func parseTimestamp(s string) (time.Time, error) {
-	t, err := time.Parse(time.RFC3339, s)
-	if err == nil {
-		return t, nil
-	}
-	t, err = time.Parse("2006-01-02 15:04:05", s)
+func (d *DB) CleanOldCredentials(days int) (int64, error) {
+	cutoff := formatTS(time.Now().Add(-time.Duration(days) * 24 * time.Hour))
+	res, err := d.db.Exec(`DELETE FROM credentials WHERE timestamp < ?`, cutoff)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("parsing timestamp %q: %w", s, err)
+		return 0, fmt.Errorf("cleaning old credentials: %w", err)
 	}
-	return t, nil
+	n, _ := res.RowsAffected()
+	return n, nil
 }

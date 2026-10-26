@@ -2,7 +2,11 @@ package dashboard
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"embed"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -12,8 +16,20 @@ import (
 
 	"github.com/skyguard/skyguard/internal/config"
 	"github.com/skyguard/skyguard/internal/firewall"
+	"github.com/skyguard/skyguard/internal/netutil"
 	"github.com/skyguard/skyguard/internal/storage"
 )
+
+//go:embed static/index.html static/app.js
+var staticFiles embed.FS
+
+// BanManager applies and lifts bans consistently (database, firewall, score
+// reset, whitelist protection). It is implemented by the server.
+type BanManager interface {
+	BanIP(ip, reason string, duration time.Duration, permanent bool) error
+	UnbanIP(ip string) error
+	IsWhitelisted(ip string) bool
+}
 
 // Dashboard serves a lightweight HTTP management interface.
 type Dashboard struct {
@@ -21,72 +37,78 @@ type Dashboard struct {
 	db       *storage.DB
 	fw       firewall.Firewall
 	settings *storage.Settings
+	bans     BanManager
 	logger   *slog.Logger
 	server   *http.Server
 }
 
 // New creates a Dashboard instance. Call Start to begin serving.
-func New(cfg config.DashboardConfig, db *storage.DB, fw firewall.Firewall, settings *storage.Settings, logger *slog.Logger) *Dashboard {
-	return &Dashboard{
-		cfg:      cfg,
-		db:       db,
-		fw:       fw,
-		settings: settings,
-		logger:   logger,
-	}
+func New(cfg config.DashboardConfig, db *storage.DB, fw firewall.Firewall, settings *storage.Settings, bans BanManager, logger *slog.Logger) *Dashboard {
+	return &Dashboard{cfg: cfg, db: db, fw: fw, settings: settings, bans: bans, logger: logger}
 }
 
-// Start registers routes and launches the HTTP server in a background goroutine.
-// It returns once the server is listening (or immediately on error).
+// Start launches the HTTP server in a background goroutine. It returns an
+// error if the address cannot be bound or the configuration is unsafe.
 func (d *Dashboard) Start(ctx context.Context) error {
-	d.warnInsecureExposure()
-
-	d.server = &http.Server{
-		Addr:         d.cfg.Listen,
-		Handler:      d.routes(),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+	if err := d.checkExposure(); err != nil {
+		return err
 	}
 
-	// Listen first so we can return an error if the address is already in use.
+	d.server = &http.Server{
+		Addr:              d.cfg.Listen,
+		Handler:           d.routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      60 * time.Second, // CSV exports can be large
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    32 << 10,
+	}
+
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", d.cfg.Listen)
 	if err != nil {
 		return err
 	}
-
 	d.logger.Info("dashboard started", "addr", d.cfg.Listen)
 
 	go func() {
-		if err := d.server.Serve(ln); err != nil && err != http.ErrServerClosed {
+		if err := d.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			d.logger.Error("dashboard server error", "error", err)
 		}
 	}()
-
 	return nil
 }
 
-// warnInsecureExposure logs loud warnings for risky configurations.
-func (d *Dashboard) warnInsecureExposure() {
+// checkExposure refuses to expose an unauthenticated (or default-password)
+// admin panel beyond loopback, and warns about weaker setups.
+func (d *Dashboard) checkExposure() error {
 	host, _, err := net.SplitHostPort(d.cfg.Listen)
 	if err != nil {
 		host = d.cfg.Listen
 	}
 	ip := net.ParseIP(strings.TrimSpace(host))
 	loopback := ip != nil && ip.IsLoopback()
+	if host == "localhost" {
+		loopback = true
+	}
 
 	authSet := d.cfg.Auth.Username != "" && d.cfg.Auth.Password != ""
+	weak := authSet && (d.cfg.Auth.Password == "CHANGE_ME_NOW" || len(d.cfg.Auth.Password) < 8)
 
 	if !loopback {
-		d.logger.Warn("dashboard is NOT bound to loopback — it may be reachable from the network; prefer 127.0.0.1 + SSH tunnel",
-			"listen", d.cfg.Listen)
+		if !authSet {
+			return fmt.Errorf("refusing to serve the dashboard on %s without authentication; set dashboard.auth or bind to 127.0.0.1", d.cfg.Listen)
+		}
+		if weak {
+			return fmt.Errorf("refusing to serve the dashboard on %s with a weak/default password; set a strong dashboard.auth.password", d.cfg.Listen)
+		}
+		d.logger.Warn("dashboard is NOT bound to loopback; prefer 127.0.0.1 + SSH tunnel", "listen", d.cfg.Listen)
 	}
 	if !authSet {
 		d.logger.Warn("dashboard authentication is DISABLED — set dashboard.auth.username/password")
+	} else if weak {
+		d.logger.Warn("dashboard password is weak or the example default — change dashboard.auth.password")
 	}
-	if authSet && (d.cfg.Auth.Password == "CHANGE_ME_NOW" || len(d.cfg.Auth.Password) < 8) {
-		d.logger.Warn("dashboard password is weak or default — set a strong password in dashboard.auth.password")
-	}
+	return nil
 }
 
 // Stop gracefully shuts down the HTTP server with a 5-second deadline.
@@ -99,38 +121,59 @@ func (d *Dashboard) Stop() error {
 	return d.server.Shutdown(ctx)
 }
 
-// routes builds and returns the HTTP mux with all dashboard endpoints.
+// routes builds the HTTP handler with all dashboard endpoints.
 func (d *Dashboard) routes() http.Handler {
-	mux := http.NewServeMux()
+	api := http.NewServeMux()
+	api.HandleFunc("GET /{$}", d.handleStatic("static/index.html", "text/html; charset=utf-8"))
+	api.HandleFunc("GET /app.js", d.handleStatic("static/app.js", "text/javascript; charset=utf-8"))
+	api.HandleFunc("GET /api/stats", d.handleStats)
+	api.HandleFunc("GET /api/timeline", d.handleTimeline)
+	api.HandleFunc("GET /api/connections", d.handleConnections)
+	api.HandleFunc("GET /api/search", d.handleConnections) // backward-compatible alias
+	api.HandleFunc("GET /api/export", d.handleExport)
+	api.HandleFunc("GET /api/banned", d.handleBanned)
+	api.HandleFunc("GET /api/attackers", d.handleAttackers)
+	api.HandleFunc("GET /api/credentials", d.handleCredentials)
+	api.HandleFunc("GET /api/ip", d.handleIPDetail)
+	api.HandleFunc("GET /api/firewall", d.handleFirewall)
+	api.HandleFunc("GET /api/settings", d.handleGetSettings)
+	api.HandleFunc("POST /api/settings", d.csrf(d.handlePostSettings))
+	api.HandleFunc("POST /api/ban", d.csrf(d.handleBan))
+	api.HandleFunc("POST /api/unban", d.csrf(d.handleUnban))
 
-	mux.HandleFunc("/", d.handleIndex)
-	mux.HandleFunc("/api/stats", d.handleStats)
-	mux.HandleFunc("/api/connections", d.handleConnections)
-	mux.HandleFunc("/api/banned", d.handleBanned)
-	mux.HandleFunc("/api/attackers", d.handleAttackers)
-	mux.HandleFunc("/api/credentials", d.handleCredentials)
-	mux.HandleFunc("/api/firewall", d.handleFirewall)
-	mux.HandleFunc("/api/ban", d.handleBan)
-	mux.HandleFunc("/api/unban", d.handleUnban)
-	mux.HandleFunc("/api/settings", d.handleSettings)
-	mux.HandleFunc("/api/timeline", d.handleTimeline)
-	mux.HandleFunc("/api/search", d.handleSearch)
-	mux.HandleFunc("/api/export", d.handleExport)
-
-	var handler http.Handler = mux
+	var protected http.Handler = api
 	if d.cfg.Auth.Username != "" && d.cfg.Auth.Password != "" {
-		handler = newAuthGuard(d.cfg.Auth.Username, d.cfg.Auth.Password, d.logger).wrap(handler)
+		protected = newAuthGuard(d.cfg.Auth.Username, d.cfg.Auth.Password, d.logger).wrap(api)
 	}
-	// Security headers are applied to every response, including auth failures.
-	return securityHeaders(handler)
+
+	root := http.NewServeMux()
+	// Unauthenticated liveness probe for Docker / systemd health checks, so
+	// the password never has to be embedded in a compose file.
+	root.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	root.Handle("/", protected)
+	return securityHeaders(root)
 }
 
-// securityHeaders adds defensive HTTP headers (clickjacking, MIME sniffing,
-// referrer leakage, and a CSP that limits resource origins).
+func (d *Dashboard) handleStatic(name, contentType string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		b, err := staticFiles.ReadFile(name)
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", contentType)
+		_, _ = w.Write(b)
+	}
+}
+
+// securityHeaders adds defensive HTTP headers. All JavaScript lives in
+// /app.js, so scripts are restricted to 'self' (no inline script execution).
 func securityHeaders(next http.Handler) http.Handler {
-	const csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
-		"style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; " +
-		"base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+	const csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+		"img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
@@ -142,74 +185,118 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// authGuard performs HTTP Basic Auth with constant-time comparison, logs failed
-// attempts, slows each failure down, and throttles sustained brute-force bursts.
+// csrf protects state-changing endpoints. Browsers cannot attach a custom
+// header to a cross-site request without a CORS preflight, which we never
+// approve, so requiring it blocks CSRF even though Basic Auth credentials are
+// sent automatically. Request bodies are capped as well.
+func (d *Dashboard) csrf(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-SkyGuard-Request") == "" {
+			writeError(w, http.StatusForbidden, "missing X-SkyGuard-Request header")
+			return
+		}
+		if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+			writeError(w, http.StatusForbidden, "cross-site request rejected")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		next(w, r)
+	}
+}
+
+// authGuard performs HTTP Basic Auth with constant-time comparison and
+// throttles brute force per client IP (a global counter would let any
+// attacker lock the real admin out).
 type authGuard struct {
-	username, password string
+	userHash, passHash [32]byte
 	logger             *slog.Logger
-	mu                 sync.Mutex
-	failures           []time.Time
+
+	mu       sync.Mutex
+	failures map[string][]time.Time
 }
 
 const (
-	authFailWindow    = time.Minute
-	authFailThreshold = 15 // failures within the window before we hard-throttle
+	authFailWindow    = 5 * time.Minute
+	authFailThreshold = 10
 	authFailDelay     = 500 * time.Millisecond
 )
 
 func newAuthGuard(username, password string, logger *slog.Logger) *authGuard {
-	return &authGuard{username: username, password: password, logger: logger}
+	return &authGuard{
+		userHash: sha256.Sum256([]byte(username)),
+		passHash: sha256.Sum256([]byte(password)),
+		logger:   logger,
+		failures: make(map[string][]time.Time),
+	}
 }
 
 func (a *authGuard) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Hard throttle if too many recent failures (brute-force burst).
-		if a.tooManyFailures() {
-			w.Header().Set("Retry-After", "60")
-			http.Error(w, "too many authentication failures, slow down", http.StatusTooManyRequests)
+		ip := netutil.HostIP(r.RemoteAddr)
+		if a.tooManyFailures(ip) {
+			w.Header().Set("Retry-After", "300")
+			http.Error(w, "too many authentication failures, try again later", http.StatusTooManyRequests)
 			return
 		}
 
 		u, p, ok := r.BasicAuth()
-		userMatch := subtle.ConstantTimeCompare([]byte(u), []byte(a.username))
-		passMatch := subtle.ConstantTimeCompare([]byte(p), []byte(a.password))
-		if !ok || userMatch != 1 || passMatch != 1 {
-			a.recordFailure()
-			a.logger.Warn("dashboard auth failed", "remote", clientIP(r), "user", u)
-			time.Sleep(authFailDelay) // slow down brute force
-			w.Header().Set("WWW-Authenticate", `Basic realm="SkyGuard"`)
+		// Hashing first makes the comparison constant-time regardless of length.
+		uh, ph := sha256.Sum256([]byte(u)), sha256.Sum256([]byte(p))
+		userOK := subtle.ConstantTimeCompare(uh[:], a.userHash[:]) == 1
+		passOK := subtle.ConstantTimeCompare(ph[:], a.passHash[:]) == 1
+		if !ok || !userOK || !passOK {
+			if ok { // a browser's first credential-less probe is not a failure
+				a.recordFailure(ip)
+				a.logger.Warn("dashboard auth failed", "remote", ip, "user", u)
+				time.Sleep(authFailDelay)
+			}
+			w.Header().Set("WWW-Authenticate", `Basic realm="SkyGuard", charset="UTF-8"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		a.clearFailures(ip)
 		next.ServeHTTP(w, r)
 	})
 }
 
-func (a *authGuard) recordFailure() {
+func (a *authGuard) recordFailure(ip string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.failures = append(a.failures, time.Now())
+	a.failures[ip] = append(a.failures[ip], time.Now())
+	if len(a.failures) > 10000 { // bound memory under a distributed attack
+		a.pruneLocked()
+	}
 }
 
-func (a *authGuard) tooManyFailures() bool {
+func (a *authGuard) clearFailures(ip string) {
+	a.mu.Lock()
+	delete(a.failures, ip)
+	a.mu.Unlock()
+}
+
+func (a *authGuard) tooManyFailures(ip string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	cutoff := time.Now().Add(-authFailWindow)
-	kept := a.failures[:0]
-	for _, t := range a.failures {
+	kept := a.failures[ip][:0]
+	for _, t := range a.failures[ip] {
 		if t.After(cutoff) {
 			kept = append(kept, t)
 		}
 	}
-	a.failures = kept
-	return len(a.failures) >= authFailThreshold
+	if len(kept) == 0 {
+		delete(a.failures, ip)
+		return false
+	}
+	a.failures[ip] = kept
+	return len(kept) >= authFailThreshold
 }
 
-// clientIP extracts the remote IP for logging.
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+func (a *authGuard) pruneLocked() {
+	cutoff := time.Now().Add(-authFailWindow)
+	for ip, ts := range a.failures {
+		if len(ts) == 0 || ts[len(ts)-1].Before(cutoff) {
+			delete(a.failures, ip)
+		}
 	}
-	return host
 }

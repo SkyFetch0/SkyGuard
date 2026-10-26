@@ -2,11 +2,14 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/skyguard/skyguard/internal/analysis"
@@ -14,6 +17,7 @@ import (
 	"github.com/skyguard/skyguard/internal/dashboard"
 	"github.com/skyguard/skyguard/internal/firewall"
 	"github.com/skyguard/skyguard/internal/honeypot"
+	"github.com/skyguard/skyguard/internal/netutil"
 	"github.com/skyguard/skyguard/internal/proxy"
 	"github.com/skyguard/skyguard/internal/stealth"
 	"github.com/skyguard/skyguard/internal/storage"
@@ -22,6 +26,32 @@ import (
 // maxConcurrentConns is the global cap on simultaneously handled connections.
 // Prevents goroutine explosion under mass-connection DoS attacks.
 const maxConcurrentConns = 4096
+
+// Service kinds.
+const (
+	kindStealth     = "stealth"
+	kindHoneypot    = "honeypot"
+	kindPassthrough = "passthrough"
+)
+
+// service is one configured listener and the handler behind it.
+type service struct {
+	kind     string
+	name     string
+	port     int
+	stealth  *stealth.Handler
+	honeypot honeypot.Handler
+	target   string // passthrough backend
+}
+
+// label is the service_type stored with connection rows: the honeypot
+// protocol ("ssh", "ftp", ...) or the service kind.
+func (svc service) label() string {
+	if svc.kind == kindHoneypot && svc.honeypot != nil {
+		return svc.honeypot.Type()
+	}
+	return svc.kind
+}
 
 // Server manages all TCP listeners and dispatches incoming connections to the
 // appropriate handler (stealth, honeypot, or passthrough).
@@ -37,48 +67,43 @@ type Server struct {
 	dash      *dashboard.Dashboard
 	settings  *storage.Settings
 	logger    *slog.Logger
-	listeners []net.Listener
+	whitelist *netutil.IPSet
+	blacklist *netutil.IPSet
+
 	mu        sync.Mutex
-	wg        sync.WaitGroup
-	// sem throttles the number of concurrently handled connections.
-	sem chan struct{}
+	listeners []net.Listener
+	conns     map[net.Conn]struct{}
+	stopping  bool
+
+	wg     sync.WaitGroup
+	sem    chan struct{}
+	cancel context.CancelFunc
 }
 
 // New initialises all sub-systems and returns a ready-to-start Server.
 func New(cfg *config.Config, db *storage.DB, logger *slog.Logger) (*Server, error) {
-	geoip, err := analysis.NewGeoIPService(
-		cfg.Analysis.GeoIP.DBPath,
-		cfg.Analysis.GeoIP.Enabled,
-	)
+	geoip, err := analysis.NewGeoIPService(cfg.Analysis.GeoIP.DBPath, cfg.Analysis.GeoIP.Enabled)
 	if err != nil {
-		return nil, fmt.Errorf("geoip: %w", err)
+		logger.Warn("GeoIP database could not be opened; country features are disabled",
+			"path", cfg.Analysis.GeoIP.DBPath, "error", err)
 	}
 
-	limiter := analysis.NewRateLimiter(
-		cfg.Analysis.RateLimit.MaxPerMinute,
-		cfg.Analysis.RateLimit.MaxPerHour,
-	)
-
-	scorer := analysis.NewScorer(db, cfg.Analysis.AutoBan)
-
-	// Zero values fall back to safe defaults (60s window, 5 ports) inside NewDetector.
-	detector := analysis.NewDetector(cfg.Analysis.PortScan.Window, cfg.Analysis.PortScan.Threshold)
-
-	fw, err := firewall.New(cfg.Analysis.AutoBan.Method, logger)
+	fw, err := firewall.New(cfg.Analysis.AutoBan.Method,
+		firewall.Options{IPTablesBackend: cfg.Analysis.AutoBan.IPTablesBackend}, logger)
 	if err != nil {
+		geoip.Close()
 		return nil, fmt.Errorf("firewall: %w", err)
 	}
 
-	prx := proxy.New(logger)
-
-	// Runtime settings: seed from config, override with anything stored in the
-	// DB, so the dashboard can change auto-ban params without a restart.
+	// Runtime settings: the dashboard can change auto-ban params without a
+	// restart; editing the config file takes precedence again.
 	settings, err := db.LoadSettings(storage.AutoBanSettings{
 		Enabled:        cfg.Analysis.AutoBan.Enabled,
 		ScoreThreshold: cfg.Analysis.AutoBan.ScoreThreshold,
 		BanDuration:    cfg.Analysis.AutoBan.BanDuration,
 	})
 	if err != nil {
+		geoip.Close()
 		return nil, fmt.Errorf("loading settings: %w", err)
 	}
 
@@ -86,180 +111,248 @@ func New(cfg *config.Config, db *storage.DB, logger *slog.Logger) (*Server, erro
 		cfg:      cfg,
 		db:       db,
 		geoip:    geoip,
-		limiter:  limiter,
-		scorer:   scorer,
-		detector: detector,
+		limiter:  analysis.NewRateLimiter(cfg.Analysis.RateLimit.MaxPerMinute, cfg.Analysis.RateLimit.MaxPerHour),
+		scorer:   analysis.NewScorer(db, cfg.Analysis.AutoBan.Scoring),
+		detector: analysis.NewDetector(cfg.Analysis.PortScan.Window, cfg.Analysis.PortScan.Threshold),
 		firewall: fw,
-		proxy:    prx,
+		proxy:    proxy.New(logger),
 		settings: settings,
 		logger:   logger,
-		sem:      make(chan struct{}, maxConcurrentConns),
+		// Loopback is always trusted: SkyGuard's own health checks and the
+		// stealth proxy's backend connections must never be scored or banned.
+		whitelist: netutil.NewIPSet(append([]string{"127.0.0.0/8", "::1"}, cfg.Whitelist.IPs...)),
+		blacklist: netutil.NewIPSet(cfg.Blacklist.IPs),
+		conns:     make(map[net.Conn]struct{}),
+		sem:       make(chan struct{}, maxConcurrentConns),
 	}
 
 	if cfg.Dashboard.Enabled {
-		s.dash = dashboard.New(cfg.Dashboard, db, fw, settings, logger)
+		s.dash = dashboard.New(cfg.Dashboard, db, fw, settings, s, logger)
 	}
-
+	s.warnRiskyConfig()
 	return s, nil
 }
 
+func (s *Server) warnRiskyConfig() {
+	ownIPs := 0
+	for _, e := range s.cfg.Whitelist.IPs {
+		if set := netutil.NewIPSet([]string{e}); !set.Contains("127.0.0.1") && !set.Contains("::1") {
+			ownIPs++
+		}
+	}
+	if s.settings.AutoBan().Enabled && ownIPs == 0 {
+		s.logger.Warn("auto-ban is enabled but the whitelist only holds loopback addresses; " +
+			"add your own IP to whitelist.ips so you cannot lock yourself out")
+	}
+	if !s.geoip.Enabled() {
+		if len(s.cfg.Blacklist.Countries) > 0 || len(s.cfg.Whitelist.Countries) > 0 {
+			s.logger.Warn("country white/blacklists are configured but GeoIP is disabled; they will not match anything")
+		}
+		for _, svc := range s.cfg.Stealth {
+			if svc.IsEnabled() && len(svc.AllowedCountries) > 0 {
+				s.logger.Warn("stealth service has allowed_countries but GeoIP is disabled; the country filter is NOT enforced",
+					"service", svc.Name)
+			}
+		}
+	}
+}
+
 // Start opens all configured listeners and begins accepting connections.
-// It blocks until ctx is cancelled.
+// It returns once everything is listening; call Stop to shut down.
 func (s *Server) Start(ctx context.Context) error {
-	eventLogger := honeypot.NewEventLogger(s.db, s.logger)
-	// Score captured credentials and apply auto-ban on failed-credential events.
-	eventLogger.OnCredential(func(sourceIP string) {
-		_, _ = s.scorer.Record(sourceIP, "", analysis.EventFailedCredential, 0)
-		s.shouldBanAndBan(sourceIP, "failed_credential")
+	ctx, s.cancel = context.WithCancel(ctx)
+
+	eventLogger := honeypot.NewEventLogger(s.db, s.logger, s.cfg.Logging.LogFirstBytes)
+	eventLogger.OnCredential(func(sess honeypot.Session) {
+		if s.IsWhitelisted(sess.IP) {
+			return
+		}
+		score, err := s.scorer.Record(sess.IP, sess.Country, analysis.EventFailedCredential, sess.Port)
+		if err != nil {
+			s.logger.Error("scoring failed", "ip", sess.IP, "error", err)
+			return
+		}
+		s.maybeAutoBan(sess.IP, score, "failed_credential")
 	})
 
-	// Stealth services.
+	// Build every handler first so a bad config cannot leave half the
+	// listeners open.
+	var services []service
 	for _, svc := range s.cfg.Stealth {
-		svc := svc
 		if !svc.IsEnabled() {
 			s.logger.Info("stealth service disabled, skipping", "name", svc.Name)
 			continue
 		}
-		if len(svc.AllowedCountries) > 0 && !s.cfg.Analysis.GeoIP.Enabled {
-			s.logger.Warn("stealth service has allowed_countries but GeoIP is disabled; country filter will not be enforced",
-				"service", svc.Name)
-		}
-		addr := fmt.Sprintf("0.0.0.0:%d", svc.ListenPort)
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			return fmt.Errorf("stealth %q: listen %s: %w", svc.Name, addr, err)
-		}
-		s.addListener(ln)
-
-		h := stealth.NewHandler(svc, s.proxy, s.db, s.logger.With("service", svc.Name))
-		s.logger.Info("stealth listener started", "name", svc.Name, "addr", addr)
-
-		s.wg.Add(1)
-		go s.acceptLoop(ctx, ln, func(conn net.Conn) {
-			s.handleConnection(conn, "stealth", h)
+		services = append(services, service{
+			kind: kindStealth, name: svc.Name, port: svc.ListenPort,
+			stealth: stealth.NewHandler(svc, s.proxy, s.logger.With("service", svc.Name)),
 		})
 	}
-
-	// Honeypot services.
 	for _, svc := range s.cfg.Honeypots {
-		svc := svc
 		if !svc.IsEnabled() {
 			s.logger.Info("honeypot service disabled, skipping", "name", svc.Name)
 			continue
 		}
-		addr := fmt.Sprintf("0.0.0.0:%d", svc.Port)
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			return fmt.Errorf("honeypot %q: listen %s: %w", svc.Name, addr, err)
-		}
-		s.addListener(ln)
-
-		h, err := honeypot.NewHandler(svc, eventLogger)
+		h, err := honeypot.NewHandler(svc, eventLogger, s.cfg.General.DataDir)
 		if err != nil {
 			return fmt.Errorf("honeypot %q: %w", svc.Name, err)
 		}
-		s.logger.Info("honeypot listener started", "name", svc.Name, "type", svc.Type, "addr", addr)
-
-		s.wg.Add(1)
-		go s.acceptLoop(ctx, ln, func(conn net.Conn) {
-			s.handleConnection(conn, "honeypot", h)
-		})
+		services = append(services, service{kind: kindHoneypot, name: svc.Name, port: svc.Port, honeypot: h})
+	}
+	for _, svc := range s.cfg.Passthrough {
+		if !svc.IsEnabled() {
+			s.logger.Info("passthrough service disabled, skipping", "name", svc.Name)
+			continue
+		}
+		services = append(services, service{kind: kindPassthrough, name: svc.Name, port: svc.ListenPort, target: svc.RealTarget})
 	}
 
-	// Passthrough services.
-	for _, svc := range s.cfg.Passthrough {
-		svc := svc
-		addr := fmt.Sprintf("0.0.0.0:%d", svc.ListenPort)
-		ln, err := net.Listen("tcp", addr)
+	for _, svc := range services {
+		// ":port" listens on both IPv4 and IPv6 (the old "0.0.0.0:port" never
+		// saw IPv6 attackers at all).
+		addr := fmt.Sprintf(":%d", svc.port)
+		ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
 		if err != nil {
-			return fmt.Errorf("passthrough %q: listen %s: %w", svc.Name, addr, err)
+			return fmt.Errorf("%s %q: listen %s: %w%s", svc.kind, svc.name, addr, err, listenHint(err, svc.port))
 		}
 		s.addListener(ln)
+		s.logger.Info("listener started", "kind", svc.kind, "name", svc.name, "addr", addr)
 
-		s.logger.Info("passthrough listener started", "name", svc.Name, "addr", addr, "target", svc.RealTarget)
-
-		target := svc.RealTarget
+		svc := svc
 		s.wg.Add(1)
-		go s.acceptLoop(ctx, ln, func(conn net.Conn) {
-			s.handleConnection(conn, "passthrough", target)
-		})
+		go s.acceptLoop(ln, func(conn net.Conn) { s.handleConnection(conn, svc) })
 	}
 
-	// Dashboard.
+	// Re-apply bans that are still active: firewall rules do not survive a
+	// reboot (or a container restart without persistence), the database does.
+	s.syncBans()
+
 	if s.dash != nil {
 		if err := s.dash.Start(ctx); err != nil {
 			return fmt.Errorf("dashboard: %w", err)
 		}
 	}
 
-	// Periodic maintenance: clean up expired bans, purge old records, enforce
-	// data retention. Runs every minute so temporary bans are lifted promptly.
 	s.wg.Add(1)
-	go s.cleanupLoop(ctx)
-
+	go s.maintenanceLoop(ctx)
 	return nil
 }
 
-// Stop closes all listeners and waits for in-flight goroutines to finish.
+// listenHint turns the two most common listen failures into actionable advice.
+func listenHint(err error, port int) string {
+	switch {
+	case errors.Is(err, syscall.EADDRINUSE):
+		if port == 22 {
+			return " (port 22 is still used by the real sshd — move sshd first, see scripts/enable-ssh-honeypot.sh)"
+		}
+		return " (another process already listens on this port; check with: ss -tlnp)"
+	case errors.Is(err, syscall.EACCES):
+		return " (ports below 1024 need root or CAP_NET_BIND_SERVICE)"
+	}
+	return ""
+}
+
+// Stop closes all listeners and active connections, then waits for every
+// goroutine to finish. Long-lived proxied sessions are closed rather than
+// waited for, so shutdown cannot hang.
 func (s *Server) Stop() error {
 	s.mu.Lock()
+	s.stopping = true
 	for _, ln := range s.listeners {
 		ln.Close()
 	}
 	s.listeners = nil
+	for c := range s.conns {
+		c.Close()
+	}
 	s.mu.Unlock()
 
-	s.wg.Wait()
+	if s.cancel != nil {
+		s.cancel()
+	}
 
-	// Release background analysis goroutines and the GeoIP reader.
+	var dashErr error
+	if s.dash != nil {
+		dashErr = s.dash.Stop()
+	}
+
+	s.wg.Wait()
 	s.detector.Stop()
 	s.limiter.Stop()
 	s.geoip.Close()
-
-	if s.dash != nil {
-		return s.dash.Stop()
-	}
-	return nil
+	return dashErr
 }
 
-// addListener registers a listener under the server's mutex.
 func (s *Server) addListener(ln net.Listener) {
 	s.mu.Lock()
 	s.listeners = append(s.listeners, ln)
 	s.mu.Unlock()
 }
 
-// cleanupLoop runs every minute. It lifts firewall rules for bans that have
-// expired (so a temporary ban is actually released at the kernel level, not
-// just removed from the DB), purges the expired ban rows, and enforces data
-// retention. The 1-minute cadence keeps ban expiry reasonably prompt.
-func (s *Server) cleanupLoop(ctx context.Context) {
+// track registers conn for forced close on shutdown; it returns false when
+// the server is already stopping.
+func (s *Server) track(conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopping {
+		return false
+	}
+	s.conns[conn] = struct{}{}
+	return true
+}
+
+func (s *Server) untrack(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.conns, conn)
+	s.mu.Unlock()
+}
+
+// maintenanceLoop lifts expired bans every minute and enforces data
+// retention every hour.
+func (s *Server) maintenanceLoop(ctx context.Context) {
 	defer s.wg.Done()
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
+
+	s.releaseExpiredBans()
+	s.enforceRetention()
+
+	banTicker := time.NewTicker(time.Minute)
+	defer banTicker.Stop()
+	retentionTicker := time.NewTicker(time.Hour)
+	defer retentionTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-banTicker.C:
 			s.releaseExpiredBans()
-
-			// Enforce data retention so the database does not grow unbounded.
-			if days := s.cfg.Logging.RetentionDays; days > 0 {
-				if err := s.db.CleanOldConnections(days); err != nil {
-					s.logger.Error("failed to clean old connections", "error", err)
-				}
-				if err := s.db.CleanOldCredentials(days); err != nil {
-					s.logger.Error("failed to clean old credentials", "error", err)
-				}
-			}
+		case <-retentionTicker.C:
+			s.enforceRetention()
 		}
 	}
 }
 
+func (s *Server) enforceRetention() {
+	days := s.cfg.Logging.RetentionDays
+	if days <= 0 {
+		return
+	}
+	if n, err := s.db.CleanOldConnections(days); err != nil {
+		s.logger.Error("failed to clean old connections", "error", err)
+	} else if n > 0 {
+		s.logger.Info("retention: deleted old connections", "rows", n)
+	}
+	if n, err := s.db.CleanOldCredentials(days); err != nil {
+		s.logger.Error("failed to clean old credentials", "error", err)
+	} else if n > 0 {
+		s.logger.Info("retention: deleted old credentials", "rows", n)
+	}
+}
+
 // releaseExpiredBans removes the firewall rule for every expired ban before
-// deleting the rows, so the actual block is lifted when the ban duration ends.
+// deleting its row, so a temporary ban is actually lifted at the kernel level.
+// If the firewall call fails the row is kept and retried next minute;
+// deleting it anyway would silently turn the ban into a permanent one.
 func (s *Server) releaseExpiredBans() {
 	expired, err := s.db.GetExpiredBans()
 	if err != nil {
@@ -267,47 +360,73 @@ func (s *Server) releaseExpiredBans() {
 		return
 	}
 	for _, ip := range expired {
-		if err := s.firewall.UnbanIP(ip); err != nil {
-			s.logger.Warn("failed to remove firewall rule for expired ban", "ip", ip, "error", err)
+		if err := s.firewall.Unban(ip); err != nil {
+			s.logger.Warn("failed to remove firewall rule for expired ban; will retry", "ip", ip, "error", err)
 			continue
 		}
-		s.logger.Info("expired ban lifted from firewall", "ip", ip)
+		if err := s.db.DeleteExpiredBan(ip); err != nil {
+			s.logger.Error("failed to delete expired ban", "ip", ip, "error", err)
+			continue
+		}
+		// Start from a clean slate; otherwise the first event after expiry
+		// would immediately re-ban because the old score is still above the
+		// threshold.
+		if err := s.db.ResetScore(ip); err != nil {
+			s.logger.Error("failed to reset score", "ip", ip, "error", err)
+		}
+		s.logger.Info("expired ban lifted", "ip", ip)
 	}
-	if err := s.db.CleanExpiredBans(); err != nil {
-		s.logger.Error("failed to clean expired bans", "error", err)
+}
+
+// syncBans re-applies every active ban to the firewall and drops bans that
+// target whitelisted addresses.
+func (s *Server) syncBans() {
+	bans, err := s.db.GetActiveBans()
+	if err != nil {
+		s.logger.Error("failed to load active bans", "error", err)
+		return
+	}
+	applied := 0
+	for _, b := range bans {
+		if s.IsWhitelisted(b.IP) {
+			s.logger.Warn("removing ban on whitelisted IP", "ip", b.IP)
+			_ = s.UnbanIP(b.IP)
+			continue
+		}
+		if err := s.firewall.Ban(b.IP); err != nil {
+			s.logger.Error("failed to re-apply ban", "ip", b.IP, "error", err)
+			continue
+		}
+		applied++
+	}
+	if len(bans) > 0 {
+		s.logger.Info("active bans re-applied to firewall", "count", applied, "method", s.firewall.Method())
 	}
 }
 
 // acceptLoop accepts new TCP connections and dispatches each to handler in its
-// own goroutine. It exits when the listener is closed or ctx is done.
-// Transient errors (e.g. "too many open files") are logged and retried;
-// only listener-closed errors cause a clean exit.
-func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, handler func(net.Conn)) {
+// own goroutine. It exits when the listener is closed.
+func (s *Server) acceptLoop(ln net.Listener, handler func(net.Conn)) {
 	defer s.wg.Done()
 
+	backoff := 5 * time.Millisecond
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				if strings.Contains(err.Error(), "use of closed network connection") {
-					return
-				}
-				// Transient errors (EMFILE, ENFILE, temporary resource limits):
-				// log and continue accepting rather than killing the listener.
-				if isTemporaryError(err) {
-					s.logger.Warn("transient accept error, retrying", "error", err)
-					time.Sleep(5 * time.Millisecond)
-					continue
-				}
-				s.logger.Error("accept error", "error", err)
+			if errors.Is(err, net.ErrClosed) {
 				return
 			}
+			// Transient errors (EMFILE, ENFILE, ECONNABORTED): back off and retry
+			// rather than killing the listener.
+			s.logger.Warn("accept error, retrying", "addr", ln.Addr(), "error", err, "backoff", backoff)
+			time.Sleep(backoff)
+			if backoff < time.Second {
+				backoff *= 2
+			}
+			continue
 		}
+		backoff = 5 * time.Millisecond
 
-		// Acquire semaphore slot; drop the connection if at capacity.
 		select {
 		case s.sem <- struct{}{}:
 		default:
@@ -316,238 +435,46 @@ func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, handler func(n
 			conn.Close()
 			continue
 		}
+		if !s.track(conn) {
+			<-s.sem
+			conn.Close()
+			return
+		}
 
 		s.wg.Add(1)
 		go func(c net.Conn) {
 			defer s.wg.Done()
 			defer func() { <-s.sem }()
+			defer s.untrack(c)
+			defer c.Close()
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Error("panic in connection handler", "remote", c.RemoteAddr(), "panic", r)
+				}
+			}()
 			handler(c)
 		}(conn)
 	}
 }
 
-// isTemporaryError reports whether err is a transient network error that
-// the accept loop should retry rather than terminate on.
-func isTemporaryError(err error) bool {
-	type temporary interface{ Temporary() bool }
-	if t, ok := err.(temporary); ok {
-		return t.Temporary()
-	}
-	// Heuristic: "too many open files" is a well-known transient OS error.
-	return strings.Contains(err.Error(), "too many open files")
+// connInfo carries per-connection facts used for logging.
+type connInfo struct {
+	ip       string
+	srcPort  int
+	destPort int
+	country  string
+	city     string
+	svc      service
 }
 
-// handleConnection applies shared security checks before routing the
-// connection to the appropriate handler. portHandler must be one of:
-//   - *stealth.Handler  (portType "stealth")
-//   - honeypot.Handler  (portType "honeypot")
-//   - string            (portType "passthrough" – the target address)
-func (s *Server) handleConnection(conn net.Conn, portType string, portHandler interface{}) {
-	defer func() {
-		// Safety net: individual handlers are responsible for closing conn, but
-		// we close here too so a panic or early return never leaks a fd.
-		conn.Close()
-	}()
-
-	remoteAddr := conn.RemoteAddr().String()
-	sourceIP, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		sourceIP = remoteAddr
-	}
-	// Normalize to canonical IP string so that IPv4-mapped IPv6 addresses
-	// (e.g. "::ffff:1.2.3.4") compare equal to their plain IPv4 form.
-	if parsed := net.ParseIP(sourceIP); parsed != nil {
-		if v4 := parsed.To4(); v4 != nil {
-			sourceIP = v4.String()
-		} else {
-			sourceIP = parsed.String()
-		}
-	}
-
-	_, destPort, _ := net.SplitHostPort(conn.LocalAddr().String())
-
-	// 1. Whitelist – always allow, but still log so the operator can see their
-	// own infrastructure's traffic patterns in the dashboard.
-	for _, wIP := range s.cfg.Whitelist.IPs {
-		// Normalize whitelist entry for comparison.
-		if normalizeIP(wIP) == sourceIP {
-			s.logConn(sourceIP, destPort, "", "", portType, "forwarded", "whitelisted_ip")
-			s.routeConnection(conn, portType, portHandler, sourceIP)
-			return
-		}
-	}
-
-	// 2. Blacklist / ban check.
-	banned, err := s.db.IsBanned(sourceIP)
-	if err != nil {
-		s.logger.Error("ban check error", "ip", sourceIP, "error", err)
-	}
-	if banned {
-		s.logger.Debug("dropping banned IP", "ip", sourceIP)
-		_ = s.firewall.BanIP(sourceIP, s.settings.AutoBan().BanDuration)
-		s.logConn(sourceIP, destPort, "", "", portType, "dropped", "banned")
-		return
-	}
-
-	// 3. Manual blacklist IPs.
-	for _, blIP := range s.cfg.Blacklist.IPs {
-		if normalizeIP(blIP) == sourceIP {
-			s.logConn(sourceIP, destPort, "", "", portType, "dropped", "blacklisted_ip")
-			return
-		}
-	}
-
-	// 4. GeoIP lookup.
-	geo := s.geoip.Lookup(sourceIP)
-	country := geo.CountryCode
-	city := geo.City
-
-	// 4a. Stealth service allowed_countries enforcement.
-	if portType == "stealth" {
-		if h, ok := portHandler.(*stealth.Handler); ok {
-			if !h.IsCountryAllowed(country) {
-				s.logger.Info("stealth: country not in allowed list, dropping",
-					"ip", sourceIP, "country", country, "service", h.Name())
-				s.logConn(sourceIP, destPort, country, city, portType, "dropped", "country_not_allowed")
-				return
-			}
-		}
-	}
-
-	// Whitelist countries – pass immediately.
-	for _, wc := range s.cfg.Whitelist.Countries {
-		if strings.EqualFold(wc, country) {
-			s.logConn(sourceIP, destPort, country, city, portType, "forwarded", "whitelisted_country")
-			s.routeConnection(conn, portType, portHandler, sourceIP)
-			return
-		}
-	}
-
-	// Blacklisted countries.
-	for _, bc := range s.cfg.Blacklist.Countries {
-		if strings.EqualFold(bc, country) {
-			s.logger.Info("dropping blacklisted country", "ip", sourceIP, "country", country)
-			_, _ = s.scorer.Record(sourceIP, country, analysis.EventBlacklistedCountry, 0)
-			s.shouldBanAndBan(sourceIP, "blacklisted_country")
-			s.logConn(sourceIP, destPort, country, city, portType, "dropped", "blacklisted_country")
-			return
-		}
-	}
-
-	// Steps 5-7 (rate-limit, port-scan, behavioural scoring) drive auto-ban.
-	// Passthrough forwards real production traffic (e.g. a website), where many
-	// connections per client are normal — applying these here would ban real
-	// users. Passthrough therefore only honours the explicit deny lists above
-	// (manual ban, blacklist IP/country) and skips the heuristic ban triggers.
-	if portType != "passthrough" {
-		// 5. Rate limit.
-		if !s.limiter.Check(sourceIP) {
-			s.logger.Info("rate limit exceeded", "ip", sourceIP)
-			_, _ = s.scorer.Record(sourceIP, country, analysis.EventRateLimitExceeded, 0)
-			s.shouldBanAndBan(sourceIP, "rate_limit_exceeded")
-			s.logConn(sourceIP, destPort, country, city, portType, "dropped", "rate_limited")
-			return
-		}
-
-		// 6. Port-scan detection.
-		port := parsePort(destPort)
-		if s.detector.RecordPort(sourceIP, port) {
-			s.logger.Info("port scan detected", "ip", sourceIP)
-			_, _ = s.scorer.Record(sourceIP, country, analysis.EventPortScan, port)
-			s.shouldBanAndBan(sourceIP, "port_scan")
-			s.logConn(sourceIP, destPort, country, city, portType, "dropped", "port_scan")
-			return
-		}
-
-		// 7. Scoring for honeypot connections.
-		if portType == "honeypot" {
-			_, _ = s.scorer.Record(sourceIP, country, analysis.EventHoneypotConnection, port)
-			s.shouldBanAndBan(sourceIP, "honeypot_threshold")
-		}
-	}
-
-	// 8. Connection log. Honeypot handlers write their own richer connection
-	//    record (with captured banner/path/data), so we skip here to avoid
-	//    double-counting honeypot hits in the stats.
-	if portType != "honeypot" {
-		s.logConn(sourceIP, destPort, country, city, portType, portType, "")
-	}
-
-	// 9. Route to appropriate handler.
-	s.routeConnection(conn, portType, portHandler, sourceIP)
-}
-
-// normalizeIP parses and normalizes an IP string, converting IPv4-mapped
-// IPv6 addresses to their plain IPv4 form. Returns the original string on error.
-func normalizeIP(s string) string {
-	ip := net.ParseIP(strings.TrimSpace(s))
-	if ip == nil {
-		return s
-	}
-	if v4 := ip.To4(); v4 != nil {
-		return v4.String()
-	}
-	return ip.String()
-}
-
-// routeConnection dispatches conn to the correct handler type.
-func (s *Server) routeConnection(conn net.Conn, portType string, portHandler interface{}, sourceIP string) {
-	switch portType {
-	case "stealth":
-		h := portHandler.(*stealth.Handler)
-		if err := h.Handle(conn, sourceIP); err != nil {
-			s.logger.Debug("stealth handler error", "ip", sourceIP, "error", err)
-		}
-
-	case "honeypot":
-		h := portHandler.(honeypot.Handler)
-		if err := h.Handle(conn, sourceIP); err != nil {
-			s.logger.Debug("honeypot handler error", "ip", sourceIP, "error", err)
-		}
-
-	case "passthrough":
-		target := portHandler.(string)
-		if err := s.proxy.Forward(conn, target); err != nil {
-			s.logger.Debug("passthrough error", "ip", sourceIP, "target", target, "error", err)
-		}
-	}
-}
-
-// shouldBanAndBan checks the current score for ip against the (runtime-adjustable)
-// auto-ban settings and applies a ban if the threshold has been reached.
-func (s *Server) shouldBanAndBan(ip, reason string) {
-	ab := s.settings.AutoBan()
-	if !ab.Enabled {
-		return
-	}
-	score, err := s.scorer.GetScore(ip)
-	if err != nil {
-		s.logger.Error("scorer error", "ip", ip, "error", err)
-		return
-	}
-	if score < ab.ScoreThreshold {
-		return
-	}
-
-	dur := ab.BanDuration
-	if err := s.db.BanIP(ip, reason, dur, false); err != nil {
-		s.logger.Error("db ban error", "ip", ip, "error", err)
-	}
-	if err := s.firewall.BanIP(ip, dur); err != nil {
-		s.logger.Error("firewall ban error", "ip", ip, "error", err)
-	}
-	s.logger.Info("auto-ban applied", "ip", ip, "reason", reason, "duration", dur)
-}
-
-// logConn is a convenience wrapper around db.LogConnection.
-func (s *Server) logConn(sourceIP, destPort, country, city, serviceType, action, data string) {
-	port := parsePort(destPort)
+func (s *Server) logConn(ci *connInfo, action, data string) {
 	if err := s.db.LogConnection(&storage.Connection{
-		SourceIP:    sourceIP,
-		DestPort:    port,
-		Country:     country,
-		City:        city,
-		ServiceType: serviceType,
+		SourceIP:    ci.ip,
+		SourcePort:  ci.srcPort,
+		DestPort:    ci.destPort,
+		Country:     ci.country,
+		City:        ci.city,
+		ServiceType: ci.svc.label(),
 		Action:      action,
 		Data:        data,
 	}); err != nil {
@@ -555,9 +482,222 @@ func (s *Server) logConn(sourceIP, destPort, country, city, serviceType, action,
 	}
 }
 
-// parsePort converts a port string to int, returning 0 on error.
-func parsePort(s string) int {
-	var p int
-	fmt.Sscanf(s, "%d", &p)
-	return p
+// handleConnection applies the shared security checks and routes the
+// connection. Order: whitelist → active ban → IP blacklist → GeoIP-based
+// rules → heuristics (rate limit, port scan, honeypot scoring) → handler.
+func (s *Server) handleConnection(conn net.Conn, svc service) {
+	ci := &connInfo{
+		ip:       netutil.HostIP(conn.RemoteAddr().String()),
+		srcPort:  addrPort(conn.RemoteAddr()),
+		destPort: addrPort(conn.LocalAddr()),
+		svc:      svc,
+	}
+	if ci.destPort == 0 {
+		ci.destPort = svc.port
+	}
+
+	// 1. Whitelist: skip every check (the honeypot credential hook also
+	// ignores whitelisted IPs, so they can never be scored or banned).
+	if s.IsWhitelisted(ci.ip) {
+		geo := s.geoip.Lookup(ci.ip)
+		ci.country, ci.city = geo.CountryCode, geo.City
+		s.route(conn, ci, "whitelisted")
+		return
+	}
+
+	// 2. Active ban. Normally the kernel drops these packets; seeing one here
+	// means the firewall rule is missing (method=none, restart, manual flush),
+	// so re-assert it.
+	banned, err := s.db.IsBanned(ci.ip)
+	if err != nil {
+		s.logger.Error("ban check error", "ip", ci.ip, "error", err)
+	}
+	if banned {
+		if err := s.firewall.Ban(ci.ip); err != nil {
+			s.logger.Debug("re-applying firewall ban failed", "ip", ci.ip, "error", err)
+		}
+		s.logConn(ci, storage.ActionDropped, "banned")
+		return
+	}
+
+	// 3. Manual IP blacklist.
+	if s.blacklist.Contains(ci.ip) {
+		s.logConn(ci, storage.ActionDropped, "blacklisted_ip")
+		return
+	}
+
+	// 4. GeoIP.
+	geo := s.geoip.Lookup(ci.ip)
+	ci.country, ci.city = geo.CountryCode, geo.City
+
+	if svc.kind == kindStealth && svc.stealth.RestrictsCountries() && s.geoip.Enabled() {
+		// Private/LAN addresses have no country; never lock them out.
+		if !(ci.country == "" && netutil.IsPrivateOrLocal(ci.ip)) && !svc.stealth.IsCountryAllowed(ci.country) {
+			s.logger.Info("stealth: country not allowed, dropping",
+				"ip", ci.ip, "country", ci.country, "service", svc.name)
+			s.logConn(ci, storage.ActionDropped, "country_not_allowed")
+			return
+		}
+	}
+
+	if ci.country != "" {
+		for _, wc := range s.cfg.Whitelist.Countries {
+			if strings.EqualFold(wc, ci.country) {
+				s.route(conn, ci, "whitelisted_country")
+				return
+			}
+		}
+		for _, bc := range s.cfg.Blacklist.Countries {
+			if strings.EqualFold(bc, ci.country) {
+				s.logger.Info("dropping blacklisted country", "ip", ci.ip, "country", ci.country)
+				s.recordAndMaybeBan(ci, analysis.EventBlacklistedCountry, "blacklisted_country")
+				s.logConn(ci, storage.ActionDropped, "blacklisted_country")
+				return
+			}
+		}
+	}
+
+	// 5-7. Heuristic ban triggers. Passthrough forwards real production
+	// traffic (e.g. a website) where many connections per client are normal,
+	// so it only honours the explicit deny lists above.
+	if svc.kind != kindPassthrough {
+		if !s.limiter.Check(ci.ip) {
+			s.logger.Info("rate limit exceeded", "ip", ci.ip)
+			s.recordAndMaybeBan(ci, analysis.EventRateLimitExceeded, "rate_limit_exceeded")
+			s.logConn(ci, storage.ActionDropped, "rate_limited")
+			return
+		}
+
+		if scanning, first := s.detector.RecordPort(ci.ip, ci.destPort); scanning {
+			if first {
+				s.logger.Info("port scan detected", "ip", ci.ip)
+				s.recordAndMaybeBan(ci, analysis.EventPortScan, "port_scan")
+			}
+			s.logConn(ci, storage.ActionDropped, "port_scan")
+			return
+		}
+
+		if svc.kind == kindHoneypot {
+			if s.recordAndMaybeBan(ci, analysis.EventHoneypotConnection, "honeypot_threshold") {
+				s.logConn(ci, storage.ActionDropped, "banned")
+				return
+			}
+		}
+	}
+
+	s.route(conn, ci, "")
+}
+
+// route hands conn to its handler. Each path writes exactly one connection
+// row: the stealth recorder, the honeypot handler, or the passthrough log.
+func (s *Server) route(conn net.Conn, ci *connInfo, note string) {
+	switch ci.svc.kind {
+	case kindStealth:
+		record := func(action, data string) {
+			if note != "" {
+				data = note + "; " + data
+			}
+			s.logConn(ci, action, data)
+		}
+		if err := ci.svc.stealth.Handle(conn, ci.ip, record); err != nil {
+			s.logger.Debug("stealth handler error", "ip", ci.ip, "error", err)
+		}
+
+	case kindHoneypot:
+		sess := honeypot.Session{IP: ci.ip, Port: ci.destPort, Country: ci.country, City: ci.city}
+		if err := ci.svc.honeypot.Handle(conn, sess); err != nil {
+			s.logger.Debug("honeypot handler error", "ip", ci.ip, "error", err)
+		}
+
+	case kindPassthrough:
+		s.logConn(ci, storage.ActionForwarded, note)
+		if err := s.proxy.Forward(conn, ci.svc.target); err != nil {
+			s.logger.Warn("passthrough error", "ip", ci.ip, "target", ci.svc.target, "error", err)
+		}
+	}
+}
+
+// recordAndMaybeBan scores event for the connection's IP and applies an
+// auto-ban when the threshold is reached. It reports whether the IP is now banned.
+func (s *Server) recordAndMaybeBan(ci *connInfo, event analysis.ScoreEvent, reason string) bool {
+	score, err := s.scorer.Record(ci.ip, ci.country, event, ci.destPort)
+	if err != nil {
+		s.logger.Error("scoring failed", "ip", ci.ip, "error", err)
+		return false
+	}
+	return s.maybeAutoBan(ci.ip, score, reason)
+}
+
+// maybeAutoBan bans ip when auto-ban is enabled and score has reached the
+// (runtime-adjustable) threshold. Whitelisted IPs are never banned.
+func (s *Server) maybeAutoBan(ip string, score int, reason string) bool {
+	ab := s.settings.AutoBan()
+	if !ab.Enabled || score < ab.ScoreThreshold || s.IsWhitelisted(ip) {
+		return false
+	}
+	if banned, _ := s.db.IsBanned(ip); banned {
+		return true
+	}
+	if err := s.BanIP(ip, reason, ab.BanDuration, ab.BanDuration == 0); err != nil {
+		s.logger.Error("auto-ban failed", "ip", ip, "error", err)
+		return false
+	}
+	s.logger.Info("auto-ban applied", "ip", ip, "reason", reason, "score", score, "duration", ab.BanDuration)
+	return true
+}
+
+// IsWhitelisted reports whether ip is covered by whitelist.ips (or loopback).
+func (s *Server) IsWhitelisted(ip string) bool {
+	return s.whitelist.Contains(ip)
+}
+
+// BanIP records a ban and applies it to the firewall. It implements
+// dashboard.BanManager. A firewall error is returned after the ban is stored;
+// SkyGuard's own listeners still drop the IP.
+func (s *Server) BanIP(ip, reason string, duration time.Duration, permanent bool) error {
+	ip = netutil.NormalizeIP(ip)
+	if net.ParseIP(ip) == nil {
+		return fmt.Errorf("invalid IP %q", ip)
+	}
+	if s.IsWhitelisted(ip) {
+		return fmt.Errorf("%s is whitelisted; remove it from whitelist.ips first", ip)
+	}
+	if err := s.db.BanIP(ip, reason, duration, permanent); err != nil {
+		return err
+	}
+	if err := s.firewall.Ban(ip); err != nil {
+		return fmt.Errorf("ban stored but firewall rule failed: %w", err)
+	}
+	return nil
+}
+
+// UnbanIP lifts a ban everywhere and resets the IP's score. It implements
+// dashboard.BanManager.
+func (s *Server) UnbanIP(ip string) error {
+	ip = netutil.NormalizeIP(ip)
+	if net.ParseIP(ip) == nil {
+		return fmt.Errorf("invalid IP %q", ip)
+	}
+	if err := s.db.UnbanIP(ip); err != nil {
+		return err
+	}
+	if err := s.db.ResetScore(ip); err != nil {
+		s.logger.Warn("failed to reset score after unban", "ip", ip, "error", err)
+	}
+	if err := s.firewall.Unban(ip); err != nil {
+		return fmt.Errorf("ban removed but firewall rule removal failed: %w", err)
+	}
+	return nil
+}
+
+func addrPort(a net.Addr) int {
+	if tcp, ok := a.(*net.TCPAddr); ok {
+		return tcp.Port
+	}
+	_, p, err := net.SplitHostPort(a.String())
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(p)
+	return n
 }

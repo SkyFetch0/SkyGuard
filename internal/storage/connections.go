@@ -5,18 +5,26 @@ import (
 	"time"
 )
 
+// Connection actions. Every row in the connections table uses one of these so
+// the dashboard counters add up.
+const (
+	ActionHoneypot  = "honeypot"
+	ActionForwarded = "forwarded"
+	ActionDropped   = "dropped"
+)
+
 // Connection represents a single network connection event.
 type Connection struct {
-	ID          int64
-	Timestamp   time.Time
-	SourceIP    string
-	SourcePort  int
-	DestPort    int
-	Country     string
-	City        string
-	ServiceType string
-	Action      string
-	Data        string
+	ID          int64     `json:"id"`
+	Timestamp   time.Time `json:"timestamp"`
+	SourceIP    string    `json:"source_ip"`
+	SourcePort  int       `json:"source_port"`
+	DestPort    int       `json:"dest_port"`
+	Country     string    `json:"country"`
+	City        string    `json:"city"`
+	ServiceType string    `json:"service_type"`
+	Action      string    `json:"action"`
+	Data        string    `json:"data"`
 }
 
 // LogConnection inserts a new connection record into the database.
@@ -24,68 +32,26 @@ func (d *DB) LogConnection(c *Connection) error {
 	const query = `
 		INSERT INTO connections
 			(timestamp, source_ip, source_port, dest_port, country, city, service_type, action, data)
-		VALUES
-			(?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	ts := c.Timestamp
 	if ts.IsZero() {
-		ts = time.Now().UTC()
+		ts = time.Now()
 	}
-
-	_, err := d.db.Exec(query,
-		ts.Format(time.RFC3339),
-		c.SourceIP,
-		c.SourcePort,
-		c.DestPort,
-		c.Country,
-		c.City,
-		c.ServiceType,
-		c.Action,
-		c.Data,
-	)
+	_, err := d.db.Exec(query, formatTS(ts), c.SourceIP, c.SourcePort, c.DestPort,
+		c.Country, c.City, c.ServiceType, c.Action, c.Data)
 	if err != nil {
 		return fmt.Errorf("logging connection: %w", err)
 	}
 	return nil
 }
 
-// GetRecentConnections returns the most recent connections up to limit rows,
-// ordered newest first.
+const connectionColumns = `id, timestamp, source_ip, source_port, dest_port,
+	country, city, service_type, action, data`
+
+// GetRecentConnections returns the most recent connections, newest first.
 func (d *DB) GetRecentConnections(limit int) ([]*Connection, error) {
-	const query = `
-		SELECT id, timestamp, source_ip, source_port, dest_port,
-		       country, city, service_type, action, data
-		FROM   connections
-		ORDER  BY timestamp DESC
-		LIMIT  ?`
-
-	rows, err := d.db.Query(query, limit)
-	if err != nil {
-		return nil, fmt.Errorf("querying recent connections: %w", err)
-	}
-	defer rows.Close()
-
-	return scanConnections(rows)
-}
-
-// GetConnectionsByIP returns recent connections from a specific source IP,
-// ordered newest first, up to limit rows.
-func (d *DB) GetConnectionsByIP(ip string, limit int) ([]*Connection, error) {
-	const query = `
-		SELECT id, timestamp, source_ip, source_port, dest_port,
-		       country, city, service_type, action, data
-		FROM   connections
-		WHERE  source_ip = ?
-		ORDER  BY timestamp DESC
-		LIMIT  ?`
-
-	rows, err := d.db.Query(query, ip, limit)
-	if err != nil {
-		return nil, fmt.Errorf("querying connections by IP: %w", err)
-	}
-	defer rows.Close()
-
-	return scanConnections(rows)
+	return d.SearchConnections(ConnectionFilter{Limit: limit})
 }
 
 // ConnectionFilter holds optional filter criteria for connection log searches.
@@ -100,26 +66,25 @@ type ConnectionFilter struct {
 	Offset      int
 }
 
-// SearchConnections returns connections matching all non-empty filter fields.
+// SearchConnections returns connections matching all non-empty filter fields,
+// newest first.
 func (d *DB) SearchConnections(f ConnectionFilter) ([]*Connection, error) {
 	if f.Limit <= 0 {
 		f.Limit = 100
 	}
+	if f.Offset < 0 {
+		f.Offset = 0
+	}
 
-	query := `
-		SELECT id, timestamp, source_ip, source_port, dest_port,
-		       country, city, service_type, action, data
-		FROM   connections
-		WHERE  1=1`
-
-	args := []interface{}{}
+	query := `SELECT ` + connectionColumns + ` FROM connections WHERE 1=1`
+	var args []any
 
 	if f.IP != "" {
 		query += " AND source_ip = ?"
 		args = append(args, f.IP)
 	}
 	if f.Country != "" {
-		query += " AND country = ?"
+		query += " AND country = ? COLLATE NOCASE"
 		args = append(args, f.Country)
 	}
 	if f.ServiceType != "" {
@@ -131,15 +96,14 @@ func (d *DB) SearchConnections(f ConnectionFilter) ([]*Connection, error) {
 		args = append(args, f.Action)
 	}
 	if !f.Since.IsZero() {
-		query += " AND datetime(timestamp) >= datetime(?)"
-		args = append(args, f.Since.UTC().Format(time.RFC3339))
+		query += " AND timestamp >= ?"
+		args = append(args, formatTS(f.Since))
 	}
 	if !f.Until.IsZero() {
-		query += " AND datetime(timestamp) <= datetime(?)"
-		args = append(args, f.Until.UTC().Format(time.RFC3339))
+		query += " AND timestamp <= ?"
+		args = append(args, formatTS(f.Until))
 	}
-
-	query += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+	query += " ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?"
 	args = append(args, f.Limit, f.Offset)
 
 	rows, err := d.db.Query(query, args...)
@@ -147,175 +111,140 @@ func (d *DB) SearchConnections(f ConnectionFilter) ([]*Connection, error) {
 		return nil, fmt.Errorf("searching connections: %w", err)
 	}
 	defer rows.Close()
-	return scanConnections(rows)
+
+	results := []*Connection{}
+	for rows.Next() {
+		c := &Connection{}
+		var ts dbTime
+		if err := rows.Scan(&c.ID, &ts, &c.SourceIP, &c.SourcePort, &c.DestPort,
+			&c.Country, &c.City, &c.ServiceType, &c.Action, &c.Data); err != nil {
+			return nil, fmt.Errorf("scanning connection row: %w", err)
+		}
+		c.Timestamp = ts.Time
+		results = append(results, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating connection rows: %w", err)
+	}
+	return results, nil
 }
 
-// TimelineBucket holds aggregate counts for a single time bucket.
+// TimelineBucket holds aggregate counts for a single hour.
 type TimelineBucket struct {
-	Bucket       string `json:"bucket"`
+	Bucket       string `json:"bucket"` // RFC3339, start of the hour (UTC)
 	Total        int64  `json:"total"`
 	HoneypotHits int64  `json:"honeypot_hits"`
 	Dropped      int64  `json:"dropped"`
 	Forwarded    int64  `json:"forwarded"`
 }
 
-// GetTimeline returns per-hour connection counts for the last n hours.
+// GetTimeline returns per-hour connection counts for the last n hours. Hours
+// without traffic are included with zero counts so the chart's x-axis is linear.
 func (d *DB) GetTimeline(hours int) ([]*TimelineBucket, error) {
 	if hours <= 0 {
 		hours = 24
 	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	start := now.Add(-time.Duration(hours-1) * time.Hour)
+
 	const query = `
 		SELECT
-			strftime('%Y-%m-%dT%H:00:00Z', timestamp)         AS bucket,
-			COUNT(*)                                            AS total,
-			COALESCE(SUM(CASE WHEN action='honeypot'  THEN 1 ELSE 0 END),0) AS honeypot_hits,
-			COALESCE(SUM(CASE WHEN action='dropped'   THEN 1 ELSE 0 END),0) AS dropped,
-			COALESCE(SUM(CASE WHEN action='forwarded' THEN 1 ELSE 0 END),0) AS forwarded
+			substr(timestamp, 1, 13) || ':00:00Z'                             AS bucket,
+			COUNT(*)                                                          AS total,
+			COALESCE(SUM(CASE WHEN action='honeypot'  THEN 1 ELSE 0 END), 0) AS honeypot_hits,
+			COALESCE(SUM(CASE WHEN action='dropped'   THEN 1 ELSE 0 END), 0) AS dropped,
+			COALESCE(SUM(CASE WHEN action='forwarded' THEN 1 ELSE 0 END), 0) AS forwarded
 		FROM   connections
-		WHERE  datetime(timestamp) >= datetime('now', ? || ' hours')
-		GROUP  BY bucket
-		ORDER  BY bucket ASC`
+		WHERE  timestamp >= ?
+		GROUP  BY bucket`
 
-	rows, err := d.db.Query(query, fmt.Sprintf("-%d", hours))
+	rows, err := d.db.Query(query, formatTS(start))
 	if err != nil {
 		return nil, fmt.Errorf("querying timeline: %w", err)
 	}
 	defer rows.Close()
 
-	var buckets []*TimelineBucket
+	byBucket := map[string]*TimelineBucket{}
 	for rows.Next() {
 		b := &TimelineBucket{}
 		if err := rows.Scan(&b.Bucket, &b.Total, &b.HoneypotHits, &b.Dropped, &b.Forwarded); err != nil {
 			return nil, fmt.Errorf("scanning timeline bucket: %w", err)
 		}
-		buckets = append(buckets, b)
+		byBucket[b.Bucket] = b
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating timeline: %w", err)
 	}
+
+	buckets := make([]*TimelineBucket, 0, hours)
+	for t := start; !t.After(now); t = t.Add(time.Hour) {
+		key := formatTS(t)
+		if b, ok := byBucket[key]; ok {
+			buckets = append(buckets, b)
+		} else {
+			buckets = append(buckets, &TimelineBucket{Bucket: key})
+		}
+	}
 	return buckets, nil
 }
 
-// GetExtendedStats returns enriched aggregate stats including today counts, unique IPs/countries.
-func (d *DB) GetExtendedStats() (map[string]interface{}, error) {
-	const query = `
-		SELECT
-			COUNT(*)                                                              AS total,
-			COALESCE(SUM(CASE WHEN action='honeypot'  THEN 1 ELSE 0 END), 0)    AS honeypot_hits,
-			COALESCE(SUM(CASE WHEN action='forwarded' THEN 1 ELSE 0 END), 0)    AS forwarded,
-			COALESCE(SUM(CASE WHEN action='dropped'   THEN 1 ELSE 0 END), 0)    AS dropped,
-			COALESCE(SUM(CASE WHEN date(timestamp)=date('now') THEN 1 ELSE 0 END),0) AS today,
-			COUNT(DISTINCT source_ip)                                             AS unique_ips,
-			COUNT(DISTINCT country)                                               AS unique_countries
-		FROM connections`
-
-	row := d.db.QueryRow(query)
-
-	var total, honeypot, forwarded, dropped, today, uniqueIPs, uniqueCountries int64
-	if err := row.Scan(&total, &honeypot, &forwarded, &dropped, &today, &uniqueIPs, &uniqueCountries); err != nil {
-		return nil, fmt.Errorf("scanning extended stats: %w", err)
-	}
-
-	const banQuery = `
-		SELECT
-			COUNT(*) AS active_bans,
-			COALESCE(SUM(CASE WHEN date(banned_at)=date('now') THEN 1 ELSE 0 END),0) AS bans_today
-		FROM banned_ips`
-
-	banRow := d.db.QueryRow(banQuery)
-	var activeBans, bansToday int64
-	if err := banRow.Scan(&activeBans, &bansToday); err != nil {
-		return nil, fmt.Errorf("scanning ban stats: %w", err)
-	}
-
-	return map[string]interface{}{
-		"total":            total,
-		"honeypot_hits":    honeypot,
-		"forwarded":        forwarded,
-		"dropped":          dropped,
-		"connections_today": today,
-		"unique_ips":       uniqueIPs,
-		"unique_countries": uniqueCountries,
-		"active_bans":      activeBans,
-		"bans_today":       bansToday,
-	}, nil
+// Stats is the aggregate shown on the dashboard overview.
+type Stats struct {
+	Total           int64 `json:"total"`
+	HoneypotHits    int64 `json:"honeypot_hits"`
+	Forwarded       int64 `json:"forwarded"`
+	Dropped         int64 `json:"dropped"`
+	Today           int64 `json:"connections_today"`
+	UniqueIPs       int64 `json:"unique_ips"`
+	UniqueCountries int64 `json:"unique_countries"`
+	Credentials     int64 `json:"credentials"`
+	ActiveBans      int64 `json:"active_bans"`
+	BansToday       int64 `json:"bans_today"`
 }
 
-// CleanOldConnections deletes connection records older than days days.
-func (d *DB) CleanOldConnections(days int) error {
-	const query = `
-		DELETE FROM connections
-		WHERE  datetime(timestamp) < datetime('now', ? || ' days')`
+// GetStats returns aggregate counters for the dashboard.
+func (d *DB) GetStats() (*Stats, error) {
+	todayStart := formatTS(time.Now().UTC().Truncate(24 * time.Hour))
+	now := formatTS(time.Now())
 
-	if _, err := d.db.Exec(query, fmt.Sprintf("-%d", days)); err != nil {
-		return fmt.Errorf("cleaning old connections: %w", err)
-	}
-	return nil
-}
-
-// GetConnectionStats returns aggregate counters keyed by category:
-//
-//	"total"         – all connections
-//	"honeypot_hits" – connections with action="honeypot"
-//	"forwarded"     – connections with action="forwarded"
-//	"dropped"       – connections with action="dropped"
-func (d *DB) GetConnectionStats() (map[string]int64, error) {
-	const query = `
+	s := &Stats{}
+	err := d.db.QueryRow(`
 		SELECT
-			COUNT(*)                                                        AS total,
-			COALESCE(SUM(CASE WHEN action = 'honeypot'   THEN 1 ELSE 0 END), 0) AS honeypot_hits,
-			COALESCE(SUM(CASE WHEN action = 'forwarded'  THEN 1 ELSE 0 END), 0) AS forwarded,
-			COALESCE(SUM(CASE WHEN action = 'dropped'    THEN 1 ELSE 0 END), 0) AS dropped
-		FROM connections`
-
-	row := d.db.QueryRow(query)
-
-	var total, honeypot, forwarded, dropped int64
-	if err := row.Scan(&total, &honeypot, &forwarded, &dropped); err != nil {
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN action='honeypot'  THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN action='forwarded' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN action='dropped'   THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END), 0),
+			COUNT(DISTINCT source_ip),
+			COUNT(DISTINCT NULLIF(country, ''))
+		FROM connections`, todayStart).
+		Scan(&s.Total, &s.HoneypotHits, &s.Forwarded, &s.Dropped, &s.Today, &s.UniqueIPs, &s.UniqueCountries)
+	if err != nil {
 		return nil, fmt.Errorf("scanning connection stats: %w", err)
 	}
 
-	return map[string]int64{
-		"total":         total,
-		"honeypot_hits": honeypot,
-		"forwarded":     forwarded,
-		"dropped":       dropped,
-	}, nil
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM credentials`).Scan(&s.Credentials); err != nil {
+		return nil, fmt.Errorf("scanning credential stats: %w", err)
+	}
+
+	err = d.db.QueryRow(`
+		SELECT
+			COALESCE(SUM(CASE WHEN permanent = 1 OR expires_at > ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN banned_at >= ? THEN 1 ELSE 0 END), 0)
+		FROM banned_ips`, now, todayStart).Scan(&s.ActiveBans, &s.BansToday)
+	if err != nil {
+		return nil, fmt.Errorf("scanning ban stats: %w", err)
+	}
+	return s, nil
 }
 
-// scanConnections is a helper that reads all rows into a []*Connection slice.
-func scanConnections(rows interface {
-	Next() bool
-	Scan(...any) error
-	Err() error
-}) ([]*Connection, error) {
-	var results []*Connection
-
-	for rows.Next() {
-		c := &Connection{}
-		var tsStr string
-
-		if err := rows.Scan(
-			&c.ID, &tsStr, &c.SourceIP, &c.SourcePort, &c.DestPort,
-			&c.Country, &c.City, &c.ServiceType, &c.Action, &c.Data,
-		); err != nil {
-			return nil, fmt.Errorf("scanning connection row: %w", err)
-		}
-
-		ts, err := time.Parse(time.RFC3339, tsStr)
-		if err != nil {
-			// Fall back to SQLite datetime format.
-			ts, err = time.Parse("2006-01-02 15:04:05", tsStr)
-			if err != nil {
-				return nil, fmt.Errorf("parsing timestamp %q: %w", tsStr, err)
-			}
-		}
-		c.Timestamp = ts
-		results = append(results, c)
+// CleanOldConnections deletes connection records older than days days.
+func (d *DB) CleanOldConnections(days int) (int64, error) {
+	cutoff := formatTS(time.Now().Add(-time.Duration(days) * 24 * time.Hour))
+	res, err := d.db.Exec(`DELETE FROM connections WHERE timestamp < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("cleaning old connections: %w", err)
 	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterating connection rows: %w", err)
-	}
-	return results, nil
+	n, _ := res.RowsAffected()
+	return n, nil
 }

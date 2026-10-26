@@ -1,293 +1,191 @@
 package honeypot
 
 import (
-	"bufio"
-	"encoding/binary"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/pem"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
-	"strings"
+	"os"
+	"path/filepath"
+	"sync"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/skyguard/skyguard/internal/config"
 )
 
-// SSHHoneypot simulates a minimal SSH service that captures credentials.
-// It implements a simplified SSH userauth exchange: banner negotiation,
-// fake KEX_INIT, and a userauth loop that reads username/password pairs
-// before rejecting them with SSH_MSG_USERAUTH_FAILURE.
+// SSHHoneypot is a real SSH-2 server (golang.org/x/crypto/ssh) that completes
+// key exchange, captures every password / keyboard-interactive attempt and
+// rejects all of them. A hand-rolled plaintext imitation cannot work: real
+// clients only send credentials after the encrypted key exchange.
 type SSHHoneypot struct {
 	cfg         config.HoneypotService
 	eventLogger *EventLogger
 	logger      *slog.Logger
+	hostKeys    []ssh.Signer
 }
 
-// NewSSHHoneypot creates an SSHHoneypot using the supplied config and loggers.
-func NewSSHHoneypot(cfg config.HoneypotService, eventLogger *EventLogger, logger *slog.Logger) *SSHHoneypot {
+const sshSessionTimeout = 60 * time.Second
+
+var errAuthDenied = errors.New("permission denied")
+
+// NewSSHHoneypot creates an SSHHoneypot. Host keys are loaded from (or
+// generated into) dataDir so the server fingerprint stays stable across
+// restarts — a changing key is an easy honeypot tell.
+func NewSSHHoneypot(cfg config.HoneypotService, eventLogger *EventLogger, logger *slog.Logger, dataDir string) (*SSHHoneypot, error) {
 	if cfg.Banner == "" {
 		cfg.Banner = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"
 	}
-	if cfg.MaxAuthAttempts == 0 {
+	if cfg.MaxAuthAttempts <= 0 {
 		cfg.MaxAuthAttempts = 3
 	}
-	return &SSHHoneypot{cfg: cfg, eventLogger: eventLogger, logger: logger}
+	if cfg.FakeShell {
+		logger.Warn("fake_shell is not implemented and is ignored; the SSH honeypot never grants a session")
+	}
+	keys, err := loadOrCreateHostKeys(dataDir, logger)
+	if err != nil {
+		return nil, fmt.Errorf("ssh honeypot host keys: %w", err)
+	}
+	return &SSHHoneypot{cfg: cfg, eventLogger: eventLogger, logger: logger, hostKeys: keys}, nil
 }
 
 // Type implements Handler.
 func (s *SSHHoneypot) Type() string { return "ssh" }
 
 // Handle implements Handler.
-// Flow: version exchange → fake KEX_INIT drain → userauth loop (captures
-// username + password per attempt) → SSH_MSG_USERAUTH_FAILURE each time →
-// disconnect after MaxAuthAttempts.
-func (s *SSHHoneypot) Handle(conn net.Conn, sourceIP string) error {
+func (s *SSHHoneypot) Handle(conn net.Conn, sess Session) error {
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(sshSessionTimeout))
 
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	// ── Step 1: Version exchange ──────────────────────────────────────────
-	if _, err := fmt.Fprintf(conn, "%s\r\n", s.cfg.Banner); err != nil {
-		return fmt.Errorf("ssh: write banner: %w", err)
+	var (
+		mu       sync.Mutex
+		attempts int
+		client   string
+		users    = map[string]bool{}
+		methods  = map[string]bool{}
+	)
+	note := func(meta ssh.ConnMetadata, method string) {
+		mu.Lock()
+		defer mu.Unlock()
+		client = string(meta.ClientVersion())
+		users[meta.User()] = true
+		methods[method] = true
 	}
-
-	reader := bufio.NewReader(conn)
-	clientBanner, err := reader.ReadString('\n')
-	if err != nil && err != io.EOF {
-		s.eventLogger.LogConnection(sourceIP, s.cfg.Port, "ssh", "")
-		return fmt.Errorf("ssh: read client banner: %w", err)
-	}
-	clientBanner = strings.TrimSpace(clientBanner)
-
-	s.logger.Info("ssh connection", "source_ip", sourceIP, "client_banner", clientBanner)
-
-	// ── Step 2: Drain the client's KEXINIT packet ─────────────────────────
-	// A real SSH client sends a binary KEXINIT immediately after the version
-	// string. We read and discard it so the client advances to userauth.
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
-	if err := drainSSHPacket(reader); err != nil {
-		// Client disconnected before sending KEXINIT — log and exit cleanly.
-		s.eventLogger.LogConnection(sourceIP, s.cfg.Port, "ssh",
-			fmt.Sprintf("banner=%q kexinit_err=%v", clientBanner, err))
-		return nil
-	}
-
-	// Send our own fake KEXINIT so the client proceeds.
-	if _, err := conn.Write(buildFakeKEXInit()); err != nil {
-		return fmt.Errorf("ssh: write kexinit: %w", err)
-	}
-
-	// Drain NEWKEYS / any remaining handshake packets the client sends.
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
-	for i := 0; i < 3; i++ {
-		if err := drainSSHPacket(reader); err != nil {
-			break
-		}
-	}
-
-	// ── Step 3: Userauth loop ─────────────────────────────────────────────
-	attempts := 0
-	for attempts < s.cfg.MaxAuthAttempts {
-		conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-		pkt, err := readSSHPacket(reader)
-		if err != nil {
-			break
-		}
-		if len(pkt) < 1 {
-			continue
-		}
-
-		msgType := pkt[0]
-
-		// SSH_MSG_SERVICE_REQUEST (5) — reply with SERVICE_ACCEPT.
-		if msgType == 5 {
-			if _, err := conn.Write(buildSSHPacket([]byte{6})); err != nil {
-				return fmt.Errorf("ssh: write service_accept: %w", err)
-			}
-			continue
-		}
-
-		// SSH_MSG_USERAUTH_REQUEST (50).
-		if msgType != 50 || len(pkt) < 5 {
-			continue
-		}
-
-		username, password, ok := parseUserauthRequest(pkt)
-		if !ok {
-			continue
-		}
-
+	capture := func(meta ssh.ConnMetadata, password string) {
+		mu.Lock()
 		attempts++
-		s.logger.Info("ssh credential attempt",
-			"source_ip", sourceIP,
-			"user", username,
-			"pass", password,
-			"attempt", attempts,
-		)
-		s.eventLogger.LogCredential(sourceIP, s.cfg.Port, username, password, "ssh")
-
-		if attempts >= s.cfg.MaxAuthAttempts {
-			// SSH_MSG_DISCONNECT (1): too many auth failures.
-			conn.Write(buildSSHDisconnect("Too many authentication failures")) //nolint:errcheck
-			break
-		}
-
-		// SSH_MSG_USERAUTH_FAILURE (51).
-		if _, err := conn.Write(buildUserauthFailure()); err != nil {
-			break
-		}
+		n := attempts
+		mu.Unlock()
+		s.logger.Info("ssh credential attempt", "source_ip", sess.IP, "user", meta.User(), "attempt", n)
+		s.eventLogger.LogCredential(sess, meta.User(), password, "ssh")
+		// A short delay mimics real sshd and slows brute-forcers down.
+		time.Sleep(300 * time.Millisecond)
 	}
 
-	logData := fmt.Sprintf("banner=%q attempts=%d", clientBanner, attempts)
-	s.eventLogger.LogConnection(sourceIP, s.cfg.Port, "ssh", logData)
+	cfg := &ssh.ServerConfig{
+		ServerVersion: s.cfg.Banner,
+		MaxAuthTries:  s.cfg.MaxAuthAttempts,
+		PasswordCallback: func(meta ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			note(meta, "password")
+			capture(meta, string(password))
+			return nil, errAuthDenied
+		},
+		KeyboardInteractiveCallback: func(meta ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+			note(meta, "keyboard-interactive")
+			answers, err := challenge("", "", []string{"Password: "}, []bool{false})
+			if err == nil && len(answers) == 1 {
+				capture(meta, answers[0])
+			}
+			return nil, errAuthDenied
+		},
+		PublicKeyCallback: func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			note(meta, "publickey:"+key.Type())
+			return nil, errAuthDenied
+		},
+	}
+	for _, k := range s.hostKeys {
+		cfg.AddHostKey(k)
+	}
+
+	_, _, _, err := ssh.NewServerConn(conn, cfg)
+	if err == nil {
+		// Unreachable: every callback rejects. Never let a session through.
+		return errors.New("ssh honeypot: unexpected successful authentication")
+	}
+
+	mu.Lock()
+	data := fmt.Sprintf("client=%q attempts=%d users=%v methods=%v", client, attempts, keys(users), keys(methods))
+	mu.Unlock()
+	s.eventLogger.LogConnection(sess, "ssh", data)
 	return nil
 }
 
-// ── SSH binary helpers ────────────────────────────────────────────────────────
-
-// readSSHPacket reads one SSH binary packet (RFC 4253 §6) and returns the
-// payload (without packet_length, padding_length, or padding bytes).
-func readSSHPacket(r *bufio.Reader) ([]byte, error) {
-	var hdr [5]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
+func keys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
-	pktLen := binary.BigEndian.Uint32(hdr[:4])
-	if pktLen == 0 || pktLen > 35000 {
-		return nil, fmt.Errorf("ssh: packet length %d out of range", pktLen)
-	}
-	paddingLen := int(hdr[4])
-	payloadLen := int(pktLen) - 1 - paddingLen
-	if payloadLen < 0 {
-		return nil, fmt.Errorf("ssh: invalid padding length")
-	}
-	payload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
-	}
-	padding := make([]byte, paddingLen)
-	_, _ = io.ReadFull(r, padding)
-	return payload, nil
+	return out
 }
 
-// drainSSHPacket reads and discards one SSH packet.
-func drainSSHPacket(r *bufio.Reader) error {
-	_, err := readSSHPacket(r)
-	return err
-}
-
-// buildSSHPacket wraps payload in an SSH binary packet frame.
-func buildSSHPacket(payload []byte) []byte {
-	paddingLen := 8 - ((len(payload) + 5) % 8)
-	if paddingLen < 4 {
-		paddingLen += 8
+// loadOrCreateHostKeys returns an ed25519 and an RSA host key, persisted as
+// OpenSSH private keys under dataDir. If dataDir is not writable the keys
+// are kept in memory only.
+func loadOrCreateHostKeys(dataDir string, logger *slog.Logger) ([]ssh.Signer, error) {
+	specs := []struct {
+		file string
+		gen  func() (any, error)
+	}{
+		{"ssh_honeypot_ed25519_key", func() (any, error) {
+			_, priv, err := ed25519.GenerateKey(rand.Reader)
+			return priv, err
+		}},
+		{"ssh_honeypot_rsa_key", func() (any, error) {
+			return rsa.GenerateKey(rand.Reader, 3072)
+		}},
 	}
-	pktLen := uint32(1 + len(payload) + paddingLen)
-	buf := make([]byte, 4+1+len(payload)+paddingLen)
-	binary.BigEndian.PutUint32(buf[0:], pktLen)
-	buf[4] = byte(paddingLen)
-	copy(buf[5:], payload)
-	return buf
-}
 
-// buildFakeKEXInit returns a minimal SSH_MSG_KEXINIT (20) packet.
-// The name-list fields are populated with a single widely-supported algorithm
-// so a real client can parse it without errors.
-func buildFakeKEXInit() []byte {
-	// cookie (16 bytes) + msg_type
-	payload := make([]byte, 0, 256)
-	payload = append(payload, 20)             // SSH_MSG_KEXINIT
-	payload = append(payload, make([]byte, 16)...) // random cookie (zeroed, fine for a honeypot)
-	for i := 0; i < 10; i++ {                // 10 name-list fields
-		name := "diffie-hellman-group14-sha256"
-		if i == 1 {
-			name = "ssh-rsa"
-		} else if i == 2 || i == 3 {
-			name = "aes128-ctr"
-		} else if i == 4 || i == 5 {
-			name = "hmac-sha2-256"
-		} else if i == 6 || i == 7 {
-			name = "none"
+	var signers []ssh.Signer
+	for _, spec := range specs {
+		path := filepath.Join(dataDir, spec.file)
+		if b, err := os.ReadFile(path); err == nil {
+			signer, err := ssh.ParsePrivateKey(b)
+			if err != nil {
+				return nil, fmt.Errorf("parsing %s: %w", path, err)
+			}
+			signers = append(signers, signer)
+			continue
 		}
-		b := []byte(name)
-		payload = appendUint32(payload, uint32(len(b)))
-		payload = append(payload, b...)
-	}
-	payload = append(payload, 0)                   // first_kex_packet_follows = false
-	payload = appendUint32(payload, 0)             // reserved
-	return buildSSHPacket(payload)
-}
 
-// buildUserauthFailure returns SSH_MSG_USERAUTH_FAILURE (51) with
-// "password" as the only allowed continuation method.
-func buildUserauthFailure() []byte {
-	method := []byte("password")
-	payload := make([]byte, 0, 16)
-	payload = append(payload, 51) // SSH_MSG_USERAUTH_FAILURE
-	payload = appendUint32(payload, uint32(len(method)))
-	payload = append(payload, method...)
-	payload = append(payload, 0) // partial_success = false
-	return buildSSHPacket(payload)
-}
+		key, err := spec.gen()
+		if err != nil {
+			return nil, err
+		}
+		signer, err := ssh.NewSignerFromKey(key)
+		if err != nil {
+			return nil, err
+		}
+		signers = append(signers, signer)
 
-// buildSSHDisconnect returns SSH_MSG_DISCONNECT (1).
-func buildSSHDisconnect(reason string) []byte {
-	b := []byte(reason)
-	payload := make([]byte, 0, 16+len(b))
-	payload = append(payload, 1)             // SSH_MSG_DISCONNECT
-	payload = appendUint32(payload, 11)      // reason code: SSH_DISCONNECT_BY_APPLICATION
-	payload = appendUint32(payload, uint32(len(b)))
-	payload = append(payload, b...)
-	payload = appendUint32(payload, 0)       // language tag (empty)
-	return buildSSHPacket(payload)
-}
-
-// parseUserauthRequest parses SSH_MSG_USERAUTH_REQUEST (50) and returns
-// username, password, and ok=true for password-method requests.
-// Format: byte(50) + string(username) + string(service) + string(method) +
-//         bool(false) + string(password)
-func parseUserauthRequest(payload []byte) (username, password string, ok bool) {
-	if len(payload) < 5 || payload[0] != 50 {
-		return
+		block, err := ssh.MarshalPrivateKey(key, "skyguard honeypot")
+		if err != nil {
+			return nil, err
+		}
+		if dataDir == "" {
+			continue
+		}
+		if err := os.MkdirAll(dataDir, 0o750); err == nil {
+			err = os.WriteFile(path, pem.EncodeToMemory(block), 0o600)
+		}
+		if err != nil {
+			logger.Warn("could not persist ssh honeypot host key; fingerprint will change on restart",
+				"path", path, "error", err)
+		}
 	}
-	pos := 1
-	username, pos, ok = readSSHString(payload, pos)
-	if !ok {
-		return
-	}
-	_, pos, ok = readSSHString(payload, pos) // service name
-	if !ok {
-		return
-	}
-	method, pos, ok := readSSHString(payload, pos)
-	if !ok {
-		return "", "", false
-	}
-	if method != "password" {
-		return "", "", false
-	}
-	if pos >= len(payload) {
-		return "", "", false
-	}
-	pos++ // skip boolean (false = not a change password request)
-	password, _, ok = readSSHString(payload, pos)
-	return username, password, ok
-}
-
-// readSSHString reads a uint32-prefixed string from buf at offset pos.
-func readSSHString(buf []byte, pos int) (s string, newPos int, ok bool) {
-	if pos+4 > len(buf) {
-		return
-	}
-	l := int(binary.BigEndian.Uint32(buf[pos:]))
-	pos += 4
-	if pos+l > len(buf) {
-		return
-	}
-	return string(buf[pos : pos+l]), pos + l, true
-}
-
-func appendUint32(b []byte, v uint32) []byte {
-	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+	return signers, nil
 }

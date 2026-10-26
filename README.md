@@ -55,21 +55,26 @@ Internet → Server (public IP) → SkyGuard (all ports)
          ▼                     ▼
    Correct signature       Wrong / no data
    → forward to real       → log & close
-     service                 (nmap sees: filtered)
+     service                 (no banner: nmap shows tcpwrapped)
 ```
 
 **Per-connection pipeline:**
 
 ```
-1. Whitelist check      → skip all checks, forward immediately
-2. Blacklist / ban DB   → drop, re-apply firewall rule
-3. GeoIP lookup         → blacklisted country? → drop + score
-4. Rate limit           → per-minute / per-hour exceeded? → drop + score
-5. Port-scan detection  → 5+ ports in 60s? → drop + score + ban
-6. Honeypot routing     → log, score, optionally ban
-7. Stealth detection    → protocol signature match? → forward : drop
-8. Auto-ban check       → score ≥ threshold → iptables/ufw ban
+1. Whitelist (IP/CIDR, loopback always) → never scored or banned, routed directly
+2. Active ban in DB     → drop, re-apply firewall rule
+3. IP blacklist         → drop
+4. GeoIP lookup         → stealth allowed_countries, country white/blacklist
+5. Rate limit           → per-minute / per-hour exceeded? → drop + score
+6. Port-scan detection  → N distinct ports in window? → drop + score (once per burst)
+7. Honeypot routing     → score, log, capture credentials
+8. Stealth detection    → protocol signature match? → forward : drop silently
+9. Auto-ban             → score ≥ threshold → DB ban + iptables rule in the SKYGUARD chain
 ```
+
+Bans are stored in SQLite and re-applied to the firewall at start-up; when a
+temporary ban expires the kernel rule is removed and the IP's score is reset.
+Passthrough services only apply steps 1–4 (real users must not be rate-limited).
 
 ---
 
@@ -77,18 +82,18 @@ Internet → Server (public IP) → SkyGuard (all ports)
 
 | Category | Feature |
 |---|---|
-| 🕵️ **Stealth** | Real services hidden behind arbitrary ports; nmap sees `filtered` |
+| 🕵️ **Stealth** | Real services hidden behind arbitrary ports; no banner is ever sent to non-matching clients |
 | 🍯 **Honeypots** | SSH · FTP · MySQL · HTTP — configurable banners, individually toggled |
 | 🔀 **Proxy** | Transparent TCP passthrough with connection logging |
 | 📍 **GeoIP** | Country-level allow/block lists via MaxMind GeoLite2 |
 | 📊 **Scoring** | Per-IP threat score; auto-ban on threshold breach |
-| 🚫 **Auto-ban** | `iptables`, `ufw`, or dry-run (`none`) |
+| 🚫 **Auto-ban** | `iptables`/`ip6tables` (own `SKYGUARD` chain, legacy/nft auto-detected), `ufw` (bare metal), or dry-run (`none`) |
 | 🔑 **Credentials** | Every username + password attempt harvested and ranked |
 | ⏱️ **Rate limiting** | Per-IP sliding window (per-minute + per-hour) |
 | 🛡️ **DoS guard** | Semaphore caps concurrent connections at 4 096 |
 | 📦 **Storage** | Single-file SQLite, WAL mode, auto-purge old records |
 | 🌐 **Dashboard** | Browser UI with live polling + JSON REST API |
-| 🐳 **Docker** | Multi-stage image (`golang:1.22-alpine` → `alpine:3.19`, ~25 MB) |
+| 🐳 **Docker** | Multi-stage image (`golang:1.24` → `debian:bookworm-slim` with iptables-legacy + iptables-nft), built-in health check |
 | ⚙️ **Config** | Single YAML file; hot-toggleable services (`enabled: false`) |
 | 0️⃣ **Zero deps** | CGO disabled — pure Go binary, no shared libraries |
 
@@ -111,11 +116,13 @@ $EDITOR /etc/skyguard/skyguard.yaml          # set your whitelist IP + dashboard
 docker build -t skyguard:latest .
 
 # 4. Run
+docker run --rm -v /etc/skyguard/skyguard.yaml:/etc/skyguard/skyguard.yaml:ro \
+  skyguard:latest -check-config            # validate before starting
 docker run -d \
   --name skyguard \
   --network host \
   --restart unless-stopped \
-  --cap-add NET_ADMIN \
+  --cap-add NET_ADMIN --cap-add NET_RAW \
   -v /etc/skyguard/skyguard.yaml:/etc/skyguard/skyguard.yaml:ro \
   -v /var/lib/skyguard:/data \
   skyguard:latest
@@ -145,7 +152,7 @@ Supported distributions: **Ubuntu 20.04/22.04/24.04**, **Debian 11/12**, **CentO
 ### Build from source
 
 ```bash
-# Requires Go 1.22+
+# Requires Go 1.24+
 make build                     # → ./bin/skyguard
 make run                       # run with example config
 make docker-build              # build Docker image
@@ -159,7 +166,7 @@ Full annotated reference: [`configs/skyguard.example.yaml`](configs/skyguard.exa
 
 ### Stealth SSH — the killer feature
 
-Real SSH stays on `127.0.0.1:22`. SkyGuard listens on port `9911` publicly. A port scan sees it as *filtered*. An SSH client connecting to `9911` sends `SSH-2.0-` as its first bytes — SkyGuard recognises the signature and proxies the connection transparently.
+Real SSH stays on `127.0.0.1:22`. SkyGuard listens on port `9911` publicly. A scanner can see that the TCP port is open, but it never receives a banner (nmap reports `tcpwrapped`/unknown) because SkyGuard waits for the client to speak first. An SSH client connecting to `9911` sends `SSH-2.0-` as its first bytes — SkyGuard recognises the signature and proxies the connection transparently.
 
 ```yaml
 stealth_services:
@@ -173,7 +180,7 @@ stealth_services:
 ```
 
 ```
-nmap -p 9911 your-server    →  9911/tcp  filtered  unknown
+nmap -sV -p 9911 your-server  →  9911/tcp  open  tcpwrapped
 ssh -p 9911 user@server     →  connected (transparent proxy)
 ```
 
@@ -221,14 +228,17 @@ analysis:
 | `general` | `log_level` | `info` | `debug` · `info` · `warn` · `error` |
 | `stealth_services[*]` | `listen_port` | — | Public port clients connect to |
 | `stealth_services[*]` | `protocol_signature` | — | First-bytes prefix to forward on |
-| `stealth_services[*]` | `timeout` | `30s` | Close if no signature arrives |
-| `honeypot_services[*]` | `enabled` | `true` | Toggle per-honeypot without restart |
+| `stealth_services[*]` | `timeout` | `10s` | Close if no signature arrives |
+| `stealth_services[*]` | `allowed_countries` | `[]` | Requires GeoIP; private/LAN IPs are always allowed |
+| `honeypot_services[*]` | `enabled` | `true` | Toggle per honeypot (restart required) |
 | `honeypot_services[*]` | `type` | — | `ssh` · `ftp` · `mysql` · `http` |
-| `analysis.auto_ban` | `score_threshold` | `50` | Score that triggers a ban |
-| `analysis.auto_ban` | `ban_duration` | `24h` | `"1h"` · `"24h"` · `"168h"` (7 d) |
-| `analysis.auto_ban` | `method` | `none` | Firewall backend |
+| `analysis.auto_ban` | `score_threshold` | `100` | Score that triggers a ban |
+| `analysis.auto_ban` | `ban_duration` | `24h` | `"1h"` · `"24h"` · `"7d"` · `"0s"` = permanent |
+| `analysis.auto_ban` | `method` | `none` | `iptables` (recommended, also in Docker) · `ufw` (bare metal only) · `none` |
+| `analysis.auto_ban` | `iptables_backend` | `auto` | `auto` · `legacy` · `nft` |
+| `whitelist` / `blacklist` | `ips` | `[]` | Single IPs or CIDR ranges |
 | `analysis.rate_limit` | `max_per_minute` | `20` | Connections per IP per minute |
-| `dashboard` | `listen` | `127.0.0.1:9090` | Always bind to loopback |
+| `dashboard` | `listen` | `127.0.0.1:9090` | Non-loopback binds require a strong password |
 | `logging` | `retention_days` | `90` | Auto-purge records older than N days |
 
 ---
@@ -242,22 +252,32 @@ ssh -L 9090:127.0.0.1:9090 user@your-server
 # → http://localhost:9090
 ```
 
-**Panels:** live connection feed · top attackers by score · top credential pairs · active bans · aggregate stats
+**Panels:** overview (stats + 24 h chart) · searchable connection log with CSV export · top attackers · captured credentials · bans (manual ban/unban) · firewall rules · auto-ban settings · per-IP detail view. Works on mobile.
 
-All API endpoints require HTTP Basic Auth (`dashboard.auth` credentials).
+All endpoints except `/healthz` require HTTP Basic Auth (`dashboard.auth`).
+Failed logins are throttled per client IP. JSON fields are `snake_case`.
+State-changing `POST` endpoints require the header `X-SkyGuard-Request: 1` (CSRF protection).
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/stats` | `total`, `honeypot_hits`, `forwarded`, `dropped` counts |
-| `GET` | `/api/connections?limit=N` | Recent connection records (default 100) |
-| `GET` | `/api/attackers?limit=N` | IPs ranked by threat score |
-| `GET` | `/api/credentials?limit=N` | Most-attempted username/password pairs |
-| `GET` | `/api/banned?limit=N` | Active bans with expiry timestamps |
+| `GET` | `/healthz` | Unauthenticated liveness probe (Docker health check) |
+| `GET` | `/api/stats` | Totals, today, unique IPs/countries, credentials, active bans |
+| `GET` | `/api/timeline?hours=N` | Per-hour counts (gaps filled with zeros) |
+| `GET` | `/api/connections` | Connection log; filters `ip`, `country`, `service`, `action`, `since`, `until` (RFC3339), `limit`, `offset` |
+| `GET` | `/api/export` | Same filters, CSV download (formula-injection safe) |
+| `GET` | `/api/attackers?limit=N` | IPs ranked by threat score, with touched ports |
+| `GET` | `/api/credentials?limit=N` | Most-attempted service/username/password combinations |
+| `GET` | `/api/banned` | Active bans with expiry timestamps |
+| `GET` | `/api/ip?ip=X` | Score, ban state, recent connections and credentials of one IP |
+| `GET` | `/api/firewall` | Firewall backend and SKYGUARD chain rules |
+| `GET`/`POST` | `/api/settings` | Auto-ban settings (partial updates) |
+| `POST` | `/api/ban` | `ip`, `duration` (`24h`, `7d`, `0` = permanent), `permanent`, `reason` — whitelisted IPs are refused |
+| `POST` | `/api/unban` | `ip` — also resets the IP's score |
 
 ```bash
-# Example
 curl -u admin:password http://localhost:9090/api/stats
-# {"total":1337,"honeypot_hits":892,"forwarded":12,"dropped":433}
+curl -u admin:password -H 'X-SkyGuard-Request: 1' -d ip=203.0.113.5 -d duration=7d \
+     http://localhost:9090/api/ban
 ```
 
 ---
@@ -274,13 +294,14 @@ skyguard/
 │   ├── honeypot/          # SSH · FTP · MySQL · HTTP handlers
 │   ├── proxy/             # Bidirectional TCP proxy
 │   ├── analysis/          # GeoIP · rate limiter · scorer · port-scan detector
+│   ├── netutil/           # IP normalisation, IP/CIDR sets
 │   ├── firewall/          # iptables · ufw · noop backends
 │   ├── storage/           # SQLite (CGO-free) — connections · credentials · bans · scores
-│   └── dashboard/         # HTTP server · REST API handlers · embedded UI
+│   └── dashboard/         # HTTP server · REST API · embedded UI (static/index.html + app.js)
 ├── configs/
 │   └── skyguard.example.yaml
 ├── install.sh             # Production installer (multi-distro, interactive wizard)
-├── Dockerfile             # Multi-stage (golang:1.22-alpine → alpine:3.19)
+├── Dockerfile             # Multi-stage (golang:1.24 → debian:bookworm-slim)
 ├── docker-compose.yml
 ├── Makefile
 └── USAGE.md               # Full operational guide
@@ -298,7 +319,7 @@ skyguard/
 - **Secure the config file.** It contains credentials: `chmod 600 /etc/skyguard/skyguard.yaml`.
 - **The stealth port is a secret.** Share it only over a secure channel. If an attacker learns it, the model is compromised.
 - **GeoIP is advisory.** Determined attackers use VPNs. Pair it with score-based auto-ban.
-- **SkyGuard failing closes all ports.** Keep a whitelist-based `iptables` rescue rule for your own IP independent of SkyGuard.
+- **SkyGuard stopping closes its ports.** Keep a whitelist-based `iptables` rescue rule for your own IP independent of SkyGuard, and keep port 22 reachable until you have verified the stealth port works (the installer only blocks 22 after testing it).
 
 ---
 
@@ -337,10 +358,10 @@ go vet ./...
 
 # Quick smoke test with Docker
 docker build -t skyguard:dev .
-docker run --rm \
+# (the dashboard binds 127.0.0.1, so use host networking, not -p)
+docker run --rm --network host --cap-add NET_ADMIN \
   -v $(pwd)/configs/skyguard.example.yaml:/etc/skyguard/skyguard.yaml:ro \
   -v $(pwd)/data:/data \
-  -p 9090:9090 \
   skyguard:dev
 curl -u admin:CHANGE_ME_NOW http://localhost:9090/api/stats
 ```
@@ -349,13 +370,22 @@ curl -u admin:CHANGE_ME_NOW http://localhost:9090/api/stats
 
 | Variable | Default | Description |
 |---|---|---|
-| `SKYGUARD_CONFIG` | `/etc/skyguard/skyguard.yaml` | Config file path (overrides `-config` flag) |
+| `SKYGUARD_CONFIG` | `/etc/skyguard/skyguard.yaml` | Config file path (used when `-config` is not given) |
+
+### Command-line flags
+
+| Flag | Description |
+|---|---|
+| `-config PATH` | Config file |
+| `-check-config` | Validate the config (ports, addresses, durations, CIDRs) and exit |
+| `-healthcheck` | Probe the running instance's `/healthz` (used by Docker) |
+| `-version` | Print the version |
 
 ---
 
 ## Roadmap
 
-- [ ] Fake interactive shell for SSH honeypot (`fake_shell: true`)
+- [ ] Fake interactive shell for SSH honeypot (`fake_shell` is accepted but ignored)
 - [ ] WebSocket / SSE live-push for dashboard
 - [ ] Prometheus metrics endpoint (`/metrics`)
 - [ ] Geolocation map visualisation in dashboard

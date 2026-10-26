@@ -1,70 +1,128 @@
 package firewall
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
-	"net"
+	"os"
 	"os/exec"
 	"strings"
-	"time"
+	"sync"
 )
 
 // UFWFirewall implements Firewall via the ufw command-line tool.
 type UFWFirewall struct {
 	logger *slog.Logger
+	run    runner
+	mu     sync.Mutex
 }
 
-// BanIP adds a ufw deny rule for ip. Duration is not enforced by ufw itself;
-// call UnbanIP to remove the rule when the ban expires.
-func (u *UFWFirewall) BanIP(ip string, _ time.Duration) error {
-	if err := validateIP(ip); err != nil {
+func newUFW(logger *slog.Logger, run runner) (*UFWFirewall, error) {
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return nil, errors.New("running inside a container: ufw would only edit the container's own rules, not the host's")
+	}
+	if _, err := exec.LookPath("ufw"); err != nil {
+		return nil, errors.New("ufw binary not found")
+	}
+	out, err := run("ufw", "status")
+	if err != nil {
+		return nil, fmt.Errorf("ufw status: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	if !strings.Contains(string(out), "Status: active") {
+		return nil, errors.New("ufw is installed but not active (rules would have no effect)")
+	}
+	return &UFWFirewall{logger: logger, run: run}, nil
+}
+
+// Ban adds a deny rule for ip at the TOP of the ufw rule list. A plain
+// "ufw deny" appends the rule after existing "allow" rules, so an attacker
+// could still reach every explicitly allowed port (e.g. 22) — prepending
+// makes the deny win.
+func (u *UFWFirewall) Ban(ip string) error {
+	canon, _, err := parseIP(ip)
+	if err != nil {
 		return err
 	}
-	if err := runCmd("ufw", "deny", "from", ip, "to", "any"); err != nil {
-		return fmt.Errorf("ufw ban %s: %w", ip, err)
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if banned, _ := u.isBannedLocked(canon); banned {
+		return nil
 	}
-	if u.logger != nil {
-		u.logger.Info("ufw ban applied", "ip", ip)
+	out, err := u.run("ufw", "prepend", "deny", "from", canon, "to", "any")
+	if err != nil {
+		// ufw < 0.36 has no "prepend"; "insert 1" is the closest equivalent
+		// (it fails on an empty rule list, where a plain deny is first anyway).
+		if out2, err2 := u.run("ufw", "insert", "1", "deny", "from", canon, "to", "any"); err2 == nil {
+			out, err = out2, nil
+		} else if out3, err3 := u.run("ufw", "deny", "from", canon, "to", "any"); err3 == nil {
+			out, err = out3, nil
+		}
 	}
+	if err != nil {
+		return fmt.Errorf("ufw ban %s: %w (%s)", canon, err, strings.TrimSpace(string(out)))
+	}
+	u.logger.Info("ufw ban applied", "ip", canon)
 	return nil
 }
 
-// UnbanIP removes the ufw deny rule for ip.
-func (u *UFWFirewall) UnbanIP(ip string) error {
-	if err := validateIP(ip); err != nil {
+// Unban removes the ufw deny rule for ip. A missing rule is not an error.
+func (u *UFWFirewall) Unban(ip string) error {
+	canon, _, err := parseIP(ip)
+	if err != nil {
 		return err
 	}
-	if err := runCmd("ufw", "delete", "deny", "from", ip, "to", "any"); err != nil {
-		return fmt.Errorf("ufw unban %s: %w", ip, err)
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	out, err := u.run("ufw", "delete", "deny", "from", canon, "to", "any")
+	if err != nil && !strings.Contains(strings.ToLower(string(out)), "non-existent") {
+		return fmt.Errorf("ufw unban %s: %w (%s)", canon, err, strings.TrimSpace(string(out)))
 	}
-	if u.logger != nil {
-		u.logger.Info("ufw ban removed", "ip", ip)
-	}
+	u.logger.Info("ufw ban removed", "ip", canon)
 	return nil
 }
 
-// IsBanned reports whether ip appears in the current ufw status output.
+// IsBanned reports whether ufw has a DENY rule whose source is exactly ip.
 func (u *UFWFirewall) IsBanned(ip string) (bool, error) {
-	if err := validateIP(ip); err != nil {
+	canon, _, err := parseIP(ip)
+	if err != nil {
 		return false, err
 	}
-	out, err := exec.Command("ufw", "status").Output()
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.isBannedLocked(canon)
+}
+
+func (u *UFWFirewall) isBannedLocked(canon string) (bool, error) {
+	out, err := u.run("ufw", "status")
 	if err != nil {
 		return false, fmt.Errorf("ufw status: %w", err)
 	}
-	return bytes.Contains(out, []byte(ip)), nil
+	return ufwStatusHasDeny(string(out), canon), nil
 }
 
-// BanIPPermanent is identical to BanIP; ufw rules are permanent by default.
-func (u *UFWFirewall) BanIPPermanent(ip string) error {
-	if err := u.BanIP(ip, 0); err != nil {
-		return err
+// ufwStatusHasDeny parses `ufw status` output. Rule lines look like
+// "Anywhere                   DENY        1.2.3.4"; the source is the last
+// field, so an exact match avoids "1.2.3.4" matching "1.2.3.40".
+func ufwStatusHasDeny(status, ip string) bool {
+	for _, line := range strings.Split(status, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		isDeny := false
+		for _, f := range fields {
+			if f == "DENY" {
+				isDeny = true
+				break
+			}
+		}
+		if isDeny && fields[len(fields)-1] == ip {
+			return true
+		}
 	}
-	if u.logger != nil {
-		u.logger.Info("ufw permanent ban applied", "ip", ip)
-	}
-	return nil
+	return false
 }
 
 // Method implements Firewall.
@@ -72,37 +130,9 @@ func (u *UFWFirewall) Method() string { return "ufw" }
 
 // List returns the numbered ufw status output.
 func (u *UFWFirewall) List() ([]string, error) {
-	out, err := exec.Command("ufw", "status", "numbered").CombinedOutput()
+	out, err := u.run("ufw", "status", "numbered")
 	if err != nil {
 		return nil, fmt.Errorf("ufw status: %w (output: %s)", err, strings.TrimSpace(string(out)))
 	}
 	return splitNonEmptyLines(string(out)), nil
-}
-
-// splitNonEmptyLines splits s on newlines and drops blank lines.
-func splitNonEmptyLines(s string) []string {
-	var lines []string
-	for _, l := range strings.Split(s, "\n") {
-		if t := strings.TrimRight(l, "\r"); strings.TrimSpace(t) != "" {
-			lines = append(lines, t)
-		}
-	}
-	return lines
-}
-
-// validateIP returns an error if s is not a valid IP address.
-func validateIP(s string) error {
-	if net.ParseIP(strings.TrimSpace(s)) == nil {
-		return fmt.Errorf("invalid IP address: %q", s)
-	}
-	return nil
-}
-
-// runCmd executes a command and wraps any error with stdout/stderr output.
-func runCmd(name string, args ...string) error {
-	out, err := exec.Command(name, args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%s %v: %w (output: %s)", name, args, err, strings.TrimSpace(string(out)))
-	}
-	return nil
 }

@@ -153,8 +153,9 @@ When the container is running correctly, `docker ps` shows `(healthy)` in the st
 docker ps --format "table {{.Names}}\t{{.Status}}"
 # skyguard   Up 2 minutes (healthy)
 
-# Manual health check
-nc -z localhost 9090 && echo "Dashboard OK" || echo "Dashboard DOWN"
+# Manual health check (same probe Docker uses; no password needed)
+curl -fsS http://127.0.0.1:9090/healthz        # → ok
+docker exec skyguard skyguard -healthcheck && echo healthy
 ```
 
 ---
@@ -304,7 +305,6 @@ honeypot_services:
     enabled: true
     banner: "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"
     max_auth_attempts: 3
-    fake_shell: false
 
   - name: "fake-ftp"
     port: 21
@@ -333,7 +333,7 @@ honeypot_services:
 | `enabled` | bool | `true` | Set to `false` to disable this honeypot without removing it from the config. |
 | `banner` | string | Protocol default | The banner/version string shown to the attacker. A realistic banner keeps attackers engaged longer. |
 | `max_auth_attempts` | int | `3` | Maximum authentication attempts for FTP/SSH honeypots before the connection is closed. |
-| `fake_shell` | bool | `false` | Simulates a fake interactive shell in the SSH honeypot. **Do not enable in production.** |
+| `fake_shell` | bool | `false` | Not implemented — accepted for compatibility and ignored (a warning is logged). The SSH honeypot never grants a session. |
 | `server_header` | string | `"Apache/2.4.41 (Ubuntu)"` | Value of the `Server:` response header for the HTTP honeypot. |
 
 > **Note:** To temporarily disable a single honeypot, set `enabled: false` on that entry. The service will not bind to its port and no logs will be generated for it until it is re-enabled.
@@ -542,7 +542,6 @@ honeypot_services:
     enabled: true
     banner: "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"
     max_auth_attempts: 3
-    fake_shell: false
 
 whitelist:
   ips:
@@ -562,7 +561,7 @@ analysis:
     enabled: true
     score_threshold: 50
     ban_duration: "24h"
-    method: "ufw"
+    method: "iptables"       # ufw cannot manage the host from inside Docker
 ```
 
 ### Step 4 — Start SkyGuard and Verify
@@ -591,11 +590,12 @@ Run these commands from a **different machine** (not the server itself):
 # Scan the stealth port
 nmap -p 9911 YOUR_SERVER_IP
 # Expected output:
-# PORT     STATE    SERVICE
-# 9911/tcp filtered unknown
+# PORT     STATE SERVICE
+# 9911/tcp open  tcpwrapped
 #
-# Explanation: Without a valid SSH client handshake, SkyGuard drops
-# the connection after the timeout → nmap sees the port as filtered.
+# Explanation: the TCP handshake succeeds, but SkyGuard never sends a
+# banner and closes the connection after the timeout when no SSH client
+# signature arrives, so service detection learns nothing.
 
 # Scan the honeypot port
 nmap -sV -p 22 YOUR_SERVER_IP
@@ -746,11 +746,13 @@ The web UI provides:
 
 ### API Endpoints
 
-All endpoints require HTTP Basic Authentication and return `application/json`.
+All endpoints except `GET /healthz` require HTTP Basic Authentication and
+return `application/json` with `snake_case` fields. `POST` endpoints also
+require the header `X-SkyGuard-Request: 1` (CSRF protection) and accept
+form-encoded bodies. Repeated failed logins from one IP are answered with
+`429 Too Many Requests` for 5 minutes (other IPs are not affected).
 
 #### `GET /api/stats`
-
-Returns aggregate connection statistics.
 
 ```bash
 curl -u admin:PASSWORD http://127.0.0.1:9090/api/stats
@@ -758,91 +760,111 @@ curl -u admin:PASSWORD http://127.0.0.1:9090/api/stats
 
 ```json
 {
-  "total": 1423,
-  "honeypot_hits": 1187,
-  "forwarded": 34,
-  "dropped": 202
+  "total": 1423, "honeypot_hits": 1187, "forwarded": 34, "dropped": 202,
+  "connections_today": 311, "unique_ips": 640, "unique_countries": 41,
+  "credentials": 2210, "active_bans": 57, "bans_today": 9
 }
 ```
 
-#### `GET /api/connections?limit=N`
+`forwarded` counts stealth connections that matched the signature, passthrough
+connections and whitelisted traffic; `dropped` counts everything SkyGuard
+refused (bans, blacklists, rate limits, port scans, stealth probes).
 
-Returns the most recent `N` connection records. Default: 100.
+#### `GET /api/connections`
+
+Newest first. Optional filters: `ip`, `country`, `service` (`ssh`, `ftp`,
+`mysql`, `http`, `stealth`, `passthrough`), `action` (`honeypot`,
+`forwarded`, `dropped`), `since` / `until` (RFC3339), `limit` (default 100,
+max 10000), `offset`. `GET /api/export` takes the same filters and returns CSV.
 
 ```bash
-curl -u admin:PASSWORD "http://127.0.0.1:9090/api/connections?limit=20"
+curl -u admin:PASSWORD "http://127.0.0.1:9090/api/connections?service=ssh&limit=20"
 ```
 
 ```json
 [
   {
-    "Timestamp": "2024-01-15T10:23:45Z",
-    "SourceIP": "185.220.101.5",
-    "DestPort": 22,
-    "Country": "DE",
-    "City": "Frankfurt",
-    "ServiceType": "honeypot",
-    "Action": "honeypot",
-    "Data": ""
+    "id": 9812,
+    "timestamp": "2024-01-15T10:23:45Z",
+    "source_ip": "185.220.101.5",
+    "source_port": 0,
+    "dest_port": 22,
+    "country": "DE",
+    "city": "Frankfurt",
+    "service_type": "ssh",
+    "action": "honeypot",
+    "data": "client=\"SSH-2.0-libssh2_1.10.0\" attempts=3 users=[root] methods=[password]"
   }
 ]
 ```
 
-#### `GET /api/attackers`
+#### `GET /api/attackers?limit=N`
 
-Returns the top 20 attackers sorted by threat score (descending).
-
-```bash
-curl -u admin:PASSWORD http://127.0.0.1:9090/api/attackers
-```
+Top attackers by threat score (default 50).
 
 ```json
 [
   {
-    "IP": "185.220.101.5",
-    "Country": "DE",
-    "Score": 85,
-    "HoneypotHits": 7,
-    "LastSeen": "2024-01-15T10:24:00Z"
+    "ip": "185.220.101.5", "score": 85, "country": "DE",
+    "total_connections": 7, "honeypot_hits": 4, "credential_attempts": 3,
+    "ports_scanned": [21, 22, 3306],
+    "first_seen": "2024-01-15T10:20:00Z", "last_seen": "2024-01-15T10:24:00Z"
   }
 ]
 ```
 
-#### `GET /api/credentials`
+#### `GET /api/credentials?limit=N`
 
-Returns the top 50 most-attempted username/password pairs across all honeypots.
-
-```bash
-curl -u admin:PASSWORD http://127.0.0.1:9090/api/credentials
-```
+Most-attempted service/username/password combinations (default 100). MySQL
+only reveals the username (the password is sent as a salted hash).
 
 ```json
 [
-  {"username": "root",  "password": "123456",   "count": 342},
-  {"username": "admin", "password": "admin",    "count": 218},
-  {"username": "root",  "password": "password", "count": 156}
+  {"service": "ssh", "username": "root",  "password": "123456", "count": 342, "last_seen": "2024-01-15T10:24:00Z"},
+  {"service": "ftp", "username": "admin", "password": "admin",  "count": 218, "last_seen": "2024-01-15T09:02:11Z"}
 ]
 ```
 
 #### `GET /api/banned`
 
-Returns the list of currently active bans.
-
-```bash
-curl -u admin:PASSWORD http://127.0.0.1:9090/api/banned
-```
+Active (non-expired) bans.
 
 ```json
 [
   {
-    "IP": "185.220.101.5",
-    "Reason": "honeypot_threshold",
-    "BannedAt": "2024-01-15T10:24:00Z",
-    "ExpiresAt": "2024-01-16T10:24:00Z",
-    "Permanent": false
+    "id": 31, "ip": "185.220.101.5", "reason": "honeypot_threshold",
+    "banned_at": "2024-01-15T10:24:00Z", "expires_at": "2024-01-16T10:24:00Z",
+    "permanent": false
   }
 ]
 ```
+
+#### `GET /api/ip?ip=X`
+
+Everything about one address: `whitelisted`, `banned`, `score` (as in
+`/api/attackers`, or `null`), the latest 100 `connections` and `credentials`.
+
+#### `GET /api/timeline?hours=N`, `GET /api/firewall`, `GET /api/settings`
+
+Hourly buckets (gaps filled with zeros), the firewall backend with its
+SKYGUARD chain rules, and the runtime auto-ban settings.
+
+#### `POST /api/ban`, `POST /api/unban`, `POST /api/settings`
+
+```bash
+H='X-SkyGuard-Request: 1'
+curl -u admin:PASSWORD -H "$H" -d ip=203.0.113.5 -d duration=7d -d reason=manual \
+     http://127.0.0.1:9090/api/ban            # duration 0 or permanent=1 → never expires
+curl -u admin:PASSWORD -H "$H" -d ip=203.0.113.5 http://127.0.0.1:9090/api/unban   # also resets the score
+curl -u admin:PASSWORD -H "$H" -d score_threshold=80 http://127.0.0.1:9090/api/settings  # partial update
+```
+
+Whitelisted and loopback addresses cannot be banned (`400`).
+
+#### `GET /healthz`
+
+Unauthenticated, returns `ok`. Used by the Docker health check
+(`skyguard -healthcheck`), so no password has to be stored in compose files.
 
 ---
 
@@ -866,19 +888,24 @@ Scores are configurable in the `analysis.auto_ban.scoring` block. Adjust them to
 
 When an IP's cumulative score reaches `score_threshold`, the following actions occur:
 
-1. A record is written to the `bans` table in the SQLite database.
-2. All subsequent connections from that IP are dropped for the duration of `ban_duration`.
+1. A record is written to the `banned_ips` table in the SQLite database.
+2. All subsequent connections from that IP are dropped for the duration of `ban_duration` (`0s` = permanent).
 3. If `method` is `iptables` or `ufw`, a firewall rule is added at the kernel or UFW layer.
+4. When the ban expires, the firewall rule is removed and the IP's score is reset to 0 (otherwise the very next event would re-ban it). Manual unbans reset the score too.
+5. Active bans are re-applied to the firewall whenever SkyGuard starts, so a reboot does not silently lift them.
+
+Whitelisted IPs/CIDRs (and loopback) are never scored or banned, even when
+they hit a honeypot.
 
 ### UFW vs. iptables
 
 | Method | Advantages | Disadvantages |
 |--------|------------|---------------|
-| `none` | No root privilege required for banning; writes to DB only | No kernel-level block; if SkyGuard restarts, the ban persists in DB but the traffic continues until SkyGuard is back up |
-| `iptables` | Adds a `-j DROP` rule to the kernel INPUT chain; blocks at the packet level regardless of port | Requires root; rules are lost on server reboot unless `iptables-persistent` is installed |
-| `ufw` | Ubuntu's standard firewall; rules survive reboots | `ufw` must be installed; slight latency as the `ufw deny` command is executed as a subprocess |
+| `none` | No privileges needed; writes to DB only | No kernel-level block: SkyGuard's own ports drop banned IPs, but every other service on the host stays reachable |
+| `iptables` | DROP rules in a dedicated `SKYGUARD` chain jumped to from the top of INPUT (IPv4 via `iptables`, IPv6 via `ip6tables`); works from inside Docker; `iptables_backend: auto` picks legacy or nft to match the host | Requires `NET_ADMIN`; rules are not persisted by SkyGuard itself — it re-applies active bans from the database at start-up |
+| `ufw` | Native on Ubuntu; rules are *prepended* so they win over existing `allow` rules | Bare metal only. Inside a container (or when ufw is inactive) SkyGuard logs a warning and falls back to `iptables`, because ufw there would only edit the container's own rule files |
 
-> **Recommendation:** Use `ufw` on Ubuntu servers. Use `iptables` on other distributions. Always install `iptables-persistent` (`sudo apt install iptables-persistent`) if you choose `iptables` to ensure rules survive reboots.
+> **Recommendation:** Use `iptables` — it is the only method that works for the Docker deployment and it coexists with ufw and firewalld (it never touches their rules). Remove all bans at once with `iptables -F SKYGUARD; ip6tables -F SKYGUARD`.
 
 ### Manual Ban and Unban
 
@@ -1092,7 +1119,7 @@ find /backup -name "skyguard-*.db" -mtime +30 -delete
 ### Port Already in Use
 
 ```
-Error: stealth "ssh": listen 0.0.0.0:9911: bind: address already in use
+Error: stealth "ssh": listen :9911: bind: address already in use (another process already listens on this port; check with: ss -tlnp)
 ```
 
 **Resolution:**
@@ -1292,7 +1319,6 @@ Complete all items below before deploying SkyGuard to a production environment.
 - [ ] `dashboard.auth.password` has been changed from the default (`changeme_strong_password`)
 - [ ] Config file permissions are restricted: `chmod 600 /etc/skyguard/skyguard.yaml`
 - [ ] Dashboard is bound to `127.0.0.1:9090` only (not `0.0.0.0`)
-- [ ] `fake_shell: false` on all SSH honeypot entries
 - [ ] Stealth SSH port is protected by UFW or iptables
 
 ### GeoIP

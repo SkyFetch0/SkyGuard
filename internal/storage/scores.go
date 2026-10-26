@@ -10,209 +10,131 @@ import (
 
 // IPScore tracks the threat score and activity counters for a single IP address.
 type IPScore struct {
-	IP                 string
-	Score              int
-	TotalConnections   int
-	HoneypotHits       int
-	CredentialAttempts int
-	PortsScanned       []int
-	FirstSeen          time.Time
-	LastSeen           time.Time
-	Country            string
+	IP                 string    `json:"ip"`
+	Score              int       `json:"score"`
+	TotalConnections   int       `json:"total_connections"`
+	HoneypotHits       int       `json:"honeypot_hits"`
+	CredentialAttempts int       `json:"credential_attempts"`
+	PortsScanned       []int     `json:"ports_scanned"`
+	FirstSeen          time.Time `json:"first_seen"`
+	LastSeen           time.Time `json:"last_seen"`
+	Country            string    `json:"country"`
 }
 
-// GetOrCreateScore returns the IPScore for ip, inserting a new row with
-// default values if one does not yet exist. country is only used on insert.
-func (d *DB) GetOrCreateScore(ip, country string) (*IPScore, error) {
-	const upsert = `
-		INSERT INTO ip_scores (ip, country)
-		VALUES (?, ?)
-		ON CONFLICT(ip) DO NOTHING`
-
-	if _, err := d.db.Exec(upsert, ip, country); err != nil {
-		return nil, fmt.Errorf("upserting ip_scores row for %s: %w", ip, err)
-	}
-
-	return d.fetchScore(ip)
+// ScoreEvent describes one scored event for RecordScore.
+type ScoreEvent struct {
+	IP            string
+	Country       string
+	Delta         int  // points added to the score
+	HoneypotHit   bool // increments honeypot_hits
+	CredentialHit bool // increments credential_attempts
+	Port          int  // recorded in ports_scanned when > 0
 }
 
-// UpdateScore increments the named counter field and updates score by delta.
-// Valid field values: "honeypot_hits", "credential_attempts", "total_connections".
-func (d *DB) UpdateScore(ip string, delta int, field string) error {
-	allowed := map[string]bool{
-		"honeypot_hits":       true,
-		"credential_attempts": true,
-		"total_connections":   true,
+// RecordScore atomically upserts the IP's row, adds Delta to its score, bumps
+// the activity counters and remembers the touched port. It returns the new
+// cumulative score.
+func (d *DB) RecordScore(ev ScoreEvent) (int, error) {
+	port := any(nil)
+	if ev.Port > 0 {
+		port = ev.Port
 	}
-	if !allowed[field] {
-		return fmt.Errorf("unknown score field: %q", field)
+	initialPorts := "[]"
+	if ev.Port > 0 {
+		initialPorts = fmt.Sprintf("[%d]", ev.Port)
 	}
 
-	// Using fmt.Sprintf for the column name is safe because we validate above.
-	query := fmt.Sprintf(`
-		UPDATE ip_scores
-		SET    score   = score + ?,
-		       %s      = %s + 1,
-		       last_seen = datetime('now')
-		WHERE  ip = ?`, field, field)
-
-	res, err := d.db.Exec(query, delta, ip)
+	var score int
+	err := d.db.QueryRow(`
+		INSERT INTO ip_scores (ip, score, country, total_connections, honeypot_hits,
+		                       credential_attempts, ports_scanned, first_seen, last_seen)
+		VALUES (?, ?, ?, 1, ?, ?, ?, `+sqlNow+`, `+sqlNow+`)
+		ON CONFLICT(ip) DO UPDATE SET
+			score               = score + excluded.score,
+			country             = CASE WHEN excluded.country != '' THEN excluded.country ELSE country END,
+			total_connections   = total_connections + 1,
+			honeypot_hits       = honeypot_hits + excluded.honeypot_hits,
+			credential_attempts = credential_attempts + excluded.credential_attempts,
+			ports_scanned       = CASE
+				WHEN ?7 IS NULL THEN ports_scanned
+				WHEN EXISTS (SELECT 1 FROM json_each(ports_scanned) WHERE value = ?7) THEN ports_scanned
+				WHEN json_array_length(ports_scanned) >= 64 THEN ports_scanned
+				ELSE json_insert(ports_scanned, '$[#]', ?7) END,
+			last_seen           = excluded.last_seen
+		RETURNING score`,
+		ev.IP, ev.Delta, ev.Country, boolToInt(ev.HoneypotHit), boolToInt(ev.CredentialHit),
+		initialPorts, port,
+	).Scan(&score)
 	if err != nil {
-		return fmt.Errorf("updating score for %s: %w", ip, err)
+		return 0, fmt.Errorf("recording score for %s: %w", ev.IP, err)
 	}
-	affected, _ := res.RowsAffected()
-	if affected == 0 {
-		// Row doesn't exist yet; create it first, then update.
-		if _, err := d.db.Exec(`INSERT INTO ip_scores (ip) VALUES (?) ON CONFLICT(ip) DO NOTHING`, ip); err != nil {
-			return fmt.Errorf("inserting ip_scores row for %s: %w", ip, err)
-		}
-		if _, err := d.db.Exec(query, delta, ip); err != nil {
-			return fmt.Errorf("updating score for %s after insert: %w", ip, err)
-		}
-	}
-	return nil
-}
-
-// AddPortScan appends port to the JSON array stored in ports_scanned for ip.
-// Duplicate port numbers are silently ignored.
-// The read-modify-write cycle runs inside a transaction to prevent TOCTOU races.
-func (d *DB) AddPortScan(ip string, port int) error {
-	tx, err := d.db.Begin()
-	if err != nil {
-		return fmt.Errorf("beginning transaction for AddPortScan: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck — rollback on any non-committed path
-
-	// Ensure the row exists.
-	if _, err := tx.Exec(`INSERT INTO ip_scores (ip) VALUES (?) ON CONFLICT(ip) DO NOTHING`, ip); err != nil {
-		return fmt.Errorf("inserting ip_scores row for %s: %w", ip, err)
-	}
-
-	var portsJSON string
-	if err := tx.QueryRow(`SELECT ports_scanned FROM ip_scores WHERE ip = ?`, ip).Scan(&portsJSON); err != nil {
-		return fmt.Errorf("reading ports_scanned for %s: %w", ip, err)
-	}
-
-	var ports []int
-	if err := json.Unmarshal([]byte(portsJSON), &ports); err != nil {
-		ports = []int{}
-	}
-
-	// Deduplicate.
-	for _, p := range ports {
-		if p == port {
-			return tx.Commit()
-		}
-	}
-	ports = append(ports, port)
-
-	updated, err := json.Marshal(ports)
-	if err != nil {
-		return fmt.Errorf("marshalling ports_scanned: %w", err)
-	}
-
-	if _, err := tx.Exec(`
-		UPDATE ip_scores
-		SET    ports_scanned = ?,
-		       last_seen     = datetime('now')
-		WHERE  ip = ?`, string(updated), ip); err != nil {
-		return fmt.Errorf("updating ports_scanned for %s: %w", ip, err)
-	}
-
-	return tx.Commit()
-}
-
-// GetTopIPScores returns the IPs with the highest scores, up to limit entries.
-func (d *DB) GetTopIPScores(limit int) ([]*IPScore, error) {
-	const query = `
-		SELECT ip, score, total_connections, honeypot_hits, credential_attempts,
-		       ports_scanned, first_seen, last_seen, country
-		FROM   ip_scores
-		ORDER  BY score DESC
-		LIMIT  ?`
-
-	rows, err := d.db.Query(query, limit)
-	if err != nil {
-		return nil, fmt.Errorf("querying top attackers: %w", err)
-	}
-	defer rows.Close()
-
-	return scanIPScores(rows)
+	return score, nil
 }
 
 // GetScore returns the current threat score for ip, or 0 if ip is unknown.
 func (d *DB) GetScore(ip string) (int, error) {
-	const query = `SELECT score FROM ip_scores WHERE ip = ?`
-	row := d.db.QueryRow(query, ip)
-
 	var score int
-	if err := row.Scan(&score); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, nil
-		}
+	err := d.db.QueryRow(`SELECT score FROM ip_scores WHERE ip = ?`, ip).Scan(&score)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
 		return 0, fmt.Errorf("getting score for %s: %w", ip, err)
 	}
 	return score, nil
 }
 
-// ─── helpers ────────────────────────────────────────────────────────────────
+// ResetScore sets ip's score back to zero (activity counters are kept). It is
+// called when a ban is lifted, otherwise the very next event would re-ban.
+func (d *DB) ResetScore(ip string) error {
+	if _, err := d.db.Exec(`UPDATE ip_scores SET score = 0 WHERE ip = ?`, ip); err != nil {
+		return fmt.Errorf("resetting score for %s: %w", ip, err)
+	}
+	return nil
+}
 
-func (d *DB) fetchScore(ip string) (*IPScore, error) {
-	const query = `
-		SELECT ip, score, total_connections, honeypot_hits, credential_attempts,
-		       ports_scanned, first_seen, last_seen, country
-		FROM   ip_scores
-		WHERE  ip = ?`
+const scoreColumns = `ip, score, total_connections, honeypot_hits, credential_attempts,
+	ports_scanned, first_seen, last_seen, country`
 
-	rows, err := d.db.Query(query, ip)
+// GetTopAttackers returns the IPs with the highest scores.
+func (d *DB) GetTopAttackers(limit int) ([]*IPScore, error) {
+	rows, err := d.db.Query(`SELECT `+scoreColumns+` FROM ip_scores
+		WHERE score > 0 ORDER BY score DESC, last_seen DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("querying top attackers: %w", err)
+	}
+	defer rows.Close()
+	return scanIPScores(rows)
+}
+
+// GetIPScore returns the score row for ip, or nil when the IP is unknown.
+func (d *DB) GetIPScore(ip string) (*IPScore, error) {
+	rows, err := d.db.Query(`SELECT `+scoreColumns+` FROM ip_scores WHERE ip = ?`, ip)
 	if err != nil {
 		return nil, fmt.Errorf("fetching score for %s: %w", ip, err)
 	}
 	defer rows.Close()
-
 	scores, err := scanIPScores(rows)
-	if err != nil {
+	if err != nil || len(scores) == 0 {
 		return nil, err
-	}
-	if len(scores) == 0 {
-		return nil, fmt.Errorf("ip_scores row not found for %s", ip)
 	}
 	return scores[0], nil
 }
 
-func scanIPScores(rows interface {
-	Next() bool
-	Scan(...any) error
-	Err() error
-}) ([]*IPScore, error) {
-	var results []*IPScore
-
+func scanIPScores(rows *sql.Rows) ([]*IPScore, error) {
+	results := []*IPScore{}
 	for rows.Next() {
 		s := &IPScore{}
-		var portsJSON, firstStr, lastStr string
-
-		if err := rows.Scan(
-			&s.IP, &s.Score, &s.TotalConnections, &s.HoneypotHits,
-			&s.CredentialAttempts, &portsJSON, &firstStr, &lastStr, &s.Country,
-		); err != nil {
+		var portsJSON string
+		var first, last dbTime
+		if err := rows.Scan(&s.IP, &s.Score, &s.TotalConnections, &s.HoneypotHits,
+			&s.CredentialAttempts, &portsJSON, &first, &last, &s.Country); err != nil {
 			return nil, fmt.Errorf("scanning ip_scores row: %w", err)
 		}
-
-		if err := json.Unmarshal([]byte(portsJSON), &s.PortsScanned); err != nil {
+		if err := json.Unmarshal([]byte(portsJSON), &s.PortsScanned); err != nil || s.PortsScanned == nil {
 			s.PortsScanned = []int{}
 		}
-
-		first, err := parseTimestamp(firstStr)
-		if err != nil {
-			return nil, err
-		}
-		last, err := parseTimestamp(lastStr)
-		if err != nil {
-			return nil, err
-		}
-		s.FirstSeen = first
-		s.LastSeen = last
-
+		s.FirstSeen, s.LastSeen = first.Time, last.Time
 		results = append(results, s)
 	}
 	if err := rows.Err(); err != nil {

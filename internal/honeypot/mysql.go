@@ -1,13 +1,13 @@
 package honeypot
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/skyguard/skyguard/internal/config"
@@ -35,52 +35,42 @@ func (m *MySQLHoneypot) Type() string { return "mysql" }
 // Handle implements Handler.
 // It sends a realistic MySQL initial handshake packet, reads the client's
 // handshake response to extract the attempted username, then replies with an
-// Access denied error packet.
-func (m *MySQLHoneypot) Handle(conn net.Conn, sourceIP string) error {
+// Access denied error packet. MySQL never sends the password in clear text
+// (only a salted scramble), so only the username is recorded.
+func (m *MySQLHoneypot) Handle(conn net.Conn, sess Session) error {
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	// Log the initial connection.
-	m.eventLogger.LogConnection(sourceIP, m.cfg.Port, "mysql", "new connection")
-
-	// Build and send the MySQL Initial Handshake Packet (Protocol v10).
-	handshake := m.buildHandshakePacket()
-	if _, err := conn.Write(handshake); err != nil {
-		return fmt.Errorf("mysql: write handshake: %w", err)
+	if _, err := conn.Write(m.buildHandshakePacket()); err != nil {
+		m.eventLogger.LogConnection(sess, "mysql", "write handshake failed")
+		return nil
 	}
 
-	// Read the 4-byte MySQL packet header from the client response.
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
-		return fmt.Errorf("mysql: read response header: %w", err)
+		m.eventLogger.LogConnection(sess, "mysql", "no handshake response")
+		return nil
 	}
 	payloadLen := int(uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16)
-
-	// Cap to avoid memory exhaustion from malformed clients.
-	if payloadLen > 65535 {
-		payloadLen = 65535
+	if payloadLen > 8192 {
+		m.eventLogger.LogConnection(sess, "mysql", fmt.Sprintf("oversized handshake response (%d bytes)", payloadLen))
+		return nil
 	}
-
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(conn, payload); err != nil {
-		return fmt.Errorf("mysql: read response payload: %w", err)
+		m.eventLogger.LogConnection(sess, "mysql", "truncated handshake response")
+		return nil
 	}
 
 	username := parseHandshakeUsername(payload)
-	m.logger.Info("mysql login attempt",
-		"source_ip", sourceIP,
-		"user", username,
-	)
-	m.eventLogger.LogCredential(sourceIP, m.cfg.Port, username, "", "mysql")
+	m.logger.Info("mysql login attempt", "source_ip", sess.IP, "user", username)
+	m.eventLogger.LogConnection(sess, "mysql", fmt.Sprintf("user=%q", username))
+	m.eventLogger.LogCredential(sess, username, "", "mysql")
 
-	// Send an ERR packet: Access denied for user.
-	errMsg := fmt.Sprintf("Access denied for user '%s'@'%s' (using password: YES)", username, sourceIP)
-	errPkt := buildErrPacket(1045, "28000", errMsg)
-	if _, err := conn.Write(errPkt); err != nil {
-		m.logger.Debug("mysql: write err packet failed", "source_ip", sourceIP, "error", err)
+	errMsg := fmt.Sprintf("Access denied for user '%s'@'%s' (using password: YES)", username, sess.IP)
+	if _, err := conn.Write(buildErrPacket(1045, "28000", errMsg)); err != nil {
+		m.logger.Debug("mysql: write err packet failed", "source_ip", sess.IP, "error", err)
 	}
-
 	return nil
 }
 
@@ -90,7 +80,11 @@ func (m *MySQLHoneypot) buildHandshakePacket() []byte {
 
 	// Random auth-plugin-data (20 bytes split 8+12).
 	authData := make([]byte, 20)
-	rand.Read(authData)
+	// Real servers use printable, NUL-free scramble bytes.
+	_, _ = rand.Read(authData)
+	for i := range authData {
+		authData[i] = 0x21 + authData[i]%0x5e
+	}
 
 	authPluginName := "mysql_native_password\x00"
 
@@ -98,7 +92,8 @@ func (m *MySQLHoneypot) buildHandshakePacket() []byte {
 	// CLIENT_LONG_PASSWORD | CLIENT_FOUND_ROWS | CLIENT_LONG_FLAG |
 	// CLIENT_CONNECT_WITH_DB | CLIENT_NO_SCHEMA | CLIENT_PROTOCOL_41 |
 	// CLIENT_TRANSACTIONS | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH
-	capLow := uint16(0xF7FF)
+	// CLIENT_COMPRESS (0x20) and CLIENT_SSL (0x800) are deliberately not offered.
+	capLow := uint16(0xF7DF)
 	capHigh := uint16(0x0201)
 
 	// Assemble the payload.
@@ -113,7 +108,7 @@ func (m *MySQLHoneypot) buildHandshakePacket() []byte {
 		connID = []byte{0, 0, 0, 1}
 	}
 	// Clamp to [1, 65535] to keep it in a realistic range.
-	connIDVal := (uint32(connID[0])<<8 | uint32(connID[1])) % 65534 + 1
+	connIDVal := (uint32(connID[0])<<8|uint32(connID[1]))%65534 + 1
 	binary.LittleEndian.PutUint32(connID, connIDVal)
 	payload = append(payload, connID...)
 
@@ -168,7 +163,7 @@ func parseHandshakeUsername(payload []byte) string {
 	}
 	rest := payload[headerLen:]
 	// Username is null-terminated.
-	end := strings.IndexByte(string(rest), 0)
+	end := bytes.IndexByte(rest, 0)
 	if end < 0 {
 		return string(rest)
 	}
