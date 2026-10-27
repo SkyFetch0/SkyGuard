@@ -910,8 +910,8 @@ Whitelisted and loopback addresses cannot be banned (`400`).
 
 #### Containers
 
-Present when `containers.docker` or `containers.incus` is enabled; otherwise
-`GET /api/containers` returns `{"enabled": false}` and changes return `404`.
+`GET /api/containers` always lists both engines with `enabled`, `socket` and
+`snapshots`; `enabled` at the top is false while no engine is switched on.
 Changes return the container as it is afterwards (a recreated Docker
 container has a new `id`). Errors: `400` malformed input, `403` read-only,
 `404` unknown container, `409` refused (port in use, SkyGuard's own container,
@@ -927,6 +927,12 @@ the engine's own error message).
 | `POST /api/containers/ports` | `engine`, `id`, `ports`: `8080:80,127.0.0.1:8443:443/tcp,[::1]:53:53/udp` (empty = none) |
 | `POST /api/containers/settings` | `engine`, `id`, `restart`, `memory_mb`, `cpus` (omit a field to keep it, `0` removes a limit) |
 | `POST /api/containers/networks` | `engine`, `name` |
+| `POST /api/containers/networks/delete` | `engine`, `name` (refused while a container is on it) |
+| `POST /api/containers/engines` | `engine`, `enabled` — refused while the socket does not answer or the dashboard password is weak |
+| `POST /api/containers/create` | `engine`, `name`, `image`, `ports`, `network`, `env`, `restart`, `memory_mb`, `cpus`, `vm`, `start`; returns `container` (and `warning` if it was created but did not start) |
+| `POST /api/containers/remove` | `engine`, `id` |
+| `GET /api/containers/logs?engine=&id=&lines=` | `text`, `lines` (10–2000) |
+| `GET /api/containers/snapshots?engine=incus&id=` | `name`, `created`, `stateful`; `POST` with `action` (`take`, `restore`, `delete`) and `name` |
 
 A honeypot switched from the dashboard stays that way across restarts. When
 you later change that honeypot's `enabled` value in the config file, the file

@@ -330,8 +330,13 @@ func formatDuration(d time.Duration) string {
 		return "0"
 	}
 	day := 24 * time.Hour
-	if d%day == 0 {
+	switch {
+	case d%day == 0:
 		return fmt.Sprintf("%dd", d/day)
+	case d%time.Hour == 0: // "1h", not "1h0m0s", so it matches the panel's presets
+		return fmt.Sprintf("%dh", d/time.Hour)
+	case d%time.Minute == 0:
+		return fmt.Sprintf("%dm", d/time.Minute)
 	}
 	return d.String()
 }

@@ -24,6 +24,13 @@ func (d *Dashboard) containerRoutes(api *http.ServeMux) {
 	api.HandleFunc("POST /api/containers/ports", d.csrf(d.containerChange(d.doContainerPorts)))
 	api.HandleFunc("POST /api/containers/settings", d.csrf(d.containerChange(d.doContainerSettings)))
 	api.HandleFunc("POST /api/containers/networks", d.csrf(d.handleCreateNetwork))
+	api.HandleFunc("POST /api/containers/networks/delete", d.csrf(d.handleDeleteNetwork))
+	api.HandleFunc("POST /api/containers/engines", d.csrf(d.handleEngineSwitch))
+	api.HandleFunc("POST /api/containers/create", d.csrf(d.handleCreateContainer))
+	api.HandleFunc("POST /api/containers/remove", d.csrf(d.handleRemoveContainer))
+	api.HandleFunc("GET /api/containers/logs", d.handleContainerLogs)
+	api.HandleFunc("GET /api/containers/snapshots", d.handleSnapshots)
+	api.HandleFunc("POST /api/containers/snapshots", d.csrf(d.containerChange(d.doSnapshot)))
 }
 
 func (d *Dashboard) reservedPorts() []containers.Reserved {
@@ -42,7 +49,7 @@ func (d *Dashboard) handleContainers(w http.ResponseWriter, r *http.Request) {
 	}
 	snap := d.ctr.Snapshot(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled":      true,
+		"enabled":      d.ctr.AnyEnabled(),
 		"read_only":    snap.ReadOnly,
 		"engines":      snap.Engines,
 		"containers":   snap.Containers,
@@ -196,4 +203,150 @@ func (d *Dashboard) handleCreateNetwork(w http.ResponseWriter, r *http.Request) 
 	}
 	d.logger.Info("network created via dashboard", "remote", netutil.HostIP(r.RemoteAddr), "engine", engine, "name", name)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": name})
+}
+
+// longChange gives a request its own deadline, detached from the browser:
+// a pull or a removal must finish even if the tab closes.
+func longChange(w http.ResponseWriter, r *http.Request, d time.Duration) (context.Context, context.CancelFunc) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(d + time.Minute))
+	return context.WithTimeout(context.WithoutCancel(r.Context()), d)
+}
+
+func (d *Dashboard) ctrForm(w http.ResponseWriter, r *http.Request) bool {
+	if d.ctr == nil {
+		writeError(w, http.StatusNotFound, "container management is not available without the dashboard")
+		return false
+	}
+	if err := r.ParseForm(); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid form")
+		return false
+	}
+	return true
+}
+
+func (d *Dashboard) handleDeleteNetwork(w http.ResponseWriter, r *http.Request) {
+	if !d.ctrForm(w, r) {
+		return
+	}
+	engine, name := r.PostForm.Get("engine"), strings.TrimSpace(r.PostForm.Get("name"))
+	if err := d.ctr.DeleteNetwork(r.Context(), engine, name); err != nil {
+		writeContainerError(w, err)
+		return
+	}
+	d.logger.Info("network deleted via dashboard", "remote", netutil.HostIP(r.RemoteAddr), "engine", engine, "name", name)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleEngineSwitch turns Docker or Incus management on or off.
+func (d *Dashboard) handleEngineSwitch(w http.ResponseWriter, r *http.Request) {
+	if !d.ctrForm(w, r) {
+		return
+	}
+	engine, on := r.PostForm.Get("engine"), parseBool(r.PostForm.Get("enabled"))
+	d.logger.Info("container engine switch requested", "remote", netutil.HostIP(r.RemoteAddr), "engine", engine, "enabled", on)
+	if err := d.ctr.SetEngineEnabled(r.Context(), engine, on); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "engine": engine, "enabled": on})
+}
+
+// handleCreateContainer takes engine, name, image, ports, network, env (one
+// KEY=value per line), restart, memory_mb, cpus, vm and start.
+func (d *Dashboard) handleCreateContainer(w http.ResponseWriter, r *http.Request) {
+	if !d.ctrForm(w, r) {
+		return
+	}
+	f := func(k string) string { return strings.TrimSpace(r.PostForm.Get(k)) }
+	spec := containers.CreateSpec{Name: f("name"), Image: f("image"), Network: f("network"), Restart: f("restart"),
+		VM: parseBool(f("vm")), Start: !r.PostForm.Has("start") || parseBool(f("start"))}
+	var err error
+	if spec.Ports, err = containers.ParsePorts(f("ports")); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	for _, line := range strings.Split(r.PostForm.Get("env"), "\n") {
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		if k, _, ok := strings.Cut(line, "="); !ok || k == "" || strings.ContainsAny(k, " \t") {
+			writeError(w, http.StatusBadRequest, "environment lines are KEY=value: "+line)
+			return
+		}
+		spec.Env = append(spec.Env, line)
+	}
+	if v := f("memory_mb"); v != "" {
+		if spec.MemoryMB, err = strconv.ParseInt(v, 10, 64); err != nil || spec.MemoryMB < 0 {
+			writeError(w, http.StatusBadRequest, "memory_mb must be a whole number of megabytes")
+			return
+		}
+	}
+	if v := f("cpus"); v != "" {
+		if spec.CPUs, err = strconv.ParseFloat(v, 64); err != nil || spec.CPUs < 0 || spec.CPUs > 1024 {
+			writeError(w, http.StatusBadRequest, "cpus must be a number of CPUs")
+			return
+		}
+	}
+	// Pulling an image or downloading an Incus image can take minutes.
+	ctx, cancel := longChange(w, r, 15*time.Minute)
+	defer cancel()
+	d.logger.Info("container create requested", "remote", netutil.HostIP(r.RemoteAddr), "engine", f("engine"), "name", spec.Name, "image", spec.Image)
+	c, err := d.ctr.Create(ctx, f("engine"), spec)
+	if err != nil && c == nil {
+		writeContainerError(w, err)
+		return
+	}
+	resp := map[string]any{"container": c}
+	if err != nil {
+		resp["warning"] = err.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (d *Dashboard) handleRemoveContainer(w http.ResponseWriter, r *http.Request) {
+	if !d.ctrForm(w, r) {
+		return
+	}
+	engine, id := r.PostForm.Get("engine"), strings.TrimSpace(r.PostForm.Get("id"))
+	ctx, cancel := longChange(w, r, 3*time.Minute)
+	defer cancel()
+	d.logger.Info("container removal requested", "remote", netutil.HostIP(r.RemoteAddr), "engine", engine, "id", id)
+	if err := d.ctr.Remove(ctx, engine, id, parseBool(r.PostForm.Get("volumes"))); err != nil {
+		writeContainerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (d *Dashboard) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
+	if d.ctr == nil {
+		writeError(w, http.StatusNotFound, "container management is not available")
+		return
+	}
+	q := r.URL.Query()
+	lines := intParam(q, "lines", 200, 10, 2000)
+	out, err := d.ctr.Logs(r.Context(), q.Get("engine"), q.Get("id"), lines)
+	if err != nil {
+		writeContainerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"lines": lines, "text": out})
+}
+
+func (d *Dashboard) handleSnapshots(w http.ResponseWriter, r *http.Request) {
+	if d.ctr == nil {
+		writeError(w, http.StatusNotFound, "container management is not available")
+		return
+	}
+	q := r.URL.Query()
+	snaps, err := d.ctr.Snapshots(r.Context(), q.Get("engine"), q.Get("id"))
+	if err != nil {
+		writeContainerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, snaps)
+}
+
+func (d *Dashboard) doSnapshot(ctx context.Context, engine, id string, form func(string) string) (*containers.Container, error) {
+	return d.ctr.SnapshotAction(ctx, engine, id, form("action"), form("name"))
 }

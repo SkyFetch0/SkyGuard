@@ -203,27 +203,46 @@ func (s *Server) SetServiceEnabled(name string, enabled bool) error {
 	return nil
 }
 
-// containerManager builds the container manager when the config enables an
-// engine. It is told which host ports SkyGuard's own listeners hold, so a
-// container is never moved onto one of them.
+// containerManager builds the container manager whenever the dashboard
+// runs, so its engines can be switched on from the panel. Each engine starts
+// as the config file says, unless the dashboard switched it since (the file
+// wins again once that engine is edited there). It is told which host ports
+// SkyGuard's own listeners hold, so a container is never moved onto one.
 func (s *Server) containerManager() *containers.Manager {
 	cc := s.cfg.Containers
-	var engines []containers.Engine
-	if cc.Docker.Enabled {
-		engines = append(engines, containers.NewDocker(cc.Docker.Socket, s.logger.With("engine", "docker")))
+	engines := []containers.Engine{
+		containers.NewDocker(cc.Docker.Socket, s.logger.With("engine", "docker")),
+		containers.NewIncus(cc.Incus.Socket, cc.Incus.Project, s.logger.With("engine", "incus")),
 	}
-	if cc.Incus.Enabled {
-		engines = append(engines, containers.NewIncus(cc.Incus.Socket, cc.Incus.Project, s.logger.With("engine", "incus")))
-	}
-	if len(engines) == 0 {
-		return nil
-	}
-	s.logger.Warn("container management is enabled: the dashboard can control the host's containers, so keep its password strong and its address private",
-		"docker", cc.Docker.Enabled, "incus", cc.Incus.Enabled, "read_only", cc.ReadOnly)
+	cfgOn := map[string]bool{"docker": cc.Docker.Enabled, "incus": cc.Incus.Enabled}
 	m := containers.NewManager(engines, cc.ReadOnly, s.logger.With("component", "containers"))
+	for _, e := range engines {
+		name := e.Name()
+		on := cfgOn[name]
+		if v, ok, err := s.db.ServiceOverride(engineKey(name), cfgOn[name]); err != nil {
+			s.logger.Error("reading the dashboard's container engine switch", "engine", name, "error", err)
+		} else if ok {
+			on = v
+		}
+		m.SetInitial(name, on)
+	}
+	if m.AnyEnabled() {
+		s.logger.Warn("container management is enabled: the dashboard can control the host's containers, so keep its password strong and its address private",
+			"docker", m.Enabled("docker"), "incus", m.Enabled("incus"), "read_only", cc.ReadOnly)
+	}
 	m.Reserved = s.ReservedPorts
+	m.OnSwitch = func(engine string, on bool) error {
+		if on {
+			if err := s.cfg.ContainersAllowed(); err != nil {
+				return err
+			}
+		}
+		return s.db.SetServiceOverride(engineKey(engine), on, cfgOn[engine])
+	}
 	return m
 }
+
+func engineKey(engine string) string { return "container-engine:" + engine }
 
 // ReservedPorts lists the host ports SkyGuard's listeners hold or tried to
 // take, and the dashboard's own port.

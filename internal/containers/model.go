@@ -110,10 +110,45 @@ type Engine interface {
 	SetPorts(ctx context.Context, id string, ports []Port) error
 	Update(ctx context.Context, id string, s Settings) error
 	RestartPolicies() []string
+
+	Create(ctx context.Context, spec CreateSpec) (string, error)
+	Remove(ctx context.Context, id string, volumes bool) error
+	Logs(ctx context.Context, id string, lines int) (string, error)
+	DeleteNetwork(ctx context.Context, name string) error
 }
 
-// Actions every engine supports.
-var Actions = []string{"start", "stop", "restart"}
+// Snapshotter is implemented by engines that keep instance snapshots (Incus).
+type Snapshotter interface {
+	Snapshots(ctx context.Context, id string) ([]InstanceSnapshot, error)
+	TakeSnapshot(ctx context.Context, id, name string) error
+	RestoreSnapshot(ctx context.Context, id, name string) error
+	DeleteSnapshot(ctx context.Context, id, name string) error
+}
+
+// InstanceSnapshot is one saved state of an instance.
+type InstanceSnapshot struct {
+	Name     string    `json:"name"`
+	Created  time.Time `json:"created"`
+	Stateful bool      `json:"stateful,omitempty"`
+}
+
+// CreateSpec describes a new container or instance.
+type CreateSpec struct {
+	Name     string
+	Image    string // Docker: nginx:alpine; Incus: images:debian/12 or a local alias
+	Ports    []Port
+	Network  string   // optional: the network it starts on
+	Env      []string // Docker only: KEY=value
+	Restart  string
+	MemoryMB int64
+	CPUs     float64
+	VM       bool // Incus: a virtual machine instead of a container
+	Start    bool
+}
+
+// Actions every engine supports. Pause freezes the processes in place
+// (Docker pause, Incus freeze); resume thaws them.
+var Actions = []string{"start", "stop", "restart", "pause", "resume"}
 
 // ErrReadOnly is returned for changes when containers.read_only is set.
 var ErrReadOnly = errors.New("container management is read-only (containers.read_only in the config file)")

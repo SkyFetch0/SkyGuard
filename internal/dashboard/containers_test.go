@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,6 +90,16 @@ func (m *memEngine) Update(_ context.Context, id string, s containers.Settings) 
 	return nil
 }
 
+func (m *memEngine) Create(_ context.Context, spec containers.CreateSpec) (string, error) {
+	m.cs[spec.Name] = &containers.Container{Engine: "docker", ID: spec.Name, Name: spec.Name, Image: spec.Image, Running: spec.Start, Ports: spec.Ports}
+	return spec.Name, nil
+}
+func (m *memEngine) Remove(_ context.Context, id string, _ bool) error { delete(m.cs, id); return nil }
+func (m *memEngine) Logs(context.Context, string, int) (string, error) {
+	return "2026-10-27T12:00:00Z ready\n", nil
+}
+func (m *memEngine) DeleteNetwork(_ context.Context, n string) error { delete(m.nets, n); return nil }
+
 func newContainerDashboard(t *testing.T, readOnly bool) (http.Handler, *memEngine) {
 	t.Helper()
 	db, err := storage.New(filepath.Join(t.TempDir(), "t.db"))
@@ -106,6 +117,12 @@ func newContainerDashboard(t *testing.T, readOnly bool) (http.Handler, *memEngin
 	// The fake-http honeypot lost port 80 to the reverse proxy.
 	m.Reserved = func() []containers.Reserved {
 		return []containers.Reserved{{Port: 80, Proto: "tcp", Owner: "honeypot fake-http", Failed: "address already in use"}, {Port: 21, Proto: "tcp", Owner: "honeypot fake-ftp"}}
+	}
+	m.OnSwitch = func(engine string, on bool) error {
+		if on {
+			return errors.New("set a strong dashboard password first")
+		}
+		return nil
 	}
 	d.SetContainers(m)
 	return d.routes(), eng
@@ -204,6 +221,51 @@ func TestContainersAPI(t *testing.T) {
 		t.Errorf("create network: %d %s", rr.Code, rr.Body)
 	}
 
+	// Lifecycle: create, logs, remove.
+	create := url.Values{"engine": {"docker"}, "name": {"web2"}, "image": {"nginx:alpine"}, "ports": {"8085:80"}, "env": {"A=1\nB=2"}}
+	if rr := do(h, "POST", "/api/containers/create", create, true, csrfHeader); rr.Code != 200 || eng.cs["web2"] == nil || !eng.cs["web2"].Running {
+		t.Errorf("create: %d %s", rr.Code, rr.Body)
+	}
+	create.Set("name", "web3")
+	create.Set("ports", "21:21") // the FTP honeypot's
+	if rr := do(h, "POST", "/api/containers/create", create, true, csrfHeader); rr.Code != 409 || eng.cs["web3"] != nil {
+		t.Errorf("create on a taken port: %d %s", rr.Code, rr.Body)
+	}
+	create.Set("ports", "")
+	create.Set("env", "not an assignment")
+	if rr := do(h, "POST", "/api/containers/create", create, true, csrfHeader); rr.Code != 400 {
+		t.Errorf("bad env: %d", rr.Code)
+	}
+	if rr := do(h, "GET", "/api/containers/logs?engine=docker&id=web2", nil, true, nil); rr.Code != 200 || !strings.Contains(rr.Body.String(), "ready") {
+		t.Errorf("logs: %d %s", rr.Code, rr.Body)
+	}
+	if rr := do(h, "POST", "/api/containers/remove", url.Values{"engine": {"docker"}, "id": {"web2"}}, true, csrfHeader); rr.Code != 200 || eng.cs["web2"] != nil {
+		t.Errorf("remove: %d %s", rr.Code, rr.Body)
+	}
+	if rr := do(h, "GET", "/api/containers/snapshots?engine=docker&id=app", nil, true, nil); rr.Code != 409 {
+		t.Errorf("Docker has no snapshots: %d", rr.Code)
+	}
+	if rr := do(h, "POST", "/api/containers/networks/delete", url.Values{"engine": {"docker"}, "name": {"db"}}, true, csrfHeader); rr.Code != 200 || eng.nets["db"] {
+		t.Errorf("delete network: %d %s", rr.Code, rr.Body)
+	}
+
+	// Switching the engine off from the panel hides it; the guard can refuse.
+	sw := url.Values{"engine": {"docker"}, "enabled": {"0"}}
+	if rr := do(h, "POST", "/api/containers/engines", sw, true, csrfHeader); rr.Code != 200 {
+		t.Fatalf("switch off: %d %s", rr.Code, rr.Body)
+	}
+	if rr := do(h, "GET", "/api/containers/inspect?engine=docker&id=app", nil, true, nil); rr.Code == 200 {
+		t.Error("a switched-off engine still answers")
+	}
+	rr = do(h, "GET", "/api/containers", nil, true, nil)
+	if !strings.Contains(rr.Body.String(), `"enabled":false`) {
+		t.Errorf("list after switch-off: %s", rr.Body)
+	}
+	sw.Set("enabled", "1")
+	if rr := do(h, "POST", "/api/containers/engines", sw, true, csrfHeader); rr.Code != 409 {
+		t.Errorf("the guard's refusal: %d %s", rr.Code, rr.Body)
+	}
+
 	// /api/info tells the client the screen is live.
 	rr = do(h, "GET", "/api/info", nil, true, nil)
 	var info map[string]any
@@ -227,5 +289,13 @@ func TestContainersReadOnly(t *testing.T) {
 	_ = json.Unmarshal(rr.Body.Bytes(), &v)
 	if v["read_only"] != true {
 		t.Errorf("read_only not reported: %v", fmt.Sprint(v["read_only"]))
+	}
+}
+
+func TestFormatDurationMatchesPresets(t *testing.T) {
+	for d, want := range map[time.Duration]string{0: "0", time.Hour: "1h", 90 * time.Minute: "90m", 48 * time.Hour: "2d", 1500 * time.Millisecond: "1.5s"} {
+		if got := formatDuration(d); got != want {
+			t.Errorf("%v: %q, want %q", d, got, want)
+		}
 	}
 }

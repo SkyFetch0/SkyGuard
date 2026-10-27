@@ -383,6 +383,7 @@
 
   // ── settings ────────────────────────────────────────────────────────────
   async function loadSettings() {
+    loadEngineSwitches();
     const [s, fw] = await Promise.allSettled([api('/api/settings'), api('/api/firewall')]);
     if (s.status === 'fulfilled') {
       const v = s.value;
@@ -488,7 +489,7 @@
   // The patch bay: containers down the left, networks across the top. A cable hangs from a container's
   // socket to every network it is on; clicking a socket lifts a free cable that follows the pointer
   // until it is dropped on another container (they get a network in common) or on a network.
-  const ct = { engine: '', data: null, patch: null, sheet: null, cur: null, hl: '' };
+  const ct = { engine: '', data: null, patch: null, sheet: null, cur: null, hl: '', view: 'map', only: 'all', query: '', topos: {}, cabling: false, expanded: new Set(), stacks: new Map() };
   const ENGINE_NAMES = { docker: 'Docker', incus: 'Incus' };
   const RESTART_LABELS = { no: 'Stay stopped', 'on-failure': 'On failure', 'unless-stopped': 'Unless stopped by hand', always: 'Always', 'last-state': 'As before shutdown' };
   const STATE_TONE = { running: 'pos', paused: 'warn', restarting: 'warn', frozen: 'warn', dead: 'neg', error: 'neg' };
@@ -516,23 +517,26 @@
       return;
     }
     ct.data = d;
-    $$('#screen-containers .grid, #bay-meta').forEach((el) => { el.hidden = !d.enabled; });
+    $$('#screen-containers .grid, .map-tools, #ct-new').forEach((el) => { el.hidden = !d.enabled; });
     if (!d.enabled) {
-      $('#ct-sub').textContent = 'Container management is off.';
-      $('#bay').innerHTML = `<div class="empty off-note"><div><p>Turn it on in the config file, mount the engine's socket into SkyGuard's container, and restart SkyGuard.</p>
-        <pre class="rules">containers:\n  docker:\n    enabled: true\n  incus:\n    enabled: false</pre>
-        <p class="muted">Either socket is equivalent to root on this server, so the dashboard needs a strong password.</p></div></div>`;
+      $('#ct-sub').textContent = 'Container management is off. Turn an engine on to see and wire the containers on this server.';
+      $('#topo').hidden = true; $('#bay-wrap').hidden = false;
+      $('#bay').innerHTML = `<div class="empty off-note"><div>
+        <p>SkyGuard talks to the engine over its socket. Either socket is equivalent to root on this server, so this needs a strong dashboard password; with docker compose, mount the socket into SkyGuard's container first.</p>
+        <div class="form-actions">${(d.engines || []).map((e) => `<button class="btn${e.name === 'docker' ? ' primary' : ''}" type="button" data-action="engine-on" data-engine="${esc(e.name)}">Manage ${esc(engineName(e.name))}</button><span class="stamp mono">${esc(e.socket || '')}</span>`).join('')}</div>
+        </div></div>`;
       $('#ct-engines').hidden = true;
       return;
     }
-    if (!d.engines.some((e) => e.name === ct.engine)) ct.engine = (d.engines.find((e) => e.available) || d.engines[0]).name;
-    renderEngines(); renderBay(); renderHostPorts(); renderCtNetworks(); renderExposure(); renderCtFinding();
+    const on = d.engines.filter((e) => e.enabled);
+    if (!on.some((e) => e.name === ct.engine)) ct.engine = (on.find((e) => e.available) || on[0]).name;
+    renderEngines(); renderBay(); renderMap(); applyCtView(); renderHostPorts(); renderCtNetworks(); renderExposure(); renderCtFinding();
     $$('[data-stamp]').forEach((el) => { el.textContent = `Updated ${clock(new Date())}`; });
     if ($('#ct-sheet').open && ct.sheet) refreshSheet();
   }
 
   function renderEngines() {
-    const g = $('#ct-engines'), list = ct.data.engines;
+    const g = $('#ct-engines'), list = ct.data.engines.filter((e) => e.enabled);
     g.hidden = list.length < 2;
     g.innerHTML = list.map((e) => `<button type="button" data-engine="${esc(e.name)}" aria-pressed="${e.name === ct.engine}">${esc(engineName(e.name))}</button>`).join('');
   }
@@ -557,15 +561,23 @@
     sub.innerHTML = `${num(running.length)} of ${num(cs.length)} ${engineName(eng.name)} ${cs.length === 1 ? 'container is' : 'containers are'} running on ${num(ns.length)} ${ns.length === 1 ? 'network' : 'networks'}.${stop}${ct.data.read_only ? ' Changes are switched off in the config file.' : ''}`;
   }
 
+  // what the search and the running-only switch leave on screen
+  function ctMatches(c) {
+    if (ct.only === 'running' && !c.running) return false;
+    const q = ct.query.toLowerCase();
+    if (!q) return true;
+    return [c.name, c.image, c.project, ...c.ports.map(portLabel), ...c.ports.map((p) => String(p.host_port)), ...c.networks.map((e) => `${e.network} ${e.ip || ''}`)]
+      .some((v) => String(v || '').toLowerCase().includes(q));
+  }
   function renderBay() {
-    const { eng, cs, ns } = ctView(), bay = $('#bay');
+    const v = ctView(), { eng, ns } = v, cs = v.cs.filter(ctMatches), bay = $('#bay');
     $('#bay-help').textContent = '';
     if (!ns.some((n) => n.name === ct.hl)) ct.hl = '';
     if (ct.hl) bay.dataset.hl = ct.hl; else bay.removeAttribute('data-hl');
     if (!eng.available) { bay.innerHTML = `<div class="block-error">${esc(engineName(eng.name))} is not reachable: ${esc(eng.error)}</div>`; return; }
-    if (!cs.length) { bay.innerHTML = `<div class="empty">No ${esc(engineName(eng.name))} containers on this server yet.</div>`; return; }
+    if (!cs.length) { bay.innerHTML = `<div class="empty">${v.cs.length ? 'No container matches.' : `No ${esc(engineName(eng.name))} containers on this server yet.`}</div>`; return; }
     const ro = ct.data.read_only;
-    $('#bay-meta').textContent = ro ? 'Read-only: changes are switched off in the config file' : "Click a container's socket, then another container or a network";
+    $('#topo-hint').textContent = ro ? 'Read-only: changes are switched off in the config file. Drag to move, scroll to zoom, double-click to open.' : 'Select a container, then pull a cable from its plug onto another container or a switch. Drag to move, scroll to zoom, double-click to open.';
     const bad = new Set(ct.data.host_ports.filter((u) => u.conflict).map((u) => `${u.port}/${u.proto}`));
     bay.style.setProperty('--cols', String(Math.max(1, ns.length)));
     const head = `<div class="bay-head"><div class="bay-corner"><span>Container</span><span class="muted num">${num(cs.filter((c) => c.running).length)}/${num(cs.length)} running</span></div>${ns.map((n) => `
@@ -695,6 +707,129 @@
     else openConnect(from, t.id);
   }
 
+  // ── the network map ─────────────────────────────────────────────────────
+  function topoFor(engine) {
+    if (ct.topos[engine]) return ct.topos[engine];
+    const stage = document.createElement('div');
+    stage.className = 'topo-stage'; stage.dataset.engine = engine;
+    $('#topo').prepend(stage);
+    const t = Topology.create(stage, {
+      storageKey: `skyguard.map.${engine}`,
+      onSelect: (n) => renderCard(n),
+      onOpen: (n) => { if (n.kind === 'ct') openCt(n.ref); },
+      onConnect: (a, b) => { if (b.kind === 'net') connectTo(a.ref, b.ref); else openConnect(a.ref, b.ref); },
+      onEdge: (e) => { if (e.net) disconnectFrom(e.ct, e.net); },
+      onCableStart: (n) => { ct.cabling = true; $('#bay-help').textContent = `Pulling a cable from ${n.label}: drop it on another container to give the two a network in common, or on a switch to join that network. Esc cancels.`; },
+      onCableHover: (a, b) => { if (b) $('#bay-help').textContent = b.kind === 'net' ? `Release to plug ${a.label} into ${b.label}.` : `Release to connect ${a.label} with ${b.label}.`; },
+      onCableEnd: () => { ct.cabling = false; $('#bay-help').textContent = ''; },
+    });
+    ct.topos[engine] = t;
+    return t;
+  }
+  function renderMap() {
+    const v = ctView(), cs = v.cs.filter((c) => ct.only === 'all' || c.running);
+    const t = topoFor(ct.engine);
+    $$('#topo .topo-stage').forEach((el) => { el.hidden = el.dataset.engine !== ct.engine; });
+    const nodes = [], edges = [], shown = new Set(cs.map((c) => c.id));
+    v.ns.forEach((n) => nodes.push({ id: 'net:' + n.name, ref: n.name, kind: 'net', label: n.name, sub: n.builtin ? 'default bridge' : (n.subnet || n.driver), locked: !n.attachable,
+      title: `${n.name} · ${n.driver}${n.subnet ? ' · ' + n.subnet : ''} · ${n.members.filter((m) => shown.has(m)).length} connected` }));
+    // Replicas (the same image, project and networks under a numbered name: queue-worker-1…40) fold
+    // into one stacked device until it is opened, so forty workers read as one thing on the map.
+    const base = (name) => name.replace(/[-_.]?\d+$/, '');
+    const sigOf = (c) => [c.project, base(c.name), c.image, c.network_mode, c.networks.map((e) => e.network).sort().join(',')].join('|');
+    const bySig = new Map();
+    cs.forEach((c) => { if (base(c.name) !== c.name) { const k = sigOf(c); if (!bySig.has(k)) bySig.set(k, []); bySig.get(k).push(c); } });
+    const stacked = new Set();
+    ct.stacks = new Map();
+    bySig.forEach((list, k) => {
+      if (list.length < 4 || ct.expanded.has(k)) return;
+      const c0 = list[0], up = list.filter((c) => c.running).length, id = 'stack:' + k;
+      list.forEach((c) => stacked.add(c.id));
+      ct.stacks.set(id, { key: k, list });
+      nodes.push({ id, ref: k, kind: 'ct', stack: list.length, label: `${base(c0.name)}-*`, sub: `${up}/${list.length} running`, state: up ? 'running' : 'exited',
+        group: c0.project, engine: c0.engine, locked: true, search: list.map((c) => c.name).join(' ') + ' ' + c0.image,
+        title: `${list.length} × ${base(c0.name)} (${c0.image}): ${up} running. Click to see them, then Expand to place each one.` });
+      c0.networks.forEach((e) => edges.push({ id: `${id}|${e.network}`, from: id, to: 'net:' + e.network, dead: !up, label: `${list.length} containers on ${e.network}` }));
+    });
+    let host = false;
+    cs.forEach((c) => {
+      if (stacked.has(c.id)) return;
+      nodes.push({ id: 'ct:' + c.id, ref: c.id, kind: 'ct', label: c.name, sub: c.image ? c.image.replace(/^.*\//, '') : '', state: c.state, group: c.project, engine: c.engine,
+        vm: c.kind === 'virtual-machine', self: c.self, locked: !!c.network_mode || ct.data.read_only,
+        search: [c.image, c.project, ...c.ports.map(portLabel), ...c.networks.map((e) => `${e.network} ${e.ip || ''}`)].join(' '),
+        title: `${c.name} · ${c.status}${c.ports.length ? ' · ' + c.ports.map(portLabel).join(', ') : ''}` });
+      c.networks.forEach((e) => edges.push({ id: `${c.id}|${e.network}`, from: 'ct:' + c.id, to: 'net:' + e.network, ct: c.id, net: e.network, dead: !c.running,
+        label: `${c.name} on ${e.network}${e.ip ? ' at ' + e.ip.replace(/\/\d+$/, '') : ''}. Click to disconnect.` }));
+      if (c.network_mode === 'host') { host = true; edges.push({ id: `${c.id}|host`, from: 'ct:' + c.id, to: 'host', dead: !c.running, label: `${c.name} uses the host's network` }); }
+    });
+    if (host) nodes.push({ id: 'host', kind: 'host', label: (state.info && state.info.host) || 'This server', sub: 'host network', locked: true });
+    t.setData({ nodes, edges, readOnly: ct.data.read_only });
+    if (ct.query) t.search(ct.query);
+    const sel = t.selected;
+    renderCard(sel ? nodes.find((n) => n.id === sel) : null);
+  }
+  function applyCtView() {
+    const map = ct.view === 'map';
+    $('#topo').hidden = !map; $('#bay-wrap').hidden = map;
+    $$('[data-ctview]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.ctview === ct.view)));
+    $$('[data-ctfilter]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.ctfilter === ct.only)));
+    $('#map-title').textContent = map ? 'Network map' : 'Patch bay';
+    if (!map) requestAnimationFrame(drawCables);
+  }
+  // the inspector beside the map: what is selected, and what to do with it
+  function renderCard(n) {
+    const card = $('#topo-card');
+    if (!n) { card.hidden = true; $('#topo-hint').hidden = false; return; }
+    card.hidden = false; $('#topo-hint').hidden = true;
+    const ro = ct.data.read_only;
+    if (n.kind === 'ct' && n.stack) {
+      const st = ct.stacks.get(n.id);
+      if (!st) { card.hidden = true; return; }
+      const up = st.list.filter((c) => c.running).length;
+      card.innerHTML = `<div class="card-head"><span class="state-dot ${up ? 'pos' : ''}"></span><b translate="no">${esc(n.label)}</b><span class="muted">${num(st.list.length)} replicas</span></div>
+        <div class="muted mono card-image" translate="no">${esc(st.list[0].image)}</div>
+        <div class="muted">${num(up)} of ${num(st.list.length)} running · on ${esc(st.list[0].networks.map((e) => e.network).join(', ') || 'no network')}</div>
+        <ul class="card-nets">${st.list.slice(0, 8).map((c) => `<li><button class="ip-link" type="button" data-action="ct-open" data-id="${esc(c.id)}" translate="no">${esc(c.name)}</button><span class="state-dot ${STATE_TONE[c.state] || ''}"></span></li>`).join('')}${st.list.length > 8 ? `<li class="muted">and ${num(st.list.length - 8)} more</li>` : ''}</ul>
+        <div class="card-actions"><button class="btn small primary" type="button" data-action="stack-expand" data-key="${esc(st.key)}">Expand on the map</button></div>`;
+      return;
+    }
+    if (n.kind === 'ct') {
+      const c = findCt(n.ref);
+      if (!c) { card.hidden = true; return; }
+      const nets = c.networks.map((e) => `<li><span class="mono" translate="no">${esc(e.network)}</span><span class="num muted">${esc((e.ip || '').replace(/\/\d+$/, ''))}</span></li>`).join('');
+      card.innerHTML = `<div class="card-head"><span class="state-dot ${STATE_TONE[c.state] || ''}"></span><b translate="no">${esc(c.name)}</b>${c.project ? `<span class="muted">${esc(c.project)}</span>` : ''}</div>
+        <div class="muted mono card-image" translate="no">${esc(c.image || '—')}</div>
+        <div class="muted">${esc(c.status)}</div>
+        ${c.ports.length ? `<div class="ct-ports">${c.ports.map((p) => `<span class="chip mono">${esc(portLabel(p))}</span>`).join('')}</div>` : ''}
+        ${c.network_mode ? `<p class="muted">Network mode ${esc(c.network_mode)}: it joins no networks.</p>` : nets ? `<ul class="card-nets">${nets}</ul>` : '<p class="muted">On no network.</p>'}
+        <div class="card-actions">
+          <button class="btn small primary" type="button" data-action="ct-open" data-id="${esc(c.id)}">Details</button>
+          ${!ro && !c.network_mode ? `<button class="btn small" type="button" data-action="map-cable" data-id="${esc(c.id)}">Connect…</button>` : ''}
+          ${ro || c.self ? '' : c.running ? `<button class="btn small" type="button" data-action="ct-stop" data-id="${esc(c.id)}">Stop</button>` : `<button class="btn small" type="button" data-action="ct-start" data-id="${esc(c.id)}">Start</button>`}
+          ${[...ct.expanded].some((k) => k.split('|')[1] === c.name.replace(/[-_.]?\d+$/, '') && k.startsWith((c.project || '') + '|')) ? `<button class="card-link" type="button" data-action="stack-collapse" data-name="${esc(c.name)}">Fold the replicas</button>` : ''}
+        </div>`;
+      return;
+    }
+    if (n.kind === 'net') {
+      const net = ctView().ns.find((x) => x.name === n.ref);
+      if (!net) { card.hidden = true; return; }
+      const members = net.members.map((id) => findCt(id)).filter(Boolean);
+      card.innerHTML = `<div class="card-head"><svg class="card-glyph" viewBox="-32 -14 64 28" aria-hidden="true"><rect x="-30" y="-12" width="60" height="24" rx="4"/></svg><b class="mono" translate="no">${esc(net.name)}</b></div>
+        <div class="muted">${esc(net.builtin ? "Docker's default bridge: containers on it reach each other by address only, not by name" : net.driver)}${net.subnet ? ` · <span class="num">${esc(net.subnet)}</span>` : ''}</div>
+        <div class="muted">${num(members.length)} ${members.length === 1 ? 'container' : 'containers'}</div>
+        ${members.length ? `<ul class="card-nets">${members.slice(0, 10).map((c) => `<li><button class="ip-link" type="button" data-action="map-focus" data-id="${esc(c.id)}" translate="no">${esc(c.name)}</button><span class="state-dot ${STATE_TONE[c.state] || ''}"></span></li>`).join('')}${members.length > 10 ? `<li class="muted">and ${num(members.length - 10)} more</li>` : ''}</ul>` : ''}
+        <div class="card-actions">${!ro && !members.length && !net.builtin ? `<button class="btn small danger" type="button" data-action="net-delete" data-net="${esc(net.name)}">Delete network</button>` : ''}</div>`;
+      return;
+    }
+    card.innerHTML = `<div class="card-head"><b>${esc(n.label)}</b></div><p class="muted">Containers on the host network share this server's own interfaces: whatever they listen on is open on the host directly, and SkyGuard's bans apply to them through INPUT.</p>`;
+  }
+  async function deleteNetwork(name) {
+    if (!await confirmAction(`Delete network ${name}?`, 'No container is on it. It can be created again from the Networks panel.', 'Delete')) return;
+    try { await ctPost('networks/delete', { name }); toast(`Network ${name} deleted`); renderCard(null); }
+    catch (e) { toast(`Not deleted: ${e.message}`, false); }
+    loadContainers();
+  }
+
   async function connectTo(id, network, create = false) {
     const c = findCt(id);
     try {
@@ -754,6 +889,11 @@
   async function jack(btn) {
     const c = findCt(btn.dataset.id), net = btn.dataset.net, ep = c.networks.find((e) => e.network === net);
     if (!ep) { connectTo(c.id, net); return; }
+    disconnectFrom(c.id, net);
+  }
+  async function disconnectFrom(id, net) {
+    const c = findCt(id), ep = c && c.networks.find((e) => e.network === net);
+    if (!ep || ct.data.read_only) return;
     if (!await confirmAction(`Take ${c.name} off ${net}?`, `It loses ${ep.ip ? `its address ${ep.ip.replace(/\/\d+$/, '')} and ` : ''}its name on ${net}, so the containers there can no longer reach it.`, 'Disconnect')) return;
     try { await ctPost('disconnect', { id: c.id, network: net }); toast(`${c.name} left ${net}`); }
     catch (e) { toast(`${c.name}: ${e.message}`, false); }
@@ -762,13 +902,13 @@
 
   async function ctAction(id, action, engine = ct.engine) {
     const c = findCt(id, engine) || ct.cur;
-    if (action !== 'start') {
+    if (action === 'stop' || action === 'restart') {
       const what = action === 'stop' ? 'Its published ports close until it is started again.' : 'It is stopped and started again; open connections drop.';
       if (!await confirmAction(`${action === 'stop' ? 'Stop' : 'Restart'} ${c.name}?`, what, action === 'stop' ? 'Stop' : 'Restart')) return;
     }
     try {
       const after = await post('/api/containers/action', { engine, id, action });
-      toast(`${after.name} is ${after.running ? 'running' : 'stopped'}`);
+      toast(`${after.name} is ${['paused', 'frozen'].includes(after.state) ? 'paused' : after.running ? 'running' : 'stopped'}`);
     } catch (e) { toast(`${c.name}: ${e.message}`, false); }
     loadContainers();
   }
@@ -838,7 +978,8 @@
     $('#ct-tags').innerHTML = ''; $('#ct-actions').innerHTML = ''; $('#ct-note').textContent = '';
     $('#ct-facts').innerHTML = ['State', 'Image', 'Created', 'Address'].map((k) => `<div><dt>${k}</dt><dd><span class="skeleton">000000</span></dd></div>`).join('');
     $('#port-rows').innerHTML = ''; $('#ct-nets').innerHTML = skeletonRows(4, 1); $('#ct-mounts').innerHTML = '';
-    ['#ports-msg', '#limits-msg'].forEach((s) => { $(s).textContent = ''; });
+    ['#ports-msg', '#limits-msg', '#logs-meta'].forEach((s) => { $(s).textContent = ''; });
+    $('#ct-logs').hidden = true; $('[data-action="ct-logs"]').textContent = 'Load the last 200 lines'; ct.snapsFor = null;
     if (!sheet.open) sheet.showModal();
     await refreshSheet();
   }
@@ -855,7 +996,9 @@
     $('#ct-facts').innerHTML = [['State', c.status || c.state], ['Image', c.image || '—'], ['Created', c.created ? stamp(c.created) : '—'], ['Address', addr ? addr.replace(/\/\d+$/, '') : '—']]
       .map(([k, v]) => `<div><dt>${k}</dt><dd title="${esc(v)}">${esc(v)}</dd></div>`).join('');
     const btn = (action, label, primary) => `<button class="btn${primary ? ' primary' : ''}" type="button" data-action="ct-sheet-action" data-do="${action}">${label}</button>`;
-    $('#ct-actions').innerHTML = ro ? '' : c.self ? '' : c.running ? btn('restart', 'Restart') + btn('stop', 'Stop') : btn('start', 'Start', true);
+    const paused = ['paused', 'frozen'].includes(c.state);
+    $('#ct-actions').innerHTML = ro || c.self ? '' : paused ? btn('resume', 'Resume', true) + btn('stop', 'Stop')
+      : c.running ? btn('restart', 'Restart') + btn('pause', 'Pause') + btn('stop', 'Stop') : btn('start', 'Start', true);
     $('#ct-note').textContent = c.self ? "This is SkyGuard's own container: restart or change it with docker compose on the host, or the dashboard would go down with it."
       : ro ? 'Read-only: containers.read_only is set in the config file.' : '';
 
@@ -889,6 +1032,122 @@
 
     $('#ct-mounts-block').hidden = !(c.mounts || []).length;
     $('#ct-mounts').innerHTML = (c.mounts || []).map((m) => `<li class="mono">${esc(m)}</li>`).join('');
+
+    $('#ct-danger').hidden = ro || c.self;
+    $('#remove-hint').textContent = docker ? 'Stops and deletes the container. Its volumes stay, named and anonymous; remove them yourself when you are sure.'
+      : 'Stops and deletes the instance with its snapshots. Custom storage volumes attached to it stay.';
+    const snaps = !!(eng && eng.snapshots);
+    $('#ct-snaps-block').hidden = !snaps;
+    $('#snap-form').hidden = ro;
+    if (snaps && ct.snapsFor !== c.id) loadSnapshots(c);
+  }
+  const snapName = () => { const d = new Date(), p = (n) => String(n).padStart(2, '0'); return `snap-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`; }; // taste-skill-ignore: a date in a snapshot name
+  async function loadSnapshots(c = ct.cur) {
+    ct.snapsFor = c.id;
+    $('#snap-form').elements.name.value = snapName();
+    try {
+      const list = await api(`/api/containers/snapshots?engine=${encodeURIComponent(c.engine)}&id=${encodeURIComponent(c.id)}`);
+      $('#ct-snaps').innerHTML = list.length ? list.map((x) => `<tr><td class="mono" translate="no">${esc(x.name)}${x.stateful ? ' <span class="muted">with memory</span>' : ''}</td><td class="n" title="${esc(stamp(x.created))}">${esc(ago(x.created))}</td>
+        <td class="n">${ct.data.read_only ? '' : `<button class="btn small" type="button" data-action="snap-restore" data-name="${esc(x.name)}">Roll back</button> <button class="btn small" type="button" data-action="snap-delete" data-name="${esc(x.name)}">Delete</button>`}</td></tr>`).join('')
+        : emptyRow(3, 'No snapshots yet. Take one before a risky change.');
+    } catch (e) { blockError($('#ct-snaps'), 'snapshots', e); }
+  }
+  async function snapshot(action, name) {
+    const c = ct.cur;
+    if (action === 'restore' && !await confirmAction(`Roll ${c.name} back to ${name}?`, 'Everything written since that snapshot is lost.', 'Roll back')) return;
+    if (action === 'delete' && !await confirmAction(`Delete snapshot ${name}?`, 'It cannot be restored afterwards.', 'Delete')) return;
+    const btn = $('#snap-submit');
+    if (action === 'take') { btn.disabled = true; btn.textContent = 'Taking…'; }
+    try {
+      await post('/api/containers/snapshots', { engine: c.engine, id: c.id, action, name });
+      toast(action === 'take' ? `Snapshot ${name} taken` : action === 'restore' ? `${c.name} rolled back to ${name}` : `Snapshot ${name} deleted`);
+    } catch (e) { toast(`Snapshot: ${e.message}`, false); }
+    btn.disabled = false; btn.textContent = 'Take snapshot';
+    loadSnapshots(c);
+    refreshSheet();
+  }
+  async function loadLogs() {
+    const c = ct.cur, pre = $('#ct-logs');
+    $('#logs-meta').textContent = 'Loading…';
+    try {
+      const r = await api(`/api/containers/logs?engine=${encodeURIComponent(c.engine)}&id=${encodeURIComponent(c.id)}&lines=200`);
+      pre.textContent = r.text.trim() || '(nothing written yet)';
+      pre.hidden = false;
+      pre.scrollTop = pre.scrollHeight;
+      $('#logs-meta').textContent = `Last ${num(r.lines)} lines at ${clock(new Date())}`;
+      $('[data-action="ct-logs"]').textContent = 'Reload';
+    } catch (e) { $('#logs-meta').textContent = e.message; }
+  }
+  async function removeCt() {
+    const c = ct.cur;
+    if (!await confirmAction(`Remove ${c.name}?`, c.engine === 'docker' ? 'The container is stopped and deleted; its volumes stay. This cannot be undone.' : 'The instance is stopped and deleted with its snapshots. This cannot be undone.', 'Remove')) return;
+    try {
+      await post('/api/containers/remove', { engine: c.engine, id: c.id });
+      $('#ct-sheet').close();
+      toast(`${c.name} removed`);
+    } catch (e) { toast(`${c.name}: ${e.message}`, false); }
+    loadContainers();
+  }
+
+  // ── a new container ─────────────────────────────────────────────────────
+  const IMAGE_HINTS = {
+    docker: ['nginx:alpine', 'caddy:2-alpine', 'redis:alpine', 'postgres:17-alpine', 'mariadb:11', 'jc21/nginx-proxy-manager:latest', 'louislam/uptime-kuma:2', 'portainer/portainer-ce:latest'],
+    incus: ['images:debian/12', 'images:ubuntu/24.04', 'images:alpine/3.22', 'images:rockylinux/9', 'images:archlinux'],
+  };
+  function openCreate() {
+    const f = $('#create-form'), { ns, eng } = ctView(), docker = ct.engine === 'docker';
+    f.reset(); $('#create-error').textContent = '';
+    $('#create-title').textContent = docker ? 'New Docker container' : 'New Incus instance';
+    $('#image-hints').innerHTML = IMAGE_HINTS[ct.engine].map((i) => `<option value="${esc(i)}">`).join('');
+    f.elements.image.placeholder = docker ? 'nginx:alpine…' : 'images:debian/12…';
+    $('#image-hint').textContent = docker ? 'Pulled from the registry if it is not on this server yet.' : 'images:<distro>/<release> downloads from images.linuxcontainers.org; a bare name is an image already on this server.';
+    $('#create-network').innerHTML = `<option value="">${docker ? "Docker's default bridge" : 'From the default profile'}</option>` + ns.filter((n) => n.attachable && !n.builtin).map((n) => `<option value="${esc(n.name)}">${esc(n.name)}${n.subnet ? ' · ' + esc(n.subnet) : ''}</option>`).join('');
+    const def = docker ? 'unless-stopped' : 'last-state';
+    $('#create-restart').innerHTML = eng.restart_policies.map((r) => `<button type="button" data-restart="${esc(r)}" aria-pressed="${r === def}">${esc(RESTART_LABELS[r] || r)}</button>`).join('');
+    f.querySelector('.env-field').hidden = !docker;
+    $('#create-vm-row').hidden = docker;
+    f.elements.cpus.step = docker ? '0.25' : '1';
+    $('#create-dialog').showModal();
+    f.elements.name.focus();
+  }
+  async function submitCreate(f) {
+    const el = f.elements, btn = $('#create-submit'), pressed = $('#create-restart [aria-pressed="true"]');
+    const data = { engine: ct.engine, name: el.name.value.trim(), image: el.image.value.trim(), ports: el.ports.value.trim(), network: el.network.value,
+      env: ct.engine === 'docker' ? el.env.value : '', restart: pressed ? pressed.dataset.restart : '', memory_mb: el.memory_mb.value || '0', cpus: el.cpus.value || '0',
+      start: el.start.checked ? '1' : '0', vm: el.vm.checked ? '1' : '0' };
+    btn.disabled = true; btn.textContent = ct.engine === 'docker' ? 'Pulling and creating…' : 'Downloading and creating…';
+    $('#create-error').textContent = 'This can take a few minutes the first time an image is used.';
+    try {
+      const r = await post('/api/containers/create', data);
+      $('#create-dialog').close();
+      toast(r.warning ? `${data.name}: ${r.warning}` : `${data.name} is ${r.container.running ? 'running' : 'created'}`, !r.warning);
+      await loadContainers();
+      if (r.container && ct.topos[ct.engine]) ct.topos[ct.engine].focus('ct:' + r.container.id);
+    } catch (e) { $('#create-error').textContent = e.message; }
+    btn.disabled = false; btn.textContent = 'Create';
+  }
+
+  // ── engine switches (settings) ──────────────────────────────────────────
+  async function loadEngineSwitches() {
+    const box = $('#engine-switches');
+    let d;
+    try { d = await api('/api/containers'); } catch (e) { blockError(box, 'the container engines', e); return; }
+    if (!d.engines) { box.innerHTML = '<div class="muted">Container management needs the dashboard.</div>'; return; }
+    box.innerHTML = d.engines.map((e) => `<label class="switch-row engine-row"><span><b>${esc(engineName(e.name))}</b><br>
+        <span class="muted mono">${esc(e.socket || '')}</span><br>
+        <span class="${e.enabled && !e.available ? 'neg-text' : 'muted'}">${!e.enabled ? 'Off' : e.available ? `On · ${esc(engineName(e.name))} ${esc(e.version || '')}` : `On, but not reachable: ${esc(e.error || '')}`}</span></span>
+        <input class="switch" type="checkbox" role="switch" data-action="engine-switch" data-engine="${esc(e.name)}" ${e.enabled ? 'checked' : ''} aria-label="Manage ${esc(engineName(e.name))}"></label>`).join('')
+      + (d.read_only ? '<p class="hint">containers.read_only is set in the config file: the dashboard lists containers and changes nothing.</p>' : '');
+  }
+  async function switchEngine(engine, on, input) {
+    if (input) input.disabled = true;
+    try {
+      await post('/api/containers/engines', { engine, enabled: on ? '1' : '0' });
+      toast(on ? `${engineName(engine)} management is on` : `${engineName(engine)} management is off`);
+      if (on) ct.engine = engine;
+    } catch (e) { if (input) input.checked = !on; toast(`${engineName(engine)}: ${e.message}`, false); }
+    if (input) input.disabled = false;
+    if (current === 'settings') loadEngineSwitches(); else loadContainers();
   }
   function portRow(p = {}, c = ct.cur) {
     const inherited = p.inherited ? ' <span class="muted">from a profile</span>' : '';
@@ -967,7 +1226,8 @@
       for (const k of ['ip', 'service', 'country']) { const v = f.elements[k].value.trim(); if (v) p.set(k, v); }
       if (state.conn.action) p.set('action', state.conn.action);
     }
-    if (current === 'containers' && ct.engine && ct.data && ct.data.engines && ct.data.engines.length > 1) p.set('engine', ct.engine);
+    if (current === 'containers' && ct.engine && ct.data && ct.data.engines && ct.data.engines.filter((e) => e.enabled).length > 1) p.set('engine', ct.engine);
+    if (current === 'containers' && ct.view === 'table') p.set('view', 'table');
     const hash = '#' + current + (p.toString() ? '?' + p : '');
     if (location.hash !== hash) history.replaceState(null, '', hash);
   }
@@ -976,6 +1236,7 @@
     else if (name === 'overview' || name === 'credentials') state.range = '24h';
     $$('[data-range]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.range === state.range)));
     if (name === 'containers' && ['docker', 'incus'].includes(p.get('engine'))) ct.engine = p.get('engine');
+    if (name === 'containers') ct.view = p.get('view') === 'table' ? 'table' : 'map';
     if (name === 'overview') state.metric = METRICS.some((m) => m.key === p.get('metric')) ? p.get('metric') : 'total';
     if (name === 'connections') {
       const f = $('#conn-filters');
@@ -1015,6 +1276,10 @@
     if (ct.patch) { ev.preventDefault(); dropPatch(t); return; }
     const engBtn = t.closest('[data-engine]:not([data-action])');
     if (engBtn) { ct.engine = engBtn.dataset.engine; writeHash(); loadContainers(); return; }
+    const cv = t.closest('[data-ctview]');
+    if (cv) { ct.view = cv.dataset.ctview; applyCtView(); writeHash(); if (ct.view === 'map' && ct.data) renderMap(); return; }
+    const cf = t.closest('[data-ctfilter]');
+    if (cf) { ct.only = cf.dataset.ctfilter; applyCtView(); renderBay(); renderMap(); return; }
     const restart = t.closest('[data-restart]');
     if (restart) { pressOnly(restart.parentElement, restart.dataset.restart, 'restart'); return; }
     const range = t.closest('[data-range]');
@@ -1080,6 +1345,22 @@
       case 'ct-stop': ctAction(a.dataset.id, 'stop'); break;
       case 'ct-sheet-action': ctAction(ct.cur.id, a.dataset.do, ct.cur.engine).then(() => { if ($('#ct-sheet').open) refreshSheet(); }); break;
       case 'port-add': addPortRow(); break;
+      case 'ct-new': openCreate(); break;
+      case 'ct-logs': loadLogs(); break;
+      case 'ct-remove': removeCt(); break;
+      case 'snap-restore': snapshot('restore', a.dataset.name); break;
+      case 'snap-delete': snapshot('delete', a.dataset.name); break;
+      case 'map-cable': topoFor(ct.engine).startCable('ct:' + a.dataset.id); break;
+      case 'map-focus': topoFor(ct.engine).focus('ct:' + a.dataset.id); renderCard({ kind: 'ct', ref: a.dataset.id }); break;
+      case 'net-delete': deleteNetwork(a.dataset.net); break;
+      case 'stack-expand': ct.expanded.add(a.dataset.key); renderMap(); renderCard(null); break;
+      case 'stack-collapse': {
+        const b = a.dataset.name.replace(/[-_.]?\d+$/, '');
+        [...ct.expanded].forEach((k) => { if (k.split('|')[1] === b) ct.expanded.delete(k); });
+        renderMap(); renderCard(null);
+        break;
+      }
+      case 'engine-on': switchEngine(a.dataset.engine, true); break;
       case 'port-remove': {
         a.closest('.port-row').remove();
         if (!$('.port-row', $('#port-rows'))) $('#port-rows').innerHTML = '<div class="empty small">No published ports. Save to unpublish them all.</div>';
@@ -1089,6 +1370,7 @@
   });
   document.addEventListener('change', (ev) => {
     if (ev.target.matches('[data-action="toggle-service"]')) toggleService(ev.target);
+    if (ev.target.matches('[data-action="engine-switch"]')) switchEngine(ev.target.dataset.engine, ev.target.checked, ev.target);
     if (ev.target.closest('#conn-filters')) { state.conn.offset = 0; writeHash(); loadConnections(); }
     if (ev.target.id === 'set-enabled') $('#set-state').textContent = ev.target.checked ? 'On once you save' : 'Off once you save';
   });
@@ -1102,6 +1384,19 @@
   $('#ports-form').addEventListener('submit', (ev) => { ev.preventDefault(); savePorts(ev.target); });
   $('#limits-form').addEventListener('submit', (ev) => { ev.preventDefault(); saveLimits(ev.target); });
   $('#net-form').addEventListener('submit', (ev) => { ev.preventDefault(); createNetwork(ev.target); });
+  $('#create-form').addEventListener('submit', (ev) => { ev.preventDefault(); submitCreate(ev.target); });
+  $('#snap-form').addEventListener('submit', (ev) => { ev.preventDefault(); const n = ev.target.elements.name.value.trim(); if (n) snapshot('take', n); });
+  let searchTimer;
+  $('#ct-search').addEventListener('input', (ev) => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      ct.query = ev.target.value.trim();
+      renderBay();
+      const n = ct.topos[ct.engine] ? ct.topos[ct.engine].search(ct.query) : 0;
+      $('#bay-help').textContent = ct.query ? `${num(ctView().cs.filter(ctMatches).length)} ${ctView().cs.filter(ctMatches).length === 1 ? 'container matches' : 'containers match'} "${ct.query}"` : '';
+      void n;
+    }, 120);
+  });
   $('#bay').addEventListener('pointermove', movePatch);
   document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && ct.patch) { ev.preventDefault(); endPatch(); } });
   $('#ct-sheet').addEventListener('click', (ev) => { if (ev.target === ev.currentTarget) ev.currentTarget.close(); });
@@ -1126,5 +1421,5 @@
   }).catch(() => {});
   show(...parseHash());
   // Live screens refresh every 30 seconds while the tab is visible; old values stay until new ones arrive.
-  setInterval(() => { if (!document.hidden && SCREENS[current].live && !ct.patch && !document.querySelector('dialog[open]')) refresh(); }, 30000);
+  setInterval(() => { if (!document.hidden && SCREENS[current].live && !ct.patch && !ct.cabling && !document.querySelector('dialog[open]')) refresh(); }, 30000);
 })();

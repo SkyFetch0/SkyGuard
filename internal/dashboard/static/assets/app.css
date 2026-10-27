@@ -349,7 +349,7 @@ svg.cables { position: absolute; left: 0; top: 0; pointer-events: none; overflow
 /* host ports: one row per port, every claimant on its own line */
 tr.stacked td { height: auto; padding-top: 10px; padding-bottom: 10px; line-height: 22px; vertical-align: top; }
 tr.stacked td.n .pill { margin-top: 0; }
-.net-form { padding-top: 16px; flex-wrap: nowrap; }
+.net-form { margin-top: auto; padding-top: 16px; flex-wrap: nowrap; }
 .cover { color: var(--muted); line-height: 20px; margin-bottom: 8px; }
 .cover.bad { color: var(--text); padding-left: 12px; border-left: 2px solid var(--negative); }
 #open-ports li { min-height: 36px; }
@@ -387,6 +387,104 @@ tr.stacked td.n .pill { margin-top: 0; }
 #ct-facts dd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
 #restart-group { flex-wrap: wrap; height: auto; min-height: var(--control-height); row-gap: 4px; }
 #restart-group button { height: var(--control-height); }
+
+/* ---------- containers: the network map ---------- */
+/* a network simulator's logical view in the terminal's palette: switches for networks, round devices for
+   containers, cables in the one hue. Compose projects sit on a soft tone step; nothing else is filled. */
+.map-panel > header { align-items: center; }
+.map-tools { display: flex; align-items: center; gap: 12px 20px; flex-wrap: wrap; }
+.map-tools .search .input { width: 260px; }
+.topo { position: relative; height: clamp(440px, 64svh, 760px); margin: 0 calc(var(--card-pad) * -1); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); background: var(--ground); overflow: hidden; }
+.topo-stage { position: absolute; inset: 0; }
+.topo-svg { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; }
+.topo.panning .topo-svg, .panning .topo-svg { cursor: grabbing; }
+.cabling .topo-svg { cursor: crosshair; }
+.topo-tools { position: absolute; top: 12px; right: 12px; display: grid; gap: 6px; }
+.topo-tools .icon-btn { background: var(--surface); font: 500 15px/1 var(--mono); } /* taste-skill-ignore: data-terminal style */
+.topo-mini { position: absolute; right: 12px; bottom: 12px; width: 168px; height: 108px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface); cursor: pointer; display: none; }
+.mini-on .topo-mini { display: block; }
+.topo-mini circle { fill: var(--accent); } .topo-mini circle.off { fill: var(--control); }
+.topo-mini rect.net { fill: var(--text); }
+.topo-mini .m-view { fill: none; stroke: var(--text); stroke-width: 1; }
+.topo-card { position: absolute; top: 12px; left: 12px; z-index: 2; width: 288px; max-height: calc(100% - 24px); overflow: auto; display: grid; gap: 8px; padding: 14px 16px; border-radius: var(--radius-card); border: 1px solid var(--border); background: var(--surface); }
+.topo-card .card-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.topo-card .card-head b { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.topo-card .card-head .muted { font-size: var(--fs-small); }
+.topo-card .card-image { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-small); }
+.topo-card > .muted { font-size: var(--fs-small); line-height: 18px; }
+.card-nets { display: grid; gap: 2px; font-size: var(--fs-small); }
+.card-nets li { display: flex; justify-content: space-between; align-items: center; gap: 10px; min-height: 22px; }
+.card-nets li + li { border-top: 1px solid var(--rule); }
+.card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.card-actions:empty { display: none; }
+.card-glyph { width: 26px; height: 12px; flex: none; } .card-glyph rect { fill: none; stroke: var(--text); stroke-width: 2; }
+.topo-hint { position: absolute; left: 14px; bottom: 12px; max-width: min(520px, calc(100% - 210px)); color: var(--muted); font-size: var(--fs-small); pointer-events: none; }
+
+/* map marks */
+.hull { pointer-events: none; }
+.hull path { fill: var(--raised); stroke: var(--raised); stroke-width: 76; stroke-linejoin: round; stroke-linecap: round; opacity: .55; }
+.hull text { fill: var(--muted); font: 500 calc(12px * var(--ls, 1)) var(--font); text-anchor: middle; letter-spacing: .02em; }
+.edge path, .sw-body, .ct-ring, .glyph, .live-cable, .live-plug { vector-effect: non-scaling-stroke; }
+.edge .e-line { fill: none; stroke: var(--accent); stroke-width: 1.4; stroke-linecap: round; }
+.edge .e-hit { fill: none; stroke: transparent; stroke-width: 12; cursor: pointer; }
+.edge:hover .e-line { stroke-width: 2.6; }
+.edge.dead .e-line { stroke: var(--control); stroke-dasharray: 4 4; }
+.tn { cursor: pointer; }
+.tn text { text-anchor: middle; pointer-events: none; }
+.tn .t-label { fill: var(--text); font: 500 calc(12px * var(--ls, 1)) var(--font); paint-order: stroke; stroke: var(--ground); stroke-width: 4px; stroke-linejoin: round; }
+.tn .t-sub { display: none; fill: var(--muted); font: 400 calc(10.5px * var(--ls, 1)) var(--mono); paint-order: stroke; stroke: var(--ground); stroke-width: 4px; } /* taste-skill-ignore: data-terminal style */
+.tn .t-badge { fill: var(--muted); font: 500 10px var(--font); }
+.tn.net .t-label { font-family: var(--mono); } /* taste-skill-ignore: data-terminal style */
+.lod-sub .tn .t-sub, .tn.sel .t-sub, .tn.net .t-sub { display: inline; }
+.tn.nolabel:not(:hover) text:not(.t-count) { display: none; }
+.tn .t-count { fill: var(--text); font: 600 calc(11px * var(--ls, 1)) var(--mono); text-anchor: start; paint-order: stroke; stroke: var(--ground); stroke-width: 4px; } /* taste-skill-ignore: data-terminal style */
+.ct-ring.back { fill: var(--surface); stroke: var(--control); } /* taste-skill-ignore: data-terminal style */
+.sw-body { fill: var(--surface); stroke: var(--text); stroke-width: 1.2; }
+.sw-port { fill: var(--accent); }
+.tn.net:hover .sw-body, .tn.host:hover .sw-body { stroke: var(--accent); }
+.glyph { fill: none; stroke: var(--text); stroke-width: 1.2; stroke-linejoin: round; stroke-linecap: round; }
+.led { fill: var(--positive); }
+.ct-ring { fill: var(--surface); stroke: var(--control); stroke-width: 1.2; transition: stroke var(--t-hover) ease; }
+.tn.ct:hover .ct-ring { stroke: var(--text); }
+.st.pos { fill: var(--positive); } .st.warn { fill: var(--warning); } .st.neg { fill: var(--negative); } .st.off { fill: var(--control); }
+.tn.stopped .glyph, .tn.stopped .t-label { opacity: .55; }
+.tn.sel .ct-ring, .tn.sel .sw-body { stroke: var(--accent); stroke-width: 2; }
+.tn.match .ct-ring, .tn.match .sw-body { stroke: var(--accent); stroke-width: 2; }
+.tn.target .ct-ring, .tn.target .sw-body { stroke: var(--accent); stroke-width: 3; }
+.tn.dim, .edge.dim, .hull.dim { opacity: .16; }
+/* while a cable is out, every place it can go comes forward */
+.cabling .tn.net.dim, .cabling .tn.ct.dim { opacity: .55; }
+.tn.target, .tn.target.dim { opacity: 1; }
+.topo-svg:focus { outline: none; }
+.handle circle { fill: var(--accent); stroke: var(--ground); stroke-width: 2; cursor: crosshair; }
+.handle path { stroke: var(--ground); stroke-width: 1.6; stroke-linecap: round; pointer-events: none; }
+.live-cable { fill: none; stroke: color-mix(in srgb, var(--accent) 70%, #fff); stroke-width: 2.5; stroke-linecap: round; pointer-events: none; }
+.live-cable.snapped { stroke: var(--accent); }
+.live-plug { fill: var(--surface); stroke: var(--accent); stroke-width: 2; pointer-events: none; }
+/* zoomed far out only the shape of the network is left; selection, search and hover bring the names back */
+.lod-tiny .tn.net:not(:hover) .t-sub { display: none; }
+.lod-tiny .tn.ct .glyph, .lod-tiny .tn .t-badge { display: none; }
+.lod-tiny .hull text { font-size: 28px; } /* far out, a project's name labels its whole cluster */
+
+/* the new-container dialog and the sheet's extra blocks */
+dialog.modal.wide { width: min(640px, calc(100vw - 32px)); }
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.form-grid .field { align-content: start; }
+.form-grid .env-field, .form-grid .field:has(#create-restart) { grid-column: 1 / -1; }
+textarea.input { height: auto; padding: 8px 14px; border-radius: 12px; resize: vertical; }
+#create-restart { flex-wrap: wrap; height: auto; min-height: var(--control-height); row-gap: 4px; }
+#create-restart button { height: var(--control-height); }
+.checks { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+.check { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.check input { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }
+pre.logs { max-height: 360px; font-size: 11.5px; line-height: 17px; white-space: pre-wrap; overflow-wrap: anywhere; } /* taste-skill-ignore: data-terminal style */
+.danger-zone { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.danger-zone h3 { margin-bottom: 4px; }
+.snap-form { margin-bottom: 8px; flex-wrap: nowrap; }
+.snap-form .grow-field { flex: 1; min-width: 0; } .snap-form .input { width: 100%; }
+.engine-row { padding: 6px 0; } .engine-row + .engine-row { border-top: 1px solid var(--rule); padding-top: 14px; }
+.engine-row .mono { font-size: var(--fs-small); }
+.neg-text { color: var(--negative); }
 
 /* ---------- settings ---------- */
 .setting { display: grid; grid-template-columns: minmax(0, 380px) minmax(0, 1fr); gap: 24px 48px; padding: 28px 0; }
@@ -478,6 +576,14 @@ dialog.sheet[open] { animation: sheet-in var(--t-ui) var(--ease-out); }
   .facts div:nth-child(n + 3) { border-top: 1px solid var(--border); }
   #toasts { left: 16px; right: 16px; bottom: 76px; }
   td.data { min-width: 18ch; }
+  .map-tools { width: 100%; }
+  .map-tools .search { flex: 1 1 100%; } .map-tools .search .input { width: 100%; }
+  .topo { height: 480px; }
+  .topo-card { top: auto; bottom: 12px; left: 12px; right: 12px; width: auto; max-height: 55%; }
+  .topo-mini { display: none !important; }
+  .topo-hint { max-width: calc(100% - 70px); }
+  .form-grid { grid-template-columns: minmax(0, 1fr); }
+  .danger-zone { flex-wrap: wrap; }
   /* the patch bay scrolls sideways under a pinned container column */
   .bay { --card-col: 216px; grid-template-columns: var(--card-col) repeat(var(--cols, 1), 96px); }
   .ct-cell, .bay-corner { position: sticky; left: 0; background: var(--surface); }

@@ -422,7 +422,8 @@ func (d *Docker) Action(ctx context.Context, id, action string) error {
 	if !slices.Contains(Actions, action) {
 		return fmt.Errorf("unknown action %q", action)
 	}
-	return d.call(ctx, "POST", "/containers/"+url.PathEscape(id)+"/"+action, nil, nil, nil)
+	verb := map[string]string{"pause": "pause", "resume": "unpause"}[action]
+	return d.call(ctx, "POST", "/containers/"+url.PathEscape(id)+"/"+cmpOr(verb, action), nil, nil, nil)
 }
 
 func (d *Docker) Connect(ctx context.Context, id, network string) error {
@@ -766,3 +767,166 @@ func selfFromMountinfo(b []byte) string {
 	}
 	return ""
 }
+
+// raw is call for endpoints that do not answer in JSON (logs, image pulls).
+func (d *Docker) raw(ctx context.Context, method, path string, q url.Values) (*response, error) {
+	prefix, err := d.negotiate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := d.c.do(ctx, method, prefix+path, q, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("docker: %w", err)
+	}
+	if resp.status >= 300 {
+		var e struct{ Message string }
+		_ = json.Unmarshal(resp.body, &e)
+		return nil, &APIError{Engine: "docker", Status: resp.status, Message: cmpOr(e.Message, strings.TrimSpace(string(resp.body)))}
+	}
+	return resp, nil
+}
+
+// pull fetches an image unless it is already there. The daemon streams
+// progress as JSON lines and reports a failure as a line with "error",
+// still under HTTP 200.
+func (d *Docker) pull(ctx context.Context, ref string) error {
+	var img struct{}
+	if err := d.call(ctx, "GET", "/images/"+ref+"/json", nil, nil, &img); err == nil {
+		return nil
+	}
+	from := ref
+	if last := from[strings.LastIndex(from, "/")+1:]; !strings.ContainsAny(last, ":@") {
+		from += ":latest" // without a tag the API would pull every tag
+	}
+	resp, err := d.raw(ctx, "POST", "/images/create", url.Values{"fromImage": {from}})
+	if err != nil {
+		return fmt.Errorf("pulling %s: %w", ref, err)
+	}
+	sc := bufio.NewScanner(bytes.NewReader(resp.body))
+	sc.Buffer(make([]byte, 64<<10), 1<<20)
+	for sc.Scan() {
+		var line struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(sc.Bytes(), &line) == nil && line.Error != "" {
+			return fmt.Errorf("pulling %s: %s", ref, line.Error)
+		}
+	}
+	return nil
+}
+
+func (d *Docker) Create(ctx context.Context, spec CreateSpec) (string, error) {
+	if !imageRefRE.MatchString(spec.Image) {
+		return "", fmt.Errorf("%q is not an image reference", spec.Image)
+	}
+	if spec.VM {
+		return "", errors.New("Docker runs containers only")
+	}
+	if spec.Restart != "" && !slices.Contains(d.RestartPolicies(), spec.Restart) {
+		return "", fmt.Errorf("unknown restart policy %q", spec.Restart)
+	}
+	if spec.MemoryMB > 0 && spec.MemoryMB < 6 {
+		return "", errors.New("a Docker memory limit is 0 (none) or at least 6 MB")
+	}
+	if err := d.pull(ctx, spec.Image); err != nil {
+		return "", err
+	}
+	bindings := map[string][]map[string]string{}
+	exposed := map[string]any{}
+	for _, p := range spec.Ports {
+		key := fmt.Sprintf("%d/%s", p.ContainerPort, p.Proto)
+		hp := ""
+		if p.HostPort > 0 {
+			hp = strconv.Itoa(p.HostPort)
+		}
+		bindings[key] = append(bindings[key], map[string]string{"HostIp": p.HostIP, "HostPort": hp})
+		exposed[key] = map[string]any{}
+	}
+	hc := map[string]any{
+		"PortBindings":  bindings,
+		"RestartPolicy": map[string]any{"Name": cmpOr(spec.Restart, "no")},
+	}
+	if spec.MemoryMB > 0 {
+		hc["Memory"], hc["MemorySwap"] = spec.MemoryMB<<20, -1
+	}
+	if spec.CPUs > 0 {
+		hc["NanoCpus"] = int64(spec.CPUs * 1e9)
+	}
+	if spec.Network != "" {
+		hc["NetworkMode"] = spec.Network
+	}
+	body := map[string]any{
+		"Image":        spec.Image,
+		"Env":          spec.Env,
+		"ExposedPorts": exposed,
+		"Labels":       map[string]string{"io.skyguard.created": "dashboard"},
+		"HostConfig":   hc,
+	}
+	var created struct {
+		ID string `json:"Id"`
+	}
+	if err := d.call(ctx, "POST", "/containers/create", url.Values{"name": {spec.Name}}, body, &created); err != nil {
+		return "", err
+	}
+	if spec.Start {
+		if err := d.Action(ctx, created.ID, "start"); err != nil {
+			return created.ID, fmt.Errorf("created, but it did not start: %w", err)
+		}
+	}
+	return created.ID, nil
+}
+
+// Remove deletes a container (stopping it first). Named volumes always
+// stay; anonymous ones go only when volumes is set.
+func (d *Docker) Remove(ctx context.Context, id string, volumes bool) error {
+	q := url.Values{"force": {"1"}}
+	if volumes {
+		q.Set("v", "1")
+	}
+	return d.call(ctx, "DELETE", "/containers/"+url.PathEscape(id), q, nil, nil)
+}
+
+// Logs returns the last lines of a container's stdout and stderr.
+func (d *Docker) Logs(ctx context.Context, id string, lines int) (string, error) {
+	resp, err := d.raw(ctx, "GET", "/containers/"+url.PathEscape(id)+"/logs", url.Values{
+		"stdout": {"1"}, "stderr": {"1"}, "timestamps": {"1"}, "tail": {strconv.Itoa(lines)},
+	})
+	if err != nil {
+		return "", err
+	}
+	if strings.Contains(resp.header.Get("Content-Type"), "multiplexed") || looksMultiplexed(resp.body) {
+		return demux(resp.body), nil
+	}
+	return string(resp.body), nil // a TTY container: one raw stream
+}
+
+// looksMultiplexed recognises Docker's stream framing on daemons that do
+// not label it: a stream byte of 0-2, then three zero bytes.
+func looksMultiplexed(b []byte) bool {
+	return len(b) >= 8 && b[0] <= 2 && b[1] == 0 && b[2] == 0 && b[3] == 0
+}
+
+// demux strips the 8-byte frame headers of a stdout/stderr stream.
+func demux(b []byte) string {
+	var out strings.Builder
+	for len(b) >= 8 {
+		n := int(b[4])<<24 | int(b[5])<<16 | int(b[6])<<8 | int(b[7])
+		b = b[8:]
+		if n > len(b) {
+			n = len(b)
+		}
+		out.Write(b[:n])
+		b = b[n:]
+	}
+	return out.String()
+}
+
+func (d *Docker) DeleteNetwork(ctx context.Context, name string) error {
+	if name == "bridge" || pseudoNetworks[name] {
+		return fmt.Errorf("%s is one of Docker's own networks", name)
+	}
+	return d.call(ctx, "DELETE", "/networks/"+url.PathEscape(name), nil, nil, nil)
+}
+
+// Socket is the unix socket the client talks to.
+func (x *Docker) Socket() string { return x.c.socket }

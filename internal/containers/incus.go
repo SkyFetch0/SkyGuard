@@ -315,7 +315,8 @@ func (x *Incus) Action(ctx context.Context, id, action string) error {
 	if !slices.Contains(Actions, action) {
 		return fmt.Errorf("unknown action %q", action)
 	}
-	_, err := x.call(ctx, "PUT", x.path(id)+"/state", nil, map[string]any{"action": action, "timeout": 30}, nil, nil)
+	verb := map[string]string{"pause": "freeze", "resume": "unfreeze"}[action]
+	_, err := x.call(ctx, "PUT", x.path(id)+"/state", nil, map[string]any{"action": cmpOr(verb, action), "timeout": 30}, nil, nil)
 	return err
 }
 
@@ -328,6 +329,7 @@ type incusPut struct {
 	Profiles     []string               `json:"profiles"`
 	Stateful     bool                   `json:"stateful"`
 	Description  string                 `json:"description"`
+	Restore      string                 `json:"restore,omitempty"`
 }
 
 // modify reads an instance, lets fn change it and writes it back, guarded
@@ -513,3 +515,180 @@ func (x *Incus) Update(ctx context.Context, id string, s Settings) error {
 		return nil
 	})
 }
+
+// imageServers are the remotes a new instance can come from, by prefix.
+var imageServers = map[string]string{
+	"images": "https://images.linuxcontainers.org",
+}
+
+// imageSource reads "images:debian/12" (a public image server) or a bare
+// alias or fingerprint of an image already on this host.
+func imageSource(ref string) (map[string]any, error) {
+	if ref == "" || strings.ContainsAny(ref, " \t\n\"'") {
+		return nil, fmt.Errorf("%q is not an image", ref)
+	}
+	if remote, alias, ok := strings.Cut(ref, ":"); ok {
+		server, known := imageServers[remote]
+		if !known {
+			return nil, fmt.Errorf("unknown image server %q (use images:<distro>/<release>, or an image already on this host)", remote)
+		}
+		return map[string]any{"type": "image", "alias": alias, "server": server, "protocol": "simplestreams", "mode": "pull"}, nil
+	}
+	return map[string]any{"type": "image", "alias": ref}, nil
+}
+
+func (x *Incus) Create(ctx context.Context, spec CreateSpec) (string, error) {
+	src, err := imageSource(spec.Image)
+	if err != nil {
+		return "", err
+	}
+	if len(spec.Env) > 0 {
+		return "", errors.New("environment variables are a Docker setting; set Incus config keys with incus config set")
+	}
+	typ := "container"
+	if spec.VM {
+		typ = "virtual-machine"
+		if len(spec.Ports) > 0 {
+			return "", errors.New("virtual machines take only NAT proxy devices with a fixed address; add ports later with incus config device add")
+		}
+	}
+	cfg := map[string]string{}
+	switch spec.Restart {
+	case "always":
+		cfg["boot.autostart"] = "true"
+	case "no":
+		cfg["boot.autostart"] = "false"
+	case "", "last-state":
+	default:
+		return "", fmt.Errorf("unknown restart policy %q", spec.Restart)
+	}
+	if spec.MemoryMB > 0 {
+		cfg["limits.memory"] = fmt.Sprintf("%dMiB", spec.MemoryMB)
+	}
+	if spec.CPUs > 0 {
+		if spec.CPUs != math.Trunc(spec.CPUs) {
+			return "", errors.New("Incus takes a whole number of CPUs")
+		}
+		cfg["limits.cpu"] = strconv.Itoa(int(spec.CPUs))
+	}
+	devices := map[string]incusDevice{}
+	if spec.Network != "" {
+		devices["eth0"] = incusDevice{"type": "nic", "network": spec.Network, "name": "eth0"}
+	}
+	for _, p := range spec.Ports {
+		if p.HostPort == 0 {
+			return "", errors.New("Incus needs a fixed host port")
+		}
+		devices[fmt.Sprintf("proxy-%s-%d", p.Proto, p.HostPort)] = incusDevice{
+			"type": "proxy", "listen": proxyAddr(p.Proto, p.HostIP, p.HostPort), "connect": proxyAddr(p.Proto, "127.0.0.1", p.ContainerPort),
+		}
+	}
+	body := map[string]any{"name": spec.Name, "type": typ, "source": src, "profiles": []string{"default"},
+		"config": cfg, "devices": devices, "description": "created from the SkyGuard dashboard"}
+	if _, err := x.call(ctx, "POST", "/1.0/instances", nil, body, nil, nil); err != nil {
+		return "", err
+	}
+	if spec.Start {
+		if err := x.Action(ctx, spec.Name, "start"); err != nil {
+			return spec.Name, fmt.Errorf("created, but it did not start: %w", err)
+		}
+	}
+	return spec.Name, nil
+}
+
+// Remove stops the instance if it runs and deletes it with its snapshots.
+// Incus keeps no separate volumes for an instance's root disk, so volumes
+// changes nothing here; custom volumes attached to it are never deleted.
+func (x *Incus) Remove(ctx context.Context, id string, _ bool) error {
+	var st struct {
+		Status string `json:"status"`
+	}
+	if _, err := x.call(ctx, "GET", x.path(id)+"/state", nil, nil, nil, &st); err != nil {
+		return err
+	}
+	if st.Status != "Stopped" {
+		if _, err := x.call(ctx, "PUT", x.path(id)+"/state", nil, map[string]any{"action": "stop", "timeout": 30, "force": true}, nil, nil); err != nil {
+			return fmt.Errorf("stopping before removal: %w", err)
+		}
+	}
+	_, err := x.call(ctx, "DELETE", x.path(id), nil, nil, nil, nil)
+	return err
+}
+
+// Logs returns the end of the instance's console log, or of its LXC log
+// when the console log is not available.
+func (x *Incus) Logs(ctx context.Context, id string, lines int) (string, error) {
+	q := url.Values{}
+	if x.project != "" {
+		q.Set("project", x.project)
+	}
+	for _, path := range []string{x.path(id) + "/console", x.path(id) + "/logs/lxc.log"} {
+		resp, err := x.c.do(ctx, "GET", path, q, nil, nil)
+		if err != nil {
+			return "", fmt.Errorf("incus: %w", err)
+		}
+		if resp.status == 200 && !strings.HasPrefix(resp.header.Get("Content-Type"), "application/json") {
+			return lastLines(string(resp.body), lines), nil
+		}
+	}
+	return "", &APIError{Engine: "incus", Status: 404, Message: "no console or LXC log for " + id}
+}
+
+func lastLines(s string, n int) string {
+	s = strings.TrimRight(s, "\n")
+	parts := strings.Split(s, "\n")
+	if len(parts) > n {
+		parts = parts[len(parts)-n:]
+	}
+	return strings.Join(parts, "\n") + "\n"
+}
+
+func (x *Incus) DeleteNetwork(ctx context.Context, name string) error {
+	_, err := x.call(ctx, "DELETE", "/1.0/networks/"+url.PathEscape(name), nil, nil, nil, nil)
+	return err
+}
+
+func (x *Incus) Snapshots(ctx context.Context, id string) ([]InstanceSnapshot, error) {
+	var raw []struct {
+		Name      string    `json:"name"`
+		CreatedAt time.Time `json:"created_at"`
+		Stateful  bool      `json:"stateful"`
+	}
+	if _, err := x.call(ctx, "GET", x.path(id)+"/snapshots", url.Values{"recursion": {"1"}}, nil, nil, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]InstanceSnapshot, 0, len(raw))
+	for _, r := range raw {
+		out = append(out, InstanceSnapshot{Name: r.Name, Created: r.CreatedAt, Stateful: r.Stateful})
+	}
+	slices.SortFunc(out, func(a, b InstanceSnapshot) int { return b.Created.Compare(a.Created) })
+	return out, nil
+}
+
+func (x *Incus) TakeSnapshot(ctx context.Context, id, name string) error {
+	_, err := x.call(ctx, "POST", x.path(id)+"/snapshots", nil, map[string]any{"name": name}, nil, nil)
+	return err
+}
+
+// RestoreSnapshot puts the instance back to the snapshot; what changed
+// since is lost.
+func (x *Incus) RestoreSnapshot(ctx context.Context, id, name string) error {
+	return x.modify(ctx, id, func(_ *incusInstance, put *incusPut) error {
+		put.Restore = name
+		return nil
+	})
+}
+
+func (x *Incus) DeleteSnapshot(ctx context.Context, id, name string) error {
+	_, err := x.call(ctx, "DELETE", x.path(id)+"/snapshots/"+url.PathEscape(name), nil, nil, nil, nil)
+	return err
+}
+
+var (
+	_ Engine      = (*Incus)(nil)
+	_ Snapshotter = (*Incus)(nil)
+	_ Engine      = (*Docker)(nil)
+)
+
+// Socket is the unix socket the client talks to.
+func (x *Incus) Socket() string { return x.c.socket }

@@ -32,22 +32,102 @@ type Manager struct {
 
 	// Reserved lists the host ports SkyGuard listens on; set by the server.
 	Reserved func() []Reserved
+	// OnSwitch is asked before an engine is switched from the dashboard; it
+	// refuses (an error) or stores the choice. Set by the server.
+	OnSwitch func(engine string, on bool) error
 
-	mu sync.Mutex
+	mu sync.Mutex // one change at a time
+
+	stateMu sync.RWMutex
+	enabled map[string]bool
 }
 
-// NewManager returns a manager for the given engines.
+// NewManager returns a manager for the given engines, all switched on.
 func NewManager(engines []Engine, readOnly bool, logger *slog.Logger) *Manager {
-	return &Manager{engines: engines, readOnly: readOnly, logger: logger}
+	m := &Manager{engines: engines, readOnly: readOnly, logger: logger, enabled: map[string]bool{}}
+	for _, e := range engines {
+		m.enabled[e.Name()] = true
+	}
+	return m
 }
 
-// EngineStatus says whether an engine answered.
+// SetInitial sets an engine's state without asking OnSwitch (start-up).
+func (m *Manager) SetInitial(engine string, on bool) {
+	m.stateMu.Lock()
+	m.enabled[engine] = on
+	m.stateMu.Unlock()
+}
+
+// Enabled reports whether an engine is switched on.
+func (m *Manager) Enabled(engine string) bool {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.enabled[engine]
+}
+
+// AnyEnabled reports whether at least one engine is switched on.
+func (m *Manager) AnyEnabled() bool {
+	for _, e := range m.engines {
+		if m.Enabled(e.Name()) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetEngineEnabled switches an engine on or off from the dashboard. Turning
+// one on is refused while its socket does not answer, so a typo'd path or a
+// missing mount says so at once.
+func (m *Manager) SetEngineEnabled(ctx context.Context, engine string, on bool) error {
+	var e Engine
+	for _, x := range m.engines {
+		if x.Name() == engine {
+			e = x
+		}
+	}
+	if e == nil {
+		return fmt.Errorf("unknown container engine %q", engine)
+	}
+	if on {
+		ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		defer cancel()
+		if _, err := e.Version(ctx); err != nil {
+			return errors.New(friendlyError(engine, err))
+		}
+	}
+	if m.OnSwitch != nil {
+		if err := m.OnSwitch(engine, on); err != nil {
+			return err
+		}
+	}
+	m.SetInitial(engine, on)
+	m.logger.Info("container engine switched from the dashboard", "engine", engine, "enabled", on)
+	return nil
+}
+
+func (m *Manager) active() []Engine {
+	var out []Engine
+	for _, e := range m.engines {
+		if m.Enabled(e.Name()) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// socketed engines say which socket they use.
+type socketed interface{ Socket() string }
+
+// EngineStatus says whether an engine is on and whether it answered.
 type EngineStatus struct {
 	Name      string   `json:"name"`
+	Enabled   bool     `json:"enabled"`
+	Socket    string   `json:"socket,omitempty"`
 	Available bool     `json:"available"`
 	Version   string   `json:"version,omitempty"`
 	Error     string   `json:"error,omitempty"`
 	Restart   []string `json:"restart_policies"`
+	Snapshots bool     `json:"snapshots"`
 }
 
 // Snapshot is every engine's containers and networks at one moment.
@@ -75,7 +155,15 @@ func (m *Manager) Snapshot(ctx context.Context) Snapshot {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 			defer cancel()
-			r := result{st: EngineStatus{Name: e.Name(), Restart: e.RestartPolicies()}, index: i}
+			r := result{st: EngineStatus{Name: e.Name(), Restart: e.RestartPolicies(), Enabled: m.Enabled(e.Name())}, index: i}
+			if s, ok := e.(socketed); ok {
+				r.st.Socket = s.Socket()
+			}
+			_, r.st.Snapshots = e.(Snapshotter)
+			if !r.st.Enabled {
+				results[i] = r
+				return
+			}
 			v, err := e.Version(ctx)
 			if err == nil {
 				r.cs, r.ns, err = e.List(ctx)
@@ -137,7 +225,7 @@ func friendlyError(engine string, err error) string {
 }
 
 func (m *Manager) engine(name string) (Engine, error) {
-	for _, e := range m.engines {
+	for _, e := range m.active() {
 		if e.Name() == name {
 			return e, nil
 		}
@@ -281,7 +369,7 @@ func (m *Manager) checkPorts(ctx context.Context, c *Container, ports []Port) er
 		mine[fmt.Sprintf("%d/%s", p.HostPort, p.Proto)] = true
 	}
 	var others []Container
-	for _, e := range m.engines {
+	for _, e := range m.active() {
 		cs, _, err := e.List(ctx)
 		if err != nil {
 			continue
@@ -411,4 +499,137 @@ func HostPorts(snap Snapshot, reserved []Reserved) []PortUse {
 		return strings.Compare(out[i].Proto, out[j].Proto) < 0
 	})
 	return out
+}
+
+// Create makes a new container or instance after the same checks a port
+// change gets, and returns it.
+func (m *Manager) Create(ctx context.Context, engine string, spec CreateSpec) (*Container, error) {
+	if m.readOnly {
+		return nil, ErrReadOnly
+	}
+	if !ValidName(spec.Name) {
+		return nil, fmt.Errorf("%q is not a valid name (letters, digits, . _ -, starting with a letter or digit)", spec.Name)
+	}
+	if spec.Network != "" && !ValidName(spec.Network) {
+		return nil, fmt.Errorf("%q is not a valid network name", spec.Network)
+	}
+	e, err := m.engine(engine)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.checkPorts(ctx, &Container{Engine: engine}, spec.Ports); err != nil {
+		return nil, err
+	}
+	id, err := e.Create(ctx, spec)
+	if err != nil && id == "" {
+		m.logger.Warn("container create failed", "engine", engine, "name", spec.Name, "image", spec.Image, "error", err)
+		return nil, err
+	}
+	m.logger.Info("container created from the dashboard", "engine", engine, "name", spec.Name, "image", spec.Image)
+	c, ierr := e.Inspect(ctx, spec.Name)
+	if ierr != nil {
+		return nil, cmpErr(err, ierr)
+	}
+	c.fill()
+	return c, err
+}
+
+func cmpErr(a, b error) error {
+	if a != nil {
+		return a
+	}
+	return b
+}
+
+// Remove deletes a container. SkyGuard's own cannot be removed.
+func (m *Manager) Remove(ctx context.Context, engine, id string, volumes bool) error {
+	_, err := m.change(ctx, engine, id, "remove", func(e Engine, c *Container) error {
+		if c.Self {
+			return ErrSelf
+		}
+		return e.Remove(ctx, c.ID, volumes)
+	})
+	return err
+}
+
+// Logs returns the last lines a container wrote. Reading is allowed in
+// read-only mode.
+func (m *Manager) Logs(ctx context.Context, engine, id string, lines int) (string, error) {
+	e, err := m.engine(engine)
+	if err != nil {
+		return "", err
+	}
+	return e.Logs(ctx, id, min(max(lines, 10), 2000))
+}
+
+// DeleteNetwork removes a network no container is on.
+func (m *Manager) DeleteNetwork(ctx context.Context, engine, name string) error {
+	if m.readOnly {
+		return ErrReadOnly
+	}
+	if !ValidName(name) {
+		return fmt.Errorf("%q is not a valid network name", name)
+	}
+	e, err := m.engine(engine)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := e.DeleteNetwork(ctx, name); err != nil {
+		return err
+	}
+	m.logger.Info("network deleted from the dashboard", "engine", engine, "network", name)
+	return nil
+}
+
+// ErrNoSnapshots is returned for engines that keep no snapshots (Docker).
+var ErrNoSnapshots = errors.New("this engine keeps no snapshots")
+
+func (m *Manager) snapshotter(engine string) (Snapshotter, error) {
+	e, err := m.engine(engine)
+	if err != nil {
+		return nil, err
+	}
+	s, ok := e.(Snapshotter)
+	if !ok {
+		return nil, ErrNoSnapshots
+	}
+	return s, nil
+}
+
+// Snapshots lists an instance's snapshots, newest first.
+func (m *Manager) Snapshots(ctx context.Context, engine, id string) ([]InstanceSnapshot, error) {
+	s, err := m.snapshotter(engine)
+	if err != nil {
+		return nil, err
+	}
+	return s.Snapshots(ctx, id)
+}
+
+// SnapshotAction takes ("take"), restores or deletes a snapshot.
+func (m *Manager) SnapshotAction(ctx context.Context, engine, id, action, name string) (*Container, error) {
+	s, err := m.snapshotter(engine)
+	if err != nil {
+		return nil, err
+	}
+	if !ValidName(name) {
+		return nil, fmt.Errorf("%q is not a valid snapshot name", name)
+	}
+	return m.change(ctx, engine, id, "snapshot "+action+" "+name, func(_ Engine, c *Container) error {
+		switch action {
+		case "take":
+			return s.TakeSnapshot(ctx, c.ID, name)
+		case "restore":
+			if c.Self {
+				return ErrSelf
+			}
+			return s.RestoreSnapshot(ctx, c.ID, name)
+		case "delete":
+			return s.DeleteSnapshot(ctx, c.ID, name)
+		}
+		return fmt.Errorf("unknown snapshot action %q", action)
+	})
 }

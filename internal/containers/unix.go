@@ -14,8 +14,9 @@ import (
 
 // unixClient speaks HTTP to a daemon over its unix socket.
 type unixClient struct {
-	http *http.Client
-	host string // the Host header; the address is the socket
+	http   *http.Client
+	host   string // the Host header; the address is the socket
+	socket string
 }
 
 func newUnixClient(socket, host string) *unixClient {
@@ -28,7 +29,7 @@ func newUnixClient(socket, host string) *unixClient {
 	}
 	// No client-wide timeout: stopping a container legitimately takes as long
 	// as its stop timeout. Every call carries a context deadline instead.
-	return &unixClient{http: &http.Client{Transport: tr}, host: host}
+	return &unixClient{http: &http.Client{Transport: tr}, host: host, socket: socket}
 }
 
 // response is a raw reply: the status, headers and (capped) body.

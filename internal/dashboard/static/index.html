@@ -245,34 +245,57 @@
           <div class="choice" role="group" aria-label="Container engine" id="ct-engines" hidden></div>
           <span class="stamp" data-stamp>—</span>
           <button class="icon-btn" type="button" data-action="refresh" aria-label="Refresh now"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button>
+          <button class="btn primary" type="button" data-action="ct-new" id="ct-new">New container</button>
         </div>
       </div>
-      <article class="panel">
-        <header><h2>Patch bay</h2><span class="meta" id="bay-meta">Click a container's socket, then another container or a network</span></header>
-        <div class="bay-wrap" id="bay-wrap"><div class="bay" id="bay"></div></div>
+      <article class="panel map-panel">
+        <header>
+          <h2 id="map-title">Network map</h2>
+          <div class="map-tools">
+            <label class="search"><span class="sr-only">Find a container, image, port or address</span>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+              <input class="input" id="ct-search" type="search" placeholder="Find a container, image, port, IP…" autocomplete="off" spellcheck="false">
+            </label>
+            <div class="choice" role="group" aria-label="Show" id="ct-state-filter">
+              <button type="button" data-ctfilter="all" aria-pressed="true">All</button>
+              <button type="button" data-ctfilter="running" aria-pressed="false">Running</button>
+            </div>
+            <div class="choice" role="group" aria-label="View" id="ct-view">
+              <button type="button" data-ctview="map" aria-pressed="true">Map</button>
+              <button type="button" data-ctview="table" aria-pressed="false">Table</button>
+            </div>
+          </div>
+        </header>
+        <div class="topo" id="topo">
+          <aside class="topo-card" id="topo-card" aria-live="polite" hidden></aside>
+          <p class="topo-hint" id="topo-hint">Select a container, then pull a cable from its plug onto another container or a switch. Drag to move, scroll to zoom, double-click to open.</p>
+        </div>
+        <div class="bay-wrap" id="bay-wrap" hidden><div class="bay" id="bay"></div></div>
         <p class="stamp bay-help" id="bay-help" role="status"></p>
       </article>
       <div class="grid">
-        <article class="panel span-7">
-          <header><h2>Host ports</h2><span class="meta" id="hp-meta">Who holds each port on this server</span></header>
-          <div class="table-wrap"><table>
-            <thead><tr><th class="n">Port</th><th>Held by</th><th>Forwards to</th><th class="n">State</th></tr></thead>
-            <tbody id="host-ports"></tbody>
-          </table></div>
-        </article>
-        <div class="span-5 stack">
+        <div class="span-7 stack">
           <article class="panel">
+            <header><h2>Host ports</h2><span class="meta" id="hp-meta">Who holds each port on this server</span></header>
+            <div class="table-wrap"><table>
+              <thead><tr><th class="n">Port</th><th>Held by</th><th>Forwards to</th><th class="n">State</th></tr></thead>
+              <tbody id="host-ports"></tbody>
+            </table></div>
+          </article>
+          <article class="panel grow">
+            <header><h2>Open to the internet</h2><span class="meta" id="open-meta"></span></header>
+            <p class="cover" id="ban-cover"></p>
+            <ol class="rank" id="open-ports"></ol>
+          </article>
+        </div>
+        <div class="span-5 stack">
+          <article class="panel grow">
             <header><h2>Networks</h2><span class="meta" id="net-meta"></span></header>
             <ol class="rank" id="ct-networks"></ol>
             <form class="filters net-form" id="net-form">
               <label class="grow-field"><span class="sr-only">New network name</span><input class="input mono" name="name" placeholder="New network, e.g. backend…" maxlength="63" autocomplete="off" spellcheck="false" translate="no" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*"></label>
               <button class="btn" type="submit" id="net-submit">Create network</button>
             </form>
-          </article>
-          <article class="panel grow">
-            <header><h2>Open to the internet</h2><span class="meta" id="open-meta"></span></header>
-            <p class="cover" id="ban-cover"></p>
-            <ol class="rank" id="open-ports"></ol>
           </article>
         </div>
       </div>
@@ -308,6 +331,10 @@
             </div>
             <div class="form-actions"><button class="btn primary" type="submit" id="set-submit">Save changes</button><span class="stamp" id="set-msg" role="status"></span></div>
           </form>
+        </div>
+        <div class="setting">
+          <div><h2>Container engines</h2><p>Let the dashboard manage this server's Docker containers and Incus instances. Either socket is equivalent to root, so this needs a strong dashboard password. With docker compose, mount the socket into SkyGuard's container first.</p></div>
+          <div class="panel" id="engine-switches"><div class="muted">Loading…</div></div>
         </div>
         <div class="setting">
           <div><h2>Firewall</h2><p id="fw-desc">The rules SkyGuard keeps in its own SKYGUARD chain.</p></div>
@@ -369,6 +396,29 @@
   </form>
 </dialog>
 
+<!-- A new container or instance -->
+<dialog class="modal wide" id="create-dialog" aria-labelledby="create-title">
+  <form method="dialog" id="create-form">
+    <h2 id="create-title">New container</h2>
+    <div class="form-grid">
+      <label class="field"><span>Name</span><input class="input mono" name="name" required maxlength="63" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*" autocomplete="off" spellcheck="false" translate="no" placeholder="web…"></label>
+      <label class="field"><span>Image</span><input class="input mono" name="image" required list="image-hints" autocomplete="off" spellcheck="false" translate="no" placeholder="nginx:alpine…"><datalist id="image-hints"></datalist><span class="hint" id="image-hint"></span></label>
+      <label class="field"><span>Published ports <span class="muted">(optional)</span></span><input class="input mono" name="ports" autocomplete="off" spellcheck="false" placeholder="8080:80, 127.0.0.1:5432:5432…"><span class="hint">host:container, comma separated</span></label>
+      <label class="field"><span>Network</span><select class="input" name="network" id="create-network"></select></label>
+      <label class="field env-field"><span>Environment <span class="muted">(optional)</span></span><textarea class="input mono" name="env" rows="3" spellcheck="false" placeholder="KEY=value, one per line…"></textarea></label>
+      <div class="field"><span>When it stops</span><div class="choice" role="group" aria-label="Restart policy" id="create-restart"></div></div>
+      <label class="field"><span>Memory limit</span><span class="unit-input"><input class="input mono" name="memory_mb" type="number" min="0" step="1" value="0" inputmode="numeric"><span>MB</span></span></label>
+      <label class="field"><span>CPU limit</span><span class="unit-input"><input class="input mono" name="cpus" type="number" min="0" step="0.25" value="0" inputmode="decimal"><span>CPUs</span></span></label>
+    </div>
+    <div class="checks">
+      <label class="check"><input type="checkbox" name="start" checked> Start it now</label>
+      <label class="check" id="create-vm-row"><input type="checkbox" name="vm"> A virtual machine, not a container</label>
+    </div>
+    <p class="stamp" id="create-error" role="alert"></p>
+    <div class="dialog-actions"><button class="btn" type="button" data-action="close-dialog">Cancel</button><button class="btn primary" type="submit" id="create-submit">Create</button></div>
+  </form>
+</dialog>
+
 <!-- One container, in detail -->
 <dialog class="sheet" id="ct-sheet" aria-labelledby="ct-title">
   <div class="sheet-body">
@@ -394,11 +444,25 @@
       <div class="form-actions"><button class="btn primary" type="submit" id="limits-submit">Save</button><span class="stamp" id="limits-msg" role="status"></span></div>
     </form>
     <div id="ct-mounts-block"><h3>Storage</h3><ul class="mounts" id="ct-mounts"></ul></div>
+    <div id="ct-snaps-block" hidden>
+      <div class="sheet-form-head"><h3>Snapshots</h3></div>
+      <form class="filters snap-form" id="snap-form"><label class="grow-field"><span class="sr-only">Snapshot name</span><input class="input mono" name="name" maxlength="63" autocomplete="off" spellcheck="false" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*"></label><button class="btn" type="submit" id="snap-submit">Take snapshot</button></form>
+      <div class="table-wrap"><table><thead><tr><th>Snapshot</th><th class="n">Taken</th><th></th></tr></thead><tbody id="ct-snaps"></tbody></table></div>
+    </div>
+    <div>
+      <div class="sheet-form-head"><h3>Logs</h3><span class="form-actions"><span class="stamp" id="logs-meta"></span><button class="card-link" type="button" data-action="ct-logs">Load the last 200 lines</button></span></div>
+      <pre class="rules logs" id="ct-logs" hidden></pre>
+    </div>
+    <div class="danger-zone" id="ct-danger">
+      <div><h3>Remove</h3><p class="hint" id="remove-hint"></p></div>
+      <button class="btn danger" type="button" data-action="ct-remove">Remove…</button>
+    </div>
   </div>
 </dialog>
 
 <div id="toasts" aria-live="polite"></div>
 <script src="/assets/charts.js"></script>
+<script src="/assets/topology.js"></script>
 <script src="/assets/app.js"></script>
 </body>
 </html>

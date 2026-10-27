@@ -187,6 +187,33 @@ func TestDockerIntegration(t *testing.T) {
 	if !snap.Engines[0].Available || len(HostPorts(snap, nil)) == 0 {
 		t.Fatalf("snapshot %+v", snap.Engines)
 	}
+
+	// A new container from the panel: pulled if needed, on a network, started.
+	newPorts, _ := ParsePorts("18400:80")
+	c, err := m.Create(ctx, "docker", CreateSpec{Name: "sg-it-new", Image: "nginx:alpine", Ports: newPorts, Network: "sg-it-a",
+		Env: []string{"GREETING=hi"}, Restart: "unless-stopped", MemoryMB: 64, Start: true})
+	if err != nil || !c.Running || c.Ports[0].HostPort != 18400 || c.Networks[0].Network != "sg-it-a" || c.Restart != "unless-stopped" {
+		t.Fatalf("create: %+v %v", c, err)
+	}
+	if out := sh(t, "docker", "exec", "sg-it-new", "printenv", "GREETING"); out != "hi" {
+		t.Fatalf("env %q", out)
+	}
+	if _, err := m.Create(ctx, "docker", CreateSpec{Name: "sg-it-dup", Image: "nginx:alpine", Ports: newPorts}); err == nil {
+		t.Fatal("a second container on the same host port was created")
+	}
+	logs, err := m.Logs(ctx, "docker", "sg-it-new", 50)
+	if err != nil || !strings.Contains(logs, "nginx") {
+		t.Fatalf("logs %q %v", logs, err)
+	}
+	if err := m.Remove(ctx, "docker", "sg-it-new", false); err != nil {
+		t.Fatal(err)
+	}
+	if out := sh(t, "docker", "ps", "-aq", "--filter", "name=sg-it-new"); out != "" {
+		t.Fatal("not removed")
+	}
+	if err := m.DeleteNetwork(ctx, "docker", "bridge"); err == nil {
+		t.Fatal("Docker's default bridge deleted")
+	}
 }
 
 func TestIncusIntegration(t *testing.T) {
@@ -262,5 +289,49 @@ func TestIncusIntegration(t *testing.T) {
 	}
 	if !find(t, x, name).Running {
 		t.Fatal("not running after restart")
+	}
+
+	// Pause and resume (freeze).
+	if c, err := m.Action(ctx, "incus", name, "pause"); err != nil || c.State != "frozen" {
+		t.Fatalf("pause: %+v %v", c, err)
+	}
+	if _, err := m.Action(ctx, "incus", name, "resume"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshots: take, list, restore, delete.
+	sh(t, "incus", "exec", name, "--", "sh", "-c", "echo before > /root/marker")
+	if _, err := m.SnapshotAction(ctx, "incus", name, "take", "sgit-snap"); err != nil {
+		t.Fatal(err)
+	}
+	sh(t, "incus", "exec", name, "--", "sh", "-c", "echo after > /root/marker")
+	snaps, err := m.Snapshots(ctx, "incus", name)
+	if err != nil || len(snaps) == 0 || snaps[0].Name != "sgit-snap" {
+		t.Fatalf("snapshots %+v %v", snaps, err)
+	}
+	if _, err := m.SnapshotAction(ctx, "incus", name, "restore", "sgit-snap"); err != nil {
+		t.Fatal(err)
+	}
+	if out := sh(t, "incus", "exec", name, "--", "cat", "/root/marker"); out != "before" {
+		t.Fatalf("restore did not roll back: %q", out)
+	}
+	if _, err := m.SnapshotAction(ctx, "incus", name, "delete", "sgit-snap"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A new instance from the public image server, then removed.
+	_ = exec.Command("incus", "delete", "-f", "sgit-new").Run()
+	nc, err := m.Create(ctx, "incus", CreateSpec{Name: "sgit-new", Image: "images:alpine/3.22", Restart: "no", MemoryMB: 128, Start: true})
+	if err != nil || !nc.Running || nc.Restart != "no" || nc.MemoryMB != 128 {
+		t.Fatalf("create: %+v %v", nc, err)
+	}
+	if logs, err := m.Logs(ctx, "incus", "sgit-new", 50); err != nil || logs == "" {
+		t.Fatalf("logs %q %v", logs, err)
+	}
+	if err := m.Remove(ctx, "incus", "sgit-new", false); err != nil {
+		t.Fatal(err)
+	}
+	if out := sh(t, "incus", "list", "sgit-new", "-c", "n", "--format", "csv"); out != "" {
+		t.Fatalf("not removed: %q", out)
 	}
 }

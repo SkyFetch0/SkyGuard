@@ -93,7 +93,7 @@ Passthrough services only apply steps 1–4 (real users must not be rate-limited
 | 🛡️ **DoS guard** | Semaphore caps concurrent connections at 4 096 |
 | 📦 **Storage** | Single-file SQLite, WAL mode, auto-purge old records |
 | 🌐 **Dashboard** | Browser UI with live polling + JSON REST API |
-| 🧩 **Containers** | Opt-in Docker and Incus management: start/stop, published ports, restart policy, limits, and a patch bay to wire containers into each other's networks |
+| 🧩 **Containers** | Opt-in Docker and Incus management, switched on from the panel: a network map to wire containers together, create / start / stop / pause / remove, published ports, restart policy, limits, logs, Incus snapshots |
 | 🐳 **Docker** | Multi-stage image (`golang:1.27` → `debian:trixie-slim` with iptables-legacy + iptables-nft), built-in health check |
 | ⚙️ **Config** | Single YAML file; hot-toggleable services (`enabled: false`) |
 | 0️⃣ **Zero deps** | CGO disabled — pure Go binary, no shared libraries |
@@ -246,12 +246,19 @@ analysis:
 
 ## Containers (Docker and Incus)
 
-The dashboard can manage the containers that run next to SkyGuard. Both
-engines are spoken to directly over their unix sockets (Docker Engine API,
-Incus REST API), so no CLI is needed inside SkyGuard's container. Access to
-either socket is equivalent to root on the host, so it is **off** until you
-enable it, it requires `dashboard.auth`, and `read_only: true` limits it to
-listing.
+The dashboard can manage the containers that run next to SkyGuard: Docker,
+and Incus (the community fork of LXD; system containers and virtual
+machines). Both engines are spoken to directly over their unix sockets
+(Docker Engine API, Incus REST API), so no CLI is needed inside SkyGuard's
+container. Access to either socket is equivalent to root on the host, so it is
+**off** until you switch it on, it requires a strong `dashboard.auth`
+password, and `read_only: true` (config file only) limits it to listing.
+
+Switch each engine on under **Settings → Container engines** (or with the
+buttons on the empty Containers screen). SkyGuard checks that the socket
+answers before it accepts, and remembers the choice across restarts; setting
+`containers.docker.enabled` / `containers.incus.enabled` in the config file
+works too, and once you change that value in the file, the file wins again.
 
 ```yaml
 containers:
@@ -278,6 +285,11 @@ What each change does:
 | Published ports | **recreates the container** (Docker cannot change ports in place): same image ID, config, labels, networks with aliases and static IPs, named and anonymous volumes; the old one is renamed aside and removed only after the new one starts, otherwise it is put back unchanged | proxy devices (`listen tcp:0.0.0.0:8080`, `connect tcp:127.0.0.1:80`) added / removed live |
 | Restart policy | live (`no`, `on-failure`, `unless-stopped`, `always`) | `boot.autostart` (`no`, `last-state`, `always`) |
 | Memory / CPU limit | set or raise live; removing one recreates the container | `limits.memory` / `limits.cpu`, live |
+| Pause / resume | `pause` / `unpause` | `freeze` / `unfreeze` |
+| Create | pulls the image if missing, then create and start | from `images:<distro>/<release>` (images.linuxcontainers.org) or a local alias; container or VM |
+| Remove | stop and delete; named and anonymous volumes are kept | stop and delete with its snapshots; custom volumes are kept |
+| Logs | the last stdout/stderr lines | the console log (or the LXC log) |
+| Snapshots | — (Docker has none) | take, roll back, delete |
 
 A port is refused before anything changes when another running container
 publishes it, a SkyGuard listener (or the dashboard) holds it, or a program on
@@ -334,7 +346,7 @@ ssh -L 9090:127.0.0.1:9090 user@your-server
 - **Attackers and bans** — threat scores against the auto-ban threshold, active bans with confirmed unban, ban reasons, a ban dialog (1 h / 1 day / 7 days / permanent).
 - **Captured credentials** — most tried usernames and passwords, attempts per honeypot and over time, the most frequent pairs.
 - **Honeypots and services** — switch each honeypot on or off at runtime (the listener opens or closes at once; the choice survives restarts until you change that honeypot in the config file), with 24-hour activity per service. Stealth and passthrough services are shown read-only: turning them off from a panel you usually reach through them could cut your own session.
-- **Containers** (opt-in, see [Containers](#containers-docker-and-incus)) — a *patch bay*: the server's Docker containers or Incus instances down the left, their networks across the top, a cable from each container to every network it is on. Click a container's socket and a cable follows the pointer; drop it on another container and the two get a network in common (join one of the other's, or a new one for the pair), drop it on a network to join it, click a lit jack to leave. Start, stop and restart; edit published ports, restart policy and memory/CPU limits in a side sheet. A host-port table names whoever holds each port (SkyGuard listeners included) and flags conflicts; *Open to the internet* lists every container port bound on all addresses and whether a ban stops traffic there.
+- **Containers** (opt-in, see [Containers](#containers-docker-and-incus)) — a *network map* in the manner of a network simulator: networks are switches, containers are devices, memberships are cables. Select a container and pull a cable from its plug: drop it on a switch to join that network, or on another container to give the two a network in common (join one of the other's, or a new one for the pair); clicking *Connect…* and then the target works too. Click a cable to unplug it. Built to stay readable with a hundred containers: a force layout that keeps each Compose project together on a soft outline, numbered replicas (`queue-worker-1…40`) folded into one stacked device until you expand them, labels that give way to each other as you zoom out, search that dims everything else and brings the first match into view, a minimap, focus on a node's own cables when selected, and dragged positions remembered per browser. A *Table* view keeps the patch bay for precise work. *New container* pulls an image (Docker) or downloads one from images.linuxcontainers.org (Incus) and starts it with ports, network, environment, restart policy and limits. The side sheet starts, stops, restarts, pauses and removes; edits ports, restart policy and memory/CPU limits; shows the last 200 log lines; and for Incus takes, rolls back and deletes snapshots. A host-port table names whoever holds each port (SkyGuard listeners included) and flags conflicts; *Open to the internet* lists every container port bound on all addresses and whether a ban stops traffic there.
 - **Auto-ban and firewall** — switch, threshold stepper, ban length, and the SKYGUARD chain's current rules.
 - **IP detail** — a side sheet with score, daily activity, credentials and connections for any address.
 
@@ -373,6 +385,12 @@ State-changing `POST` endpoints require the header `X-SkyGuard-Request: 1` (CSRF
 | `POST` | `/api/containers/ports` | `engine`, `id`, `ports` in `docker run -p` form, comma separated (`8080:80,127.0.0.1:8443:443/tcp`); empty unpublishes all |
 | `POST` | `/api/containers/settings` | `engine`, `id`, `restart`, `memory_mb`, `cpus` (0 removes a limit) |
 | `POST` | `/api/containers/networks` | `engine`, `name` — create a bridge network |
+| `POST` | `/api/containers/networks/delete` | `engine`, `name` — delete a network nothing is on |
+| `POST` | `/api/containers/engines` | `engine`, `enabled` — switch Docker or Incus management from the panel |
+| `POST` | `/api/containers/create` | `engine`, `name`, `image`, `ports`, `network`, `env` (KEY=value lines, Docker), `restart`, `memory_mb`, `cpus`, `vm` (Incus), `start` |
+| `POST` | `/api/containers/remove` | `engine`, `id` — stop and delete; volumes are kept |
+| `GET` | `/api/containers/logs?engine=&id=&lines=200` | The last lines of stdout/stderr (Docker) or the console log (Incus) |
+| `GET`/`POST` | `/api/containers/snapshots` | Incus: list; `action` = `take` \| `restore` \| `delete`, `name` |
 
 ```bash
 curl -u admin:password http://localhost:9090/api/stats

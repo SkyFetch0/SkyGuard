@@ -46,6 +46,15 @@ type IncusEngineConfig struct {
 	Project string `yaml:"project"` // empty = the default project
 }
 
+// ContainersAllowed refuses container management behind a weak panel:
+// whoever reaches an unauthenticated dashboard would get root on the host.
+func (c *Config) ContainersAllowed() error {
+	if pw := c.Dashboard.Auth.Password; c.Dashboard.Auth.Username == "" || len(pw) < 8 || pw == "CHANGE_ME_NOW" {
+		return errors.New("container management needs dashboard.auth with a strong password (8+ characters, not the example's)")
+	}
+	return nil
+}
+
 // Default engine sockets.
 const (
 	DefaultDockerSocket = "/var/run/docker.sock"
@@ -392,9 +401,8 @@ func (c *Config) Validate() error {
 		if !c.Dashboard.Enabled {
 			errs = append(errs, errors.New("containers: container management is part of the dashboard; enable the dashboard too"))
 		}
-		// Whoever reaches an unauthenticated panel would get root on the host.
-		if pw := c.Dashboard.Auth.Password; c.Dashboard.Auth.Username == "" || len(pw) < 8 || pw == "CHANGE_ME_NOW" {
-			errs = append(errs, errors.New("containers: container management needs dashboard.auth with a strong password (8+ characters, not the example's)"))
+		if err := c.ContainersAllowed(); err != nil {
+			errs = append(errs, fmt.Errorf("containers: %w", err))
 		}
 	}
 
