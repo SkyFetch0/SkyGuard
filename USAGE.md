@@ -62,7 +62,7 @@ SkyGuard compiles to a static binary and requires no external libraries at runti
 
 | Software | Minimum Version | Notes |
 |----------|----------------|-------|
-| Go | 1.22+ | Verify with `go version` |
+| Go | 1.27+ | Verify with `go version` |
 | make | any | Build automation |
 | gcc / musl-dev | any | CGO dependencies (optional) |
 

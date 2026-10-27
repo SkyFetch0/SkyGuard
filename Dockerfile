@@ -1,5 +1,5 @@
 # ── Build stage ────────────────────────────────────────────────────────────────
-FROM golang:1.24-bookworm AS builder
+FROM golang:1.27-trixie AS builder
 
 WORKDIR /build
 COPY go.mod go.sum ./
@@ -13,12 +13,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
     -o /out/skyguard ./cmd/skyguard
 
 # ── Runtime stage ──────────────────────────────────────────────────────────────
-# Debian ships both iptables-legacy and iptables-nft. SkyGuard picks whichever
+# Debian 13 ships both iptables-legacy and iptables-nft. SkyGuard picks whichever
 # backend the host already uses (analysis.auto_ban.iptables_backend: auto);
 # rules written with the wrong one are invisible to the host's tooling.
 # ufw is intentionally not installed: inside a container it would only edit
 # the container's own copy of the rules, never the host's.
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates iptables tzdata \

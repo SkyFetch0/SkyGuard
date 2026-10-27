@@ -88,7 +88,7 @@ check_docker() {
     warn "docker compose plugin not found. Installing..."
     DOCKER_CONFIG="/usr/local/lib/docker"   # system-wide, also visible to systemd
     mkdir -p "$DOCKER_CONFIG/cli-plugins"
-    COMPOSE_VERSION="v2.29.7"
+    COMPOSE_VERSION="v5.6.1"   # >= v2.40.2 fixes CVE-2025-62725
     # Release assets are lower-case (docker-compose-linux-x86_64).
     curl -fSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-$(uname -m)" \
       -o "$DOCKER_CONFIG/cli-plugins/docker-compose"

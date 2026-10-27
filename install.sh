@@ -790,7 +790,7 @@ fi
 # v2 plugin is installed as a CLI plugin rather than as the legacy
 # docker-compose binary (which "docker compose" would never find).
 if ! docker compose version &>/dev/null; then
-    COMPOSE_VER="v2.29.7"
+    COMPOSE_VER="v5.6.1"   # >= v2.40.2 fixes CVE-2025-62725
     PLUGIN_DIR="/usr/local/lib/docker/cli-plugins"
     mkdir -p "$PLUGIN_DIR"
     # Release assets are lower-case: docker-compose-linux-x86_64 / -aarch64.

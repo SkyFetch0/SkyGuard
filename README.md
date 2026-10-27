@@ -10,7 +10,7 @@
 
 ---
 
-[![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Go](https://img.shields.io/badge/Go-1.27+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-modernc%2Fsqlite-003B57?logo=sqlite&logoColor=white)](https://pkg.go.dev/modernc.org/sqlite)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -93,7 +93,7 @@ Passthrough services only apply steps 1–4 (real users must not be rate-limited
 | 🛡️ **DoS guard** | Semaphore caps concurrent connections at 4 096 |
 | 📦 **Storage** | Single-file SQLite, WAL mode, auto-purge old records |
 | 🌐 **Dashboard** | Browser UI with live polling + JSON REST API |
-| 🐳 **Docker** | Multi-stage image (`golang:1.24` → `debian:bookworm-slim` with iptables-legacy + iptables-nft), built-in health check |
+| 🐳 **Docker** | Multi-stage image (`golang:1.27` → `debian:trixie-slim` with iptables-legacy + iptables-nft), built-in health check |
 | ⚙️ **Config** | Single YAML file; hot-toggleable services (`enabled: false`) |
 | 0️⃣ **Zero deps** | CGO disabled — pure Go binary, no shared libraries |
 
@@ -152,7 +152,7 @@ Supported distributions: **Ubuntu 20.04/22.04/24.04**, **Debian 11/12**, **CentO
 ### Build from source
 
 ```bash
-# Requires Go 1.24+
+# Requires Go 1.27+ (go.mod pins toolchain go1.27.3)
 make build                     # → ./bin/skyguard
 make run                       # run with example config
 make docker-build              # build Docker image
@@ -301,7 +301,7 @@ skyguard/
 ├── configs/
 │   └── skyguard.example.yaml
 ├── install.sh             # Production installer (multi-distro, interactive wizard)
-├── Dockerfile             # Multi-stage (golang:1.24 → debian:bookworm-slim)
+├── Dockerfile             # Multi-stage (golang:1.27 → debian:trixie-slim)
 ├── docker-compose.yml
 ├── Makefile
 └── USAGE.md               # Full operational guide
@@ -327,7 +327,7 @@ skyguard/
 
 ### Prerequisites
 
-- **Go 1.22+** (CGO not required — `modernc.org/sqlite` is pure Go)
+- **Go 1.27+** (CGO not required — `modernc.org/sqlite` is pure Go)
 - **Docker** — for container builds and integration tests
 - **make**
 

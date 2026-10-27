@@ -1,9 +1,10 @@
 package analysis
 
 import (
-	"net"
+	"net/netip"
+	"strings"
 
-	"github.com/oschwald/geoip2-golang"
+	"github.com/oschwald/geoip2-golang/v2"
 )
 
 // GeoIPService wraps a geoip2 reader with a graceful disabled mode.
@@ -42,18 +43,18 @@ func (g *GeoIPService) Lookup(ipStr string) GeoInfo {
 	if !g.Enabled() {
 		return GeoInfo{}
 	}
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return GeoInfo{}
-	}
-	record, err := g.reader.City(ip)
+	ip, err := netip.ParseAddr(strings.TrimSpace(ipStr))
 	if err != nil {
 		return GeoInfo{}
 	}
+	record, err := g.reader.City(ip.Unmap())
+	if err != nil || !record.HasData() {
+		return GeoInfo{}
+	}
 	return GeoInfo{
-		Country:     record.Country.Names["en"],
-		CountryCode: record.Country.IsoCode,
-		City:        record.City.Names["en"],
+		Country:     record.Country.Names.English,
+		CountryCode: record.Country.ISOCode,
+		City:        record.City.Names.English,
 	}
 }
 
