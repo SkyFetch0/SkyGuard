@@ -1187,7 +1187,7 @@ section "$(t sec_phase8)"
 cat > /etc/systemd/system/skyguard.service <<UNIT
 [Unit]
 Description=SkyGuard Security Layer
-Documentation=https://github.com/skyguard/skyguard
+Documentation=https://github.com/SkyFetch0/SkyGuard
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target

@@ -620,3 +620,7 @@ code { font-family: var(--mono); font-size: 12px; } /* taste-skill-ignore: data-
 .pill.o-forwarded .dot { background: var(--flow-forwarded); }
 
 .sheet .table-wrap { margin: 0; padding: 0; }
+
+/* a long detail line truncates itself, never the country code beside the IP */
+.rank .who > .muted:not(.detail) { flex: none; }
+.rank .who .detail { flex: 1 1 auto; min-width: 0; }

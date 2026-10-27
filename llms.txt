@@ -1,0 +1,13 @@
+# SkyGuard
+
+> Self-hosted Linux security layer in Go: hides the real SSH behind a stealth port, runs SSH/FTP/MySQL/HTTP honeypots, scores attackers and bans them with iptables/ufw, and has a web dashboard that can also manage the host's Docker and Incus containers.
+
+## Install
+
+- [LLM_INSTALL.md](LLM_INSTALL.md): step-by-step installation runbook for AI agents, with checks, stop conditions and the questions to ask the operator. Follow it instead of running install.sh, which is interactive.
+- [README.md#installation](README.md#installation): the same for humans (interactive installer, Docker Compose, native binary).
+
+## Reference
+
+- [USAGE.md](USAGE.md): configuration reference, dashboard, REST API, troubleshooting.
+- [configs/skyguard.example.yaml](configs/skyguard.example.yaml): the annotated configuration file.

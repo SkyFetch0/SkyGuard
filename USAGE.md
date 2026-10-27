@@ -91,8 +91,8 @@ Docker installation is the fastest and most secure method. All dependencies are 
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/skyguard/skyguard
-cd skyguard
+git clone https://github.com/SkyFetch0/SkyGuard.git
+cd SkyGuard
 
 # 2. Create the config directory and copy the example config
 sudo mkdir -p /etc/skyguard
@@ -122,7 +122,7 @@ docker run -d \
 docker logs -f skyguard
 
 # 8. Test the dashboard (in a separate terminal)
-curl -u admin:changeme_strong_password http://127.0.0.1:9090/api/stats
+curl -u 'admin:<your dashboard password>' http://127.0.0.1:9090/api/stats
 ```
 
 #### Starting with Docker Compose
@@ -165,8 +165,8 @@ docker exec skyguard skyguard -healthcheck && echo healthy
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/skyguard/skyguard
-cd skyguard
+git clone https://github.com/SkyFetch0/SkyGuard.git
+cd SkyGuard
 
 # 2. Download dependencies
 go mod download
@@ -230,19 +230,32 @@ make run
 
 ### 2c. Automated Install Script
 
-`scripts/install-plugin.sh` automates Docker setup, interactive config wizard, and systemd integration:
+`install.sh` in the repository root is the guided installer: it installs Docker if needed, runs a
+wizard (whitelist, stealth port, honeypots, auto-ban, dashboard, container management), writes
+`/etc/skyguard/skyguard.yaml`, sets up the firewall, builds and starts the container, tests the stealth
+port, and installs a systemd unit, log rotation and a daily database backup. Run it from a clone:
 
 ```bash
-# Full installation (Docker + config + systemd)
-sudo ./scripts/install-plugin.sh
-
-# Create config file only, do not start the container
-sudo ./scripts/install-plugin.sh --config-only
-
-# Standalone mode (bypasses the server-guard plugin framework)
-sudo ./scripts/install-plugin.sh --standalone
+git clone https://github.com/SkyFetch0/SkyGuard.git
+cd SkyGuard
+sudo bash install.sh              # English
+sudo bash install.sh --lang tr    # Turkish
 ```
 
+`uninstall.sh` reverses it (`--purge` also deletes config and data, `--restore-iptables` restores the
+pre-install iptables snapshot).
+
+`scripts/install-plugin.sh` is a smaller alternative for hosts managed by the server-guard plugin
+framework:
+
+```bash
+sudo ./scripts/install-plugin.sh                 # Docker + config + systemd
+sudo ./scripts/install-plugin.sh --config-only   # only write the config, do not start
+sudo ./scripts/install-plugin.sh --standalone    # without the plugin framework
+```
+
+AI agents should use [LLM_INSTALL.md](LLM_INSTALL.md) instead of either script: it is the same
+installation as explicit, checkable steps.
 ---
 
 ## 3. Configuration Guide
@@ -457,7 +470,7 @@ dashboard:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `dashboard.enabled` | bool | — | Set to `false` to disable the dashboard entirely. |
-| `dashboard.listen` | string | `127.0.0.1:8080` | Bind address. Always listen on localhost only. |
+| `dashboard.listen` | string | `127.0.0.1:9090` | Bind address. Keep it on loopback and use an SSH tunnel. |
 | `dashboard.auth.username` | string | — | HTTP Basic Auth username. |
 | `dashboard.auth.password` | string | — | HTTP Basic Auth password. Use a strong, randomly generated value. |
 
@@ -666,7 +679,7 @@ This confirms the stealth port is invisible to scanners while the honeypot looks
   "time": "2024-01-15T10:23:45Z",
   "level": "INFO",
   "msg": "ssh connection",
-  "source_ip": "185.220.101.5",
+  "source_ip": "203.0.113.5",
   "client_banner": "SSH-2.0-libssh_0.9.6",
   "bytes_read": 48
 }
@@ -691,7 +704,7 @@ This confirms the stealth port is invisible to scanners while the honeypot looks
   "time": "2024-01-15T10:24:12Z",
   "level": "INFO",
   "msg": "ftp credential attempt",
-  "source_ip": "185.220.101.5",
+  "source_ip": "203.0.113.5",
   "user": "admin",
   "pass": "admin123",
   "attempt": 1
@@ -717,7 +730,7 @@ This confirms the stealth port is invisible to scanners while the honeypot looks
   "time": "2024-01-15T10:25:33Z",
   "level": "INFO",
   "msg": "mysql login attempt",
-  "source_ip": "45.155.205.233",
+  "source_ip": "198.51.100.23",
   "user": "root"
 }
 ```
@@ -773,12 +786,24 @@ Authenticate using the `username` and `password` values from `dashboard.auth` in
 
 ### Dashboard Features
 
-The web UI provides:
+Seven screens, reached from the icon rail (a bottom bar on a phone). Each screen's state lives in the URL
+hash, so a view can be bookmarked (`#overview?range=7d`, `#connections?ip=203.0.113.9&action=dropped`,
+`#containers?engine=incus&view=table`). The overview, bans, credentials, honeypots and containers screens
+refresh every 30 seconds while the tab is visible.
 
-- **Summary statistics** — total connections, honeypot hits, forwarded, dropped
-- **Recent connections** — live connection feed, refreshed every 15 seconds
-- **Top attackers** — the 20 IPs with the highest threat scores
-- **Top credentials** — the 50 most-attempted username/password pairs
+| Screen | What it answers | |
+|---|---|---|
+| **Overview** | Is the server under attack, and is SkyGuard stopping it? KPIs that switch the chart, where every connection ended, busiest sources with a one-click ban, targeted services and countries, latest events. | [picture](docs/screenshots/overview.png) |
+| **Connections** | Who connected, when, and what happened? A day × hour heatmap, filters kept in the URL, paging, CSV export. | [picture](docs/screenshots/connections.png) |
+| **Attackers and bans** | Who is the biggest threat? Scores against the auto-ban threshold, active bans with unban, ban reasons. | [picture](docs/screenshots/attackers.png) |
+| **Captured credentials** | What are bots trying? Top usernames and passwords, attempts per honeypot over time, frequent pairs. | [picture](docs/screenshots/credentials.png) |
+| **Honeypots** | Which traps are open? A switch per honeypot (applies at once, survives restarts), 24-hour activity. | [picture](docs/screenshots/honeypots.png) |
+| **Containers** | What runs next to SkyGuard and how is it wired? The network map, the patch-bay table, host ports, open ports and ban coverage. | [picture](docs/screenshots/containers-map.png) |
+| **Settings** | Auto-ban switch, threshold and ban length; container engines; the SKYGUARD chain's rules. | [picture](docs/screenshots/settings.png) |
+
+Click any IP address for its side sheet (score, daily activity, credentials, connections, ban/unban);
+click a container for its sheet (actions, ports, networks, restart policy and limits, logs, snapshots,
+remove).
 
 ### API Endpoints
 
@@ -822,7 +847,7 @@ curl -u admin:PASSWORD "http://127.0.0.1:9090/api/connections?service=ssh&limit=
   {
     "id": 9812,
     "timestamp": "2024-01-15T10:23:45Z",
-    "source_ip": "185.220.101.5",
+    "source_ip": "203.0.113.5",
     "source_port": 0,
     "dest_port": 22,
     "country": "DE",
@@ -841,7 +866,7 @@ Top attackers by threat score (default 50).
 ```json
 [
   {
-    "ip": "185.220.101.5", "score": 85, "country": "DE",
+    "ip": "203.0.113.5", "score": 85, "country": "DE",
     "total_connections": 7, "honeypot_hits": 4, "credential_attempts": 3,
     "ports_scanned": [21, 22, 3306],
     "first_seen": "2024-01-15T10:20:00Z", "last_seen": "2024-01-15T10:24:00Z"
@@ -868,7 +893,7 @@ Active (non-expired) bans.
 ```json
 [
   {
-    "id": 31, "ip": "185.220.101.5", "reason": "honeypot_threshold",
+    "id": 31, "ip": "203.0.113.5", "reason": "honeypot_threshold",
     "banned_at": "2024-01-15T10:24:00Z", "expires_at": "2024-01-16T10:24:00Z",
     "permanent": false
   }
@@ -988,16 +1013,16 @@ they hit a honeypot.
 
 ```bash
 # Manually ban an IP with iptables
-sudo iptables -I INPUT -s 185.220.101.5 -j DROP
+sudo iptables -I INPUT -s 203.0.113.5 -j DROP
 
 # Unban with iptables
-sudo iptables -D INPUT -s 185.220.101.5 -j DROP
+sudo iptables -D INPUT -s 203.0.113.5 -j DROP
 
 # Manually ban an IP with UFW
-sudo ufw deny from 185.220.101.5 to any
+sudo ufw deny from 203.0.113.5 to any
 
 # Unban with UFW
-sudo ufw delete deny from 185.220.101.5 to any
+sudo ufw delete deny from 203.0.113.5 to any
 
 # View active bans from the database via the API
 curl -u admin:PASSWORD http://127.0.0.1:9090/api/banned

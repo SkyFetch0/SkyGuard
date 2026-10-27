@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/skyguard/skyguard/main/docs/logo.png" alt="SkyGuard" width="120" />
+<img src="docs/logo.svg" alt="SkyGuard" width="96" />
 
 # SkyGuard
 
@@ -13,9 +13,8 @@
 [![Go](https://img.shields.io/badge/Go-1.27+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-modernc%2Fsqlite-003B57?logo=sqlite&logoColor=white)](https://pkg.go.dev/modernc.org/sqlite)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Go Report Card](https://goreportcard.com/badge/github.com/skyguard/skyguard)](https://goreportcard.com/report/github.com/skyguard/skyguard)
-[![Release](https://img.shields.io/github/v/release/skyguard/skyguard?color=green)](https://github.com/skyguard/skyguard/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#license)
+[![Incus](https://img.shields.io/badge/Incus-managed-E95420?logo=linuxcontainers&logoColor=white)](https://linuxcontainers.org/incus/)
 
 ---
 
@@ -24,7 +23,28 @@
 ![Honeypots](https://img.shields.io/badge/Honeypots-SSH%20%7C%20FTP%20%7C%20MySQL%20%7C%20HTTP-6C3483?logo=security&logoColor=white)
 ![CGO](https://img.shields.io/badge/CGO-disabled%20(pure%20Go)-00ADD8?logo=go&logoColor=white)
 
+**[Install](#installation)** · **[Screenshots](#screenshots)** · **[Configuration](#configuration)** · **[Containers](#containers-docker-and-incus)** · **[API](#dashboard--rest-api)** · **[Operations guide](USAGE.md)** · **[Install guide for AI agents](LLM_INSTALL.md)**
+
 </div>
+
+---
+
+## Screenshots
+
+The dashboard on a server under a week of attack traffic, with 96 Docker containers next to it. Every address in these pictures is from the documentation ranges (RFC 5737).
+
+<p align="center"><img src="docs/screenshots/overview.png" alt="Overview: connections per hour over 7 days with a spike annotated, where every connection ended (trapped by a honeypot, let through, or dropped and why), the busiest sources with their ban state, targeted services and countries" width="100%"></p>
+
+<p align="center"><img src="docs/screenshots/containers-cable.png" alt="Network map: containers as devices and networks as switches; shop-web is selected, its two cables are lit and the rest of the map is dimmed while a new cable is pulled onto the monitoring switch" width="100%"></p>
+
+| | |
+|---|---|
+| <img src="docs/screenshots/containers-map.png" alt="Network map of 96 containers grouped by Compose project, with numbered replicas folded into stacked devices and a minimap"> **Network map** — 96 containers, Compose projects kept together, replicas folded, minimap | <img src="docs/screenshots/container-sheet.png" alt="Container sheet with start, pause and stop, published ports with an explanation of the recreate, networks and restart policy"> **Container sheet** — ports, networks, restart policy, limits, logs, snapshots |
+| <img src="docs/screenshots/attackers.png" alt="Highest threat scores against the auto-ban threshold and the active bans with their expiry"> **Attackers and bans** — scores against the auto-ban threshold, active bans | <img src="docs/screenshots/credentials.png" alt="Most tried usernames and passwords, attempts per honeypot over time and the most frequent pairs"> **Captured credentials** — what bots try, per honeypot and over time |
+| <img src="docs/screenshots/connections.png" alt="A day by hour heatmap of the last week above the filterable connection log"> **Connections** — day × hour heatmap and the filterable log | <img src="docs/screenshots/honeypots.png" alt="Honeypots with on and off switches and 24-hour activity strips; stealth and passthrough services shown read-only"> **Honeypots** — switched on and off at runtime |
+| <img src="docs/screenshots/containers-table.png" alt="The patch bay table view: containers in rows, networks in columns, cables from each container to its networks"> **Table view** — the patch bay for precise work | <img src="docs/screenshots/settings.png" alt="Auto-ban settings and the container engine switches with their sockets and versions"> **Settings** — auto-ban, container engines, firewall rules |
+
+<p align="center"><img src="docs/screenshots/phone-overview.png" alt="The overview on a phone" width="240">&nbsp;&nbsp;&nbsp;<img src="docs/screenshots/phone-containers.png" alt="The network map on a phone" width="240"></p>
 
 ---
 
@@ -100,64 +120,121 @@ Passthrough services only apply steps 1–4 (real users must not be rate-limited
 
 ---
 
-## Quick Start
+## Installation
 
-### Docker (recommended)
+SkyGuard runs as one Docker container on the host's network (recommended), or as a plain binary under systemd. Three ways to get there, from the most guided to the most manual. **AI agents installing SkyGuard on a server: follow [LLM_INSTALL.md](LLM_INSTALL.md)**, which is written to be executed step by step with checks and stop conditions.
+
+### Before you start
+
+| | |
+|---|---|
+| **System** | 64-bit Linux (x86_64 or arm64): Ubuntu 20.04–24.04, Debian 11–12, Rocky / AlmaLinux / RHEL 8–9, Fedora 38+ (what `install.sh` supports; other distributions work with Option B or C). 1 vCPU and 256 MB of RAM are plenty. |
+| **Access** | Root (`sudo`). SkyGuard binds ports below 1024 and manages iptables. |
+| **Software** | Docker Engine with the compose plugin (the installer installs both), `git`. |
+| **Your IP** | Know the public IP you administer the server from: it goes on the whitelist so auto-ban can never lock you out. `echo $SSH_CLIENT` on the server prints it as the first field. |
+| **Ports** | SkyGuard wants the ports of the honeypots you enable (21, 80, 3306, 8080; 22 only if you move sshd), the stealth port (9911 by default) and 127.0.0.1:9090 for the dashboard. Check what is taken with `sudo ss -tlnp`. A reverse proxy that already holds 80/443 (Nginx Proxy Manager, Traefik, Caddy) is fine: see [sharing 80/443](#sharing-ports-80443-with-a-reverse-proxy-nginx-proxy-manager-traefik-caddy). |
+
+> **Keep your current SSH session open until the end.** Test every change (especially the stealth port) from a *second* terminal. Nothing in the installer blocks port 22 unless you confirm it after the stealth port has been proven to reach your sshd.
+
+### Option A — the interactive installer (recommended)
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/skyguard/skyguard.git
-cd skyguard
-
-# 2. Copy and edit the config
-cp configs/skyguard.example.yaml /etc/skyguard/skyguard.yaml
-$EDITOR /etc/skyguard/skyguard.yaml          # set your whitelist IP + dashboard password
-
-# 3. Build the image
-docker build -t skyguard:latest .
-
-# 4. Run
-docker run --rm -v /etc/skyguard/skyguard.yaml:/etc/skyguard/skyguard.yaml:ro \
-  skyguard:latest -check-config            # validate before starting
-docker run -d \
-  --name skyguard \
-  --network host \
-  --restart unless-stopped \
-  --cap-add NET_ADMIN --cap-add NET_RAW \
-  -v /etc/skyguard/skyguard.yaml:/etc/skyguard/skyguard.yaml:ro \
-  -v /var/lib/skyguard:/data \
-  skyguard:latest
-
-# 5. Access the dashboard (via SSH tunnel)
-ssh -L 9090:127.0.0.1:9090 user@your-server
-# → open http://localhost:9090
+git clone https://github.com/SkyFetch0/SkyGuard.git
+cd SkyGuard
+sudo bash install.sh            # English
+sudo bash install.sh --lang tr  # Türkçe
 ```
 
-### docker compose
+The wizard asks, in order: whether to whitelist the public IP it detects for you (say yes), extra whitelist IPs and blocked countries; the stealth SSH port and where the real sshd listens; which honeypots to run (a port that is already taken is detected and that honeypot left off, naming the owner, e.g. `docker container nginx-proxy-manager`); an HTTPS passthrough; GeoIP; auto-ban threshold, ban length and firewall backend; the dashboard user and password (empty generates one); Docker / Incus management; log retention. Then it:
+
+1. installs Docker if missing and the packages it needs (`curl`, `iptables`, `sqlite3`, `iproute2`, and `iptables-persistent` or `iptables-services` so rules survive a reboot);
+2. copies the project to `/opt/skyguard` and writes `/etc/skyguard/skyguard.yaml` (mode 600);
+3. snapshots your iptables rules (for `uninstall.sh --restore-iptables`), creates the `SKYGUARD` chain, hooks it into `INPUT` and `DOCKER-USER`, and opens exactly the ports you chose (recorded in `/etc/skyguard/firewall.state`);
+4. writes `/opt/skyguard/docker-compose.yml`, builds the image, validates the config with `skyguard -check-config`, starts the container and waits until it is healthy;
+5. dials the stealth port itself and, only if your sshd answers through it, offers to block direct access to port 22;
+6. installs `skyguard.service` (starts the compose project at boot), log rotation and a daily database backup.
+
+When it finishes, open a **new** terminal and log in through the stealth port before you close the old one:
 
 ```bash
+ssh -p 9911 you@your-server
+```
+
+### Option B — Docker Compose by hand
+
+```bash
+git clone https://github.com/SkyFetch0/SkyGuard.git /opt/skyguard
+cd /opt/skyguard
+cp configs/skyguard.example.yaml configs/skyguard.yaml   # must exist before `up`, or Docker creates a directory
+chmod 600 configs/skyguard.yaml
+$EDITOR configs/skyguard.yaml     # whitelist.ips, dashboard.auth.password, the honeypots you want
+docker compose build
+docker compose run --rm skyguard -check-config -config /etc/skyguard/skyguard.yaml
 docker compose up -d
-docker compose logs -f
+docker compose ps                 # wait for "(healthy)"
 ```
 
-### Automated install (Linux only)
+`docker-compose.yml` uses host networking and `NET_ADMIN`/`NET_RAW`, so honeypots see real client addresses and bans land in the host's firewall. Data (SQLite database, SSH honeypot host key, GeoIP database) lives in `./data`. To let the dashboard manage containers, uncomment the socket lines in `docker-compose.yml` (see [Containers](#containers-docker-and-incus)).
 
-The interactive install script auto-detects your OS, installs Docker, configures `iptables`, sets up a `systemd` service, and walks you through every option:
+The example config enables `fake-http` on port 80; turn it off (or move it) if a web server or reverse proxy already uses 80, otherwise SkyGuard refuses to start and names the port.
+
+### Option C — native binary with systemd
 
 ```bash
-sudo bash install.sh
+git clone https://github.com/SkyFetch0/SkyGuard.git && cd SkyGuard
+make build                                   # Go 1.27+ (go.mod pins go1.27.3; GOTOOLCHAIN downloads it)
+sudo install -m 755 bin/skyguard /usr/local/bin/skyguard
+sudo mkdir -p /etc/skyguard /var/lib/skyguard
+sudo install -m 600 configs/skyguard.example.yaml /etc/skyguard/skyguard.yaml
+sudoedit /etc/skyguard/skyguard.yaml         # also set general.data_dir and logging.db_path to /var/lib/skyguard
+sudo skyguard -check-config -config /etc/skyguard/skyguard.yaml
 ```
 
-Supported distributions: **Ubuntu 20.04/22.04/24.04**, **Debian 11/12**, **CentOS 7/8/9**, **RHEL 8/9**, **Rocky Linux**, **AlmaLinux**, **Fedora 38+**
+Then install the unit from [USAGE.md › Running as a systemd Service](USAGE.md#running-as-a-systemd-service) and `sudo systemctl enable --now skyguard`. The binary needs `iptables` (or `ufw`) on the host.
 
-### Build from source
+### Check that it works
+
+| Check | Command | Expect |
+|---|---|---|
+| Container is healthy | `docker ps --filter name=skyguard` | `Up … (healthy)` |
+| Liveness | `curl -fsS http://127.0.0.1:9090/healthz` | `ok` |
+| Listeners | `docker logs skyguard 2>&1 \| grep "listener started"` | one line per enabled service |
+| Stealth port reaches sshd | `timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9911; printf "SSH-2.0-check\r\n" >&3; head -c 8 <&3'` | `SSH-2.0-` |
+| Stealth login | from a second terminal: `ssh -p 9911 you@server` | a normal login |
+| Firewall | `sudo iptables -S SKYGUARD; sudo iptables -S DOCKER-USER` | the chain exists; `-A DOCKER-USER -j SKYGUARD` when Docker runs |
+| Dashboard | `ssh -L 9090:127.0.0.1:9090 you@server -p 9911`, then open http://localhost:9090 | the login prompt, then the overview |
+
+### Turn on container management
+
+Open **Settings → Container engines** in the dashboard and switch Docker or Incus on. SkyGuard checks that the socket answers and that the dashboard password is strong. With Docker Compose, mount the socket into the container first (uncomment the lines in `docker-compose.yml`, then `docker compose up -d`). Details and safety notes: [Containers](#containers-docker-and-incus).
+
+### Update
 
 ```bash
-# Requires Go 1.27+ (go.mod pins toolchain go1.27.3)
-make build                     # → ./bin/skyguard
-make run                       # run with example config
-make docker-build              # build Docker image
+cd /opt/skyguard && git pull && docker compose build && docker compose up -d
 ```
+
+The database, the config file and the honeypot host keys are kept. Dashboard choices (honeypot switches, auto-ban settings, container engines) survive until you change the same setting in the config file.
+
+### Uninstall
+
+```bash
+sudo bash /opt/skyguard/uninstall.sh                     # stop, remove the container and SkyGuard's firewall rules
+sudo bash /opt/skyguard/uninstall.sh --purge             # also delete /etc/skyguard and the data
+sudo bash /opt/skyguard/uninstall.sh --restore-iptables  # put back the iptables snapshot taken before install
+```
+
+### When something goes wrong
+
+| Symptom | Cause and fix |
+|---|---|
+| `listen :80: … address already in use (another process already listens on this port; check with: ss -tlnp)` | Another program or container has the port (`ss -tlnp` names it; Docker's shows as `docker-proxy`). Turn that honeypot off or give it another `port`, then restart. |
+| `skyguard.yaml: is a directory` | `docker compose up` ran before `configs/skyguard.yaml` existed. `rm -r configs/skyguard.yaml`, copy the example, start again. |
+| Locked out of SSH | From the provider's console: `iptables -D INPUT ! -i lo -p tcp --dport 22 -j DROP` and `iptables -F SKYGUARD`, then whitelist your IP. |
+| Dashboard does not open from your PC | It listens on 127.0.0.1 only, on purpose. Use the SSH tunnel above. |
+| Container stays `unhealthy` | `docker logs skyguard` names the problem; `docker compose run --rm skyguard -check-config -config /etc/skyguard/skyguard.yaml` validates the file. |
+
+More in [USAGE.md › Troubleshooting](USAGE.md#10-troubleshooting).
 
 ---
 
@@ -403,26 +480,29 @@ curl -u admin:password -H 'X-SkyGuard-Request: 1' -d ip=203.0.113.5 -d duration=
 ## Project Structure
 
 ```
-skyguard/
-├── cmd/skyguard/          # main entry point (graceful shutdown, slog, env override)
+SkyGuard/
+├── cmd/skyguard/            # entry point: flags, graceful shutdown, health check probe
 ├── internal/
-│   ├── config/            # YAML parser + struct definitions
-│   ├── server/            # TCP listeners, connection pipeline, semaphore DoS guard
-│   ├── stealth/           # Protocol-aware forwarding (prefixedConn trick)
-│   ├── honeypot/          # SSH · FTP · MySQL · HTTP handlers
-│   ├── proxy/             # Bidirectional TCP proxy
-│   ├── analysis/          # GeoIP · rate limiter · scorer · port-scan detector
-│   ├── netutil/           # IP normalisation, IP/CIDR sets
-│   ├── firewall/          # iptables · ufw · noop backends
-│   ├── storage/           # SQLite (CGO-free) — connections · credentials · bans · scores
-│   └── dashboard/         # HTTP server · REST API · embedded UI (static/index.html + app.js)
-├── configs/
-│   └── skyguard.example.yaml
-├── install.sh             # Production installer (multi-distro, interactive wizard)
-├── Dockerfile             # Multi-stage (golang:1.27 → debian:trixie-slim)
+│   ├── config/              # YAML parsing, defaults and validation
+│   ├── server/              # listeners, the connection pipeline, runtime honeypot switches
+│   ├── stealth/             # protocol-aware forwarding to the hidden real service
+│   ├── honeypot/            # SSH (x/crypto/ssh) · FTP · MySQL · HTTP
+│   ├── proxy/               # bidirectional TCP proxy
+│   ├── analysis/            # GeoIP · rate limiter · scorer · port-scan detector
+│   ├── firewall/            # iptables / ip6tables (SKYGUARD chain, DOCKER-USER hook) · ufw · none
+│   ├── containers/          # Docker Engine API and Incus REST API clients, the container manager
+│   ├── storage/             # SQLite (pure Go): connections, credentials, bans, scores, settings
+│   ├── netutil/             # IP normalisation, IP/CIDR sets
+│   └── dashboard/           # HTTP server, REST API, embedded UI (static/index.html, assets/*.js, *.css, fonts)
+├── configs/skyguard.example.yaml
+├── docs/                    # logo and screenshots
+├── scripts/                 # install-plugin.sh, enable-ssh-honeypot.sh
+├── install.sh / uninstall.sh
+├── Dockerfile               # golang:1.27 → debian:trixie-slim
 ├── docker-compose.yml
 ├── Makefile
-└── USAGE.md               # Full operational guide
+├── USAGE.md                 # full operational guide
+└── LLM_INSTALL.md           # step-by-step install guide for AI agents
 ```
 
 ---
@@ -505,12 +585,16 @@ curl -u admin:CHANGE_ME_NOW http://localhost:9090/api/stats
 ## Roadmap
 
 - [ ] Fake interactive shell for SSH honeypot (`fake_shell` is accepted but ignored)
-- [ ] WebSocket / SSE live-push for dashboard
+- [ ] Notifications (Telegram, ntfy, Discord, e-mail, webhooks) for bans and honeypot logins
+- [ ] Longer bans for repeat offenders
+- [ ] Scheduled blocklist import (Spamhaus DROP, FireHOL level1) and nftables sets
+- [ ] CrowdSec bouncer integration
+- [ ] Reading sshd and reverse-proxy (Nginx Proxy Manager) logs
+- [ ] HTTP lures for `/.git/config`, `/.env` and LLM API paths
+- [ ] Vulnerability scan of container images (Trivy)
+- [ ] TOTP two-factor login for the dashboard
 - [ ] Prometheus metrics endpoint (`/metrics`)
-- [ ] Geolocation map visualisation in dashboard
-- [ ] JSON REST API for external SIEM integration
-- [ ] IPv6 honeypot listeners
-- [ ] Rate-limited SMTP honeypot
+- [ ] WebSocket / SSE live-push for the dashboard
 
 ---
 
@@ -530,7 +614,7 @@ Please run `make lint` and `make test` before submitting.
 
 ## License
 
-[MIT](LICENSE) © SkyGuard contributors
+MIT © SkyGuard contributors
 
 ---
 
