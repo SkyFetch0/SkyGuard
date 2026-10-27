@@ -62,7 +62,9 @@
 
   // ── api ─────────────────────────────────────────────────────────────────
   async function api(url, opts) {
-    const r = await fetch(url, Object.assign({ credentials: 'same-origin' }, opts));
+    // Resolved against the origin: opened as http://user:pass@host/, the page's own URL carries the
+    // credentials and the browser refuses to fetch any relative URL from it.
+    const r = await fetch(new URL(url, location.origin), Object.assign({ credentials: 'same-origin' }, opts));
     const ct = r.headers.get('Content-Type') || '';
     const body = ct.includes('application/json') ? await r.json() : await r.text();
     if (!r.ok) throw new Error(((body && body.error) || (typeof body === 'string' && body) || r.statusText).trim());
@@ -482,6 +484,461 @@
     } catch (e) { blockError($('#ip-facts'), ip, e); }
   }
 
+  // ── containers ──────────────────────────────────────────────────────────
+  // The patch bay: containers down the left, networks across the top. A cable hangs from a container's
+  // socket to every network it is on; clicking a socket lifts a free cable that follows the pointer
+  // until it is dropped on another container (they get a network in common) or on a network.
+  const ct = { engine: '', data: null, patch: null, sheet: null, cur: null, hl: '' };
+  const ENGINE_NAMES = { docker: 'Docker', incus: 'Incus' };
+  const RESTART_LABELS = { no: 'Stay stopped', 'on-failure': 'On failure', 'unless-stopped': 'Unless stopped by hand', always: 'Always', 'last-state': 'As before shutdown' };
+  const STATE_TONE = { running: 'pos', paused: 'warn', restarting: 'warn', frozen: 'warn', dead: 'neg', error: 'neg' };
+  const hostPart = (ip) => (ip ? (ip.includes(':') ? `[${ip}]` : ip) + ':' : '');
+  const portLabel = (p) => `${hostPart(p.host_ip)}${p.host_port || 'any'}→${p.container_port}${p.proto === 'udp' ? '/udp' : ''}`;
+  const engineName = (e) => ENGINE_NAMES[e] || e;
+  const ctView = () => {
+    const d = ct.data;
+    return {
+      eng: d.engines.find((e) => e.name === ct.engine),
+      cs: d.containers.filter((c) => c.engine === ct.engine),
+      ns: d.networks.filter((n) => n.engine === ct.engine),
+    };
+  };
+  const findCt = (id, engine = ct.engine) => ct.data.containers.find((c) => c.engine === engine && c.id === id);
+  const ctPost = (path, data) => post(`/api/containers/${path}`, Object.assign({ engine: ct.engine }, data));
+  const ICON_PLAY = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>';
+  const ICON_STOP = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="1.5"/></svg>';
+
+  async function loadContainers() {
+    let d;
+    try { d = await api('/api/containers'); } catch (e) {
+      [['#bay', 'containers'], ['#host-ports', 'host ports'], ['#ct-networks', 'networks'], ['#open-ports', 'open ports']].forEach(([sel, what]) => blockError($(sel), what, e));
+      $('#ct-sub').textContent = "Couldn't reach SkyGuard's container API.";
+      return;
+    }
+    ct.data = d;
+    $$('#screen-containers .grid, #bay-meta').forEach((el) => { el.hidden = !d.enabled; });
+    if (!d.enabled) {
+      $('#ct-sub').textContent = 'Container management is off.';
+      $('#bay').innerHTML = `<div class="empty off-note"><div><p>Turn it on in the config file, mount the engine's socket into SkyGuard's container, and restart SkyGuard.</p>
+        <pre class="rules">containers:\n  docker:\n    enabled: true\n  incus:\n    enabled: false</pre>
+        <p class="muted">Either socket is equivalent to root on this server, so the dashboard needs a strong password.</p></div></div>`;
+      $('#ct-engines').hidden = true;
+      return;
+    }
+    if (!d.engines.some((e) => e.name === ct.engine)) ct.engine = (d.engines.find((e) => e.available) || d.engines[0]).name;
+    renderEngines(); renderBay(); renderHostPorts(); renderCtNetworks(); renderExposure(); renderCtFinding();
+    $$('[data-stamp]').forEach((el) => { el.textContent = `Updated ${clock(new Date())}`; });
+    if ($('#ct-sheet').open && ct.sheet) refreshSheet();
+  }
+
+  function renderEngines() {
+    const g = $('#ct-engines'), list = ct.data.engines;
+    g.hidden = list.length < 2;
+    g.innerHTML = list.map((e) => `<button type="button" data-engine="${esc(e.name)}" aria-pressed="${e.name === ct.engine}">${esc(engineName(e.name))}</button>`).join('');
+  }
+
+  function renderCtFinding() {
+    const { eng, cs, ns } = ctView(), sub = $('#ct-sub');
+    const ports = ct.data.host_ports.filter((u) => u.conflict);
+    const lost = ports.find((u) => u.owners.some((o) => o.kind === 'skyguard' && o.failed));
+    if (lost) {
+      const hp = lost.owners.find((o) => o.kind === 'skyguard'), holder = lost.owners.find((o) => o.kind !== 'skyguard');
+      sub.innerHTML = `SkyGuard's <strong>${esc(hp.name)}</strong> could not start: port <span class="num">${lost.port}</span> is held by ${holder ? `${engineName(holder.kind)} container <strong>${esc(holder.name)}</strong>` : 'another program'}. Move the honeypot to a free port in the config file, or <a class="card-link" href="#services">switch it off</a>.`;
+      return;
+    }
+    if (ports.length) {
+      const u = ports[0];
+      sub.innerHTML = `Port <span class="num">${u.port}</span> is claimed by ${u.owners.map((o) => `<strong>${esc(o.name)}</strong>`).join(' and ')}: only one of them can have it.`;
+      return;
+    }
+    if (!eng.available) { sub.textContent = `${engineName(eng.name)} is not reachable: ${eng.error}`; return; }
+    const running = cs.filter((c) => c.running), stopped = cs.filter((c) => !c.running);
+    const stop = stopped.length ? ` ${num(stopped.length)} stopped: ${stopped.slice(0, 3).map((c) => `<strong>${esc(c.name)}</strong>`).join(', ')}${stopped.length > 3 ? ' and more' : ''}.` : ' Nothing is stopped.';
+    sub.innerHTML = `${num(running.length)} of ${num(cs.length)} ${engineName(eng.name)} ${cs.length === 1 ? 'container is' : 'containers are'} running on ${num(ns.length)} ${ns.length === 1 ? 'network' : 'networks'}.${stop}${ct.data.read_only ? ' Changes are switched off in the config file.' : ''}`;
+  }
+
+  function renderBay() {
+    const { eng, cs, ns } = ctView(), bay = $('#bay');
+    $('#bay-help').textContent = '';
+    if (!ns.some((n) => n.name === ct.hl)) ct.hl = '';
+    if (ct.hl) bay.dataset.hl = ct.hl; else bay.removeAttribute('data-hl');
+    if (!eng.available) { bay.innerHTML = `<div class="block-error">${esc(engineName(eng.name))} is not reachable: ${esc(eng.error)}</div>`; return; }
+    if (!cs.length) { bay.innerHTML = `<div class="empty">No ${esc(engineName(eng.name))} containers on this server yet.</div>`; return; }
+    const ro = ct.data.read_only;
+    $('#bay-meta').textContent = ro ? 'Read-only: changes are switched off in the config file' : "Click a container's socket, then another container or a network";
+    const bad = new Set(ct.data.host_ports.filter((u) => u.conflict).map((u) => `${u.port}/${u.proto}`));
+    bay.style.setProperty('--cols', String(Math.max(1, ns.length)));
+    const head = `<div class="bay-head"><div class="bay-corner"><span>Container</span><span class="muted num">${num(cs.filter((c) => c.running).length)}/${num(cs.length)} running</span></div>${ns.map((n) => `
+      <button class="net-head${ct.hl === n.name ? ' lit' : ''}" type="button" data-action="net-pick" data-net="${esc(n.name)}" aria-pressed="${ct.hl === n.name}" title="${esc(n.name)}${n.subnet ? ' · ' + esc(n.subnet) : ''}${n.attachable ? '' : ' (cannot be joined from here)'}">
+        <b class="mono" translate="no">${esc(n.name)}</b><span>${esc(n.builtin ? 'default bridge' : n.driver)}${n.subnet ? ` · ${esc(n.subnet)}` : ''}</span></button>`).join('')}</div>`;
+    const rows = cs.map((c) => {
+      const member = new Map(c.networks.map((e) => [e.network, e]));
+      const locked = !!c.network_mode;
+      const chips = c.ports.map((p) => `<span class="chip mono${bad.has(`${p.host_port}/${p.proto}`) ? ' bad' : ''}" title="Host ${esc(hostPart(p.host_ip) + (p.host_port || 'any'))} → container ${p.container_port}/${esc(p.proto)}">${esc(portLabel(p))}</span>`).join('');
+      const toggle = ro || c.self ? '' : c.running
+        ? `<button class="icon-btn small" type="button" data-action="ct-stop" data-id="${esc(c.id)}" aria-label="Stop ${esc(c.name)}" title="Stop">${ICON_STOP}</button>`
+        : `<button class="icon-btn small" type="button" data-action="ct-start" data-id="${esc(c.id)}" aria-label="Start ${esc(c.name)}" title="Start">${ICON_PLAY}</button>`;
+      const socket = locked || ro
+        ? `<span class="socket off" title="${esc(locked ? `Network mode ${c.network_mode}: no networks to join` : 'Read-only')}"></span>`
+        : `<button class="socket" type="button" data-action="patch" data-id="${esc(c.id)}" aria-label="Connect ${esc(c.name)} to another container or a network" title="Connect"></button>`;
+      const jacks = locked
+        ? `<div class="mode-note">${c.network_mode === 'host' ? "Uses the host's network directly: its ports are the host's own" : `Network mode ${esc(c.network_mode)}`}</div>`
+        : ns.map((n) => {
+          const ep = member.get(n.name), can = !ro && n.attachable;
+          const label = `${c.name} ${ep ? `is on ${n.name}${ep.ip ? ' at ' + ep.ip : ''}` : `is not on ${n.name}`}`;
+          return `<div class="jack-cell${ct.hl === n.name ? ' lit' : ''}" data-net="${esc(n.name)}">${ep && ep.ip ? `<span class="jack-ip mono">${esc(ep.ip.replace(/\/\d+$/, ''))}</span>` : ''}${ep || can
+            ? `<button class="jack${ep ? ' on' : ''}" type="button" data-action="jack" data-id="${esc(c.id)}" data-net="${esc(n.name)}" aria-pressed="${!!ep}" aria-label="${esc(label)}" title="${esc(label)}"${can ? '' : ' disabled'}></button>` : ''}</div>`;
+        }).join('');
+      return `<div class="bay-row${c.running ? '' : ' stopped'}" data-row="${esc(c.id)}">
+        <div class="ct-cell" data-target="${esc(c.id)}">
+          <div class="ct-main">
+            <div class="ct-line"><span class="state-dot ${STATE_TONE[c.state] || ''}" title="${esc(c.state)}"></span><button class="ct-name" type="button" data-action="ct-open" data-id="${esc(c.id)}" translate="no">${esc(c.name)}</button>${c.self ? '<span class="pill">SkyGuard</span>' : ''}${c.project ? `<span class="muted tag" title="Docker Compose project">${esc(c.project)}</span>` : ''}</div>
+            <div class="ct-sub"><span class="mono" translate="no">${esc(c.image || '—')}</span><span>${esc(c.status)}</span></div>
+            ${chips ? `<div class="ct-ports">${chips}</div>` : ''}
+          </div>
+          <div class="ct-tools">${toggle}${socket}</div>
+        </div>${jacks}</div>`;
+    }).join('');
+    bay.innerHTML = head + rows + '<svg class="cables" aria-hidden="true"></svg>';
+    requestAnimationFrame(drawCables);
+  }
+
+  // A cable sags under its own weight: the longer the span, the deeper the curve.
+  const sag = (x0, y0, x1, y1, extra = 0) => {
+    const dx = x1 - x0, s = Math.min(22, Math.abs(dx) * 0.05 + 6) + extra, f = (n) => n.toFixed(1);
+    return `M${f(x0)} ${f(y0)} C${f(x0 + dx * 0.32)} ${f(y0 + s)} ${f(x1 - dx * 0.32)} ${f(y1 + s)} ${f(x1)} ${f(y1)}`;
+  };
+  const centre = (el, box) => { const r = el.getBoundingClientRect(); return [r.left - box.left + r.width / 2, r.top - box.top + r.height / 2]; };
+
+  function drawCables() {
+    const bay = $('#bay'), svg = $('svg.cables', bay);
+    if (!svg) return;
+    const box = bay.getBoundingClientRect(), w = bay.scrollWidth, h = bay.scrollHeight;
+    svg.setAttribute('width', w); svg.setAttribute('height', h); svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+    let out = '';
+    $$('.bay-row', bay).forEach((row) => {
+      const sock = $('.socket', row);
+      if (!sock) return;
+      const [x0, y0] = centre(sock, box);
+      $$('.jack.on', row).forEach((j) => {
+        const [x1, y1] = centre(j, box);
+        out += `<path class="cable${ct.hl === j.dataset.net ? ' on-hl' : ''}" data-net="${esc(j.dataset.net)}" d="${sag(x0, y0, x1, y1)}"/>`;
+      });
+    });
+    if (ct.patch) out += '<path class="cable live" id="live-cable" d=""/><circle class="plug" id="live-plug" r="5" cx="-20" cy="-20"/>';
+    svg.innerHTML = out;
+    if (ct.patch && ct.patch.last) movePatch(ct.patch.last);
+  }
+
+  function startPatch(id) {
+    const c = findCt(id);
+    ct.patch = { id, target: null };
+    const bay = $('#bay');
+    bay.classList.add('patching');
+    $(`.bay-row[data-row="${CSS.escape(id)}"]`, bay).classList.add('source');
+    $('#bay-help').textContent = `Connecting ${c.name}: click another container to give the two a network in common, or a network for ${c.name} to join. Esc cancels.`;
+    drawCables();
+    const sock = $(`.bay-row[data-row="${CSS.escape(id)}"] .socket`, bay), r = sock.getBoundingClientRect();
+    movePatch({ clientX: r.right + 60, clientY: r.top + r.height / 2, target: sock });
+  }
+  function endPatch() {
+    ct.patch = null;
+    const bay = $('#bay');
+    bay.classList.remove('patching');
+    $$('.bay-row.source, .bay-row.hot, .jack-cell.hot, .net-head.hot', bay).forEach((el) => el.classList.remove('source', 'hot'));
+    $('#bay-help').textContent = '';
+    drawCables();
+  }
+  // What the free end of the cable would plug into at this point: another container, or a network column.
+  function patchTarget(el) {
+    const cell = el && el.closest && el.closest('[data-target], .net-head, .jack-cell');
+    if (!cell || !ct.patch) return null;
+    if (cell.dataset.target) return cell.dataset.target === ct.patch.id ? null : { kind: 'ct', id: cell.dataset.target };
+    const src = findCt(ct.patch.id);
+    if (!cell.dataset.net || src.networks.some((e) => e.network === cell.dataset.net)) return null;
+    const n = ctView().ns.find((x) => x.name === cell.dataset.net);
+    return n && n.attachable ? { kind: 'net', net: n.name } : null;
+  }
+  function movePatch(ev) {
+    if (!ct.patch) return;
+    ct.patch.last = { clientX: ev.clientX, clientY: ev.clientY, target: ev.target };
+    const bay = $('#bay'), box = bay.getBoundingClientRect();
+    const src = $(`.bay-row[data-row="${CSS.escape(ct.patch.id)}"] .socket`, bay), cable = $('#live-cable'), plug = $('#live-plug');
+    if (!src || !cable) return;
+    const [x0, y0] = centre(src, box);
+    let x1 = ev.clientX - box.left, y1 = ev.clientY - box.top;
+    $$('.bay-row.hot, .jack-cell.hot, .net-head.hot', bay).forEach((el) => el.classList.remove('hot'));
+    const t = patchTarget(ev.target);
+    ct.patch.target = t;
+    if (t && t.kind === 'ct') {
+      const row = $(`.bay-row[data-row="${CSS.escape(t.id)}"]`, bay);
+      row.classList.add('hot');
+      const s = $('.socket', row);
+      if (s) [x1, y1] = centre(s, box);
+    } else if (t && t.kind === 'net') {
+      const j = $(`.bay-row[data-row="${CSS.escape(ct.patch.id)}"] .jack-cell[data-net="${CSS.escape(t.net)}"]`, bay);
+      $$(`[data-net="${CSS.escape(t.net)}"]`, bay).forEach((el) => { if (el.matches('.jack-cell, .net-head')) el.classList.add('hot'); });
+      const jack = j && $('.jack', j);
+      if (jack) [x1, y1] = centre(jack, box);
+    }
+    // socket to socket runs down the same column: the cable loops out to the right instead of lying flat
+    const loop = t && t.kind === 'ct', b = Math.min(90, 34 + Math.abs(y1 - y0) * 0.18), f = (n) => n.toFixed(1);
+    cable.setAttribute('d', loop ? `M${f(x0)} ${f(y0)} C${f(x0 + b)} ${f(y0)} ${f(x1 + b)} ${f(y1)} ${f(x1)} ${f(y1)}` : sag(x0, y0, x1, y1, t ? 4 : 14));
+    plug.setAttribute('cx', x1.toFixed(1)); plug.setAttribute('cy', y1.toFixed(1));
+    cable.classList.toggle('snapped', !!t);
+  }
+  function dropPatch(el) {
+    const t = patchTarget(el), from = ct.patch && ct.patch.id;
+    endPatch();
+    if (!t) return;
+    if (t.kind === 'net') connectTo(from, t.net);
+    else openConnect(from, t.id);
+  }
+
+  async function connectTo(id, network, create = false) {
+    const c = findCt(id);
+    try {
+      await ctPost('connect', { id, network, create: create ? '1' : '0' });
+      toast(`${c.name} joined ${network}`);
+      return true;
+    } catch (e) { toast(`${c.name}: ${e.message}`, false); return false; }
+    finally { loadContainers(); }
+  }
+
+  // Two containers reach each other by name once they share a network: join one of the target's,
+  // or make a new one for the pair.
+  function openConnect(fromId, toId) {
+    const a = findCt(fromId), b = findCt(toId), { ns } = ctView();
+    if (b.network_mode) { toast(`${b.name} uses network mode ${b.network_mode} and cannot share a network`, false); return; }
+    const mine = new Set(a.networks.map((e) => e.network));
+    const shared = b.networks.map((e) => e.network).filter((n) => mine.has(n) && !(ns.find((x) => x.name === n) || {}).builtin);
+    if (shared.length) { toast(`${a.name} and ${b.name} already share ${shared.join(', ')}: they reach each other by name`); return; }
+    const joinable = b.networks.map((e) => ns.find((n) => n.name === e.network)).filter((n) => n && n.attachable && !n.builtin && !mine.has(n.name));
+    const max = ct.engine === 'incus' ? 15 : 63;
+    const suggest = `${a.name}-${b.name}`.replace(/[^A-Za-z0-9_.-]/g, '-').slice(0, max).replace(/[-.]+$/, '');
+    $('#connect-title').textContent = `Connect ${a.name} to ${b.name}`;
+    $('#connect-text').textContent = joinable.length
+      ? `They need a network in common. ${a.name} can join one of ${b.name}'s, or the two can get a network of their own.`
+      : `They need a network in common, and ${b.name} has none that ${a.name} can join. SkyGuard makes a new one and plugs both in.`;
+    $('#connect-options').innerHTML = joinable.map((n, i) => `<label class="option"><input type="radio" name="target" value="join" data-net="${esc(n.name)}" ${i === 0 ? 'checked' : ''}>
+        <span><b class="mono" translate="no">${esc(n.name)}</b><span class="muted">Join ${esc(b.name)}'s network · ${num(n.members.length)} ${n.members.length === 1 ? 'container' : 'containers'}${n.subnet ? ` · ${esc(n.subnet)}` : ''}</span></span></label>`).join('')
+      + `<label class="option"><input type="radio" name="target" value="new" ${joinable.length ? '' : 'checked'}>
+        <span><b>A new network for the two</b><input class="input mono" name="newname" value="${esc(suggest)}" maxlength="${max}" aria-label="New network name" spellcheck="false" autocomplete="off" translate="no"></span></label>`;
+    $('#connect-error').textContent = '';
+    const f = $('#connect-form');
+    f.dataset.from = fromId; f.dataset.to = toId;
+    $('#connect-dialog').showModal();
+    $('#connect-submit').focus();
+  }
+  async function submitConnect(f) {
+    const a = findCt(f.dataset.from), b = findCt(f.dataset.to), pick = $('input[name="target"]:checked', f);
+    const btn = $('#connect-submit');
+    btn.disabled = true; btn.textContent = 'Connecting…';
+    try {
+      let net;
+      if (pick.value === 'join') {
+        net = pick.dataset.net;
+        await ctPost('connect', { id: a.id, network: net });
+      } else {
+        net = f.elements.newname.value.trim();
+        await ctPost('connect', { id: a.id, network: net, create: '1' });
+        await ctPost('connect', { id: b.id, network: net });
+      }
+      $('#connect-dialog').close();
+      toast(`${a.name} and ${b.name} now share ${net}`);
+      loadContainers();
+    } catch (e) { $('#connect-error').textContent = e.message; loadContainers(); }
+    btn.disabled = false; btn.textContent = 'Connect';
+  }
+
+  async function jack(btn) {
+    const c = findCt(btn.dataset.id), net = btn.dataset.net, ep = c.networks.find((e) => e.network === net);
+    if (!ep) { connectTo(c.id, net); return; }
+    if (!await confirmAction(`Take ${c.name} off ${net}?`, `It loses ${ep.ip ? `its address ${ep.ip.replace(/\/\d+$/, '')} and ` : ''}its name on ${net}, so the containers there can no longer reach it.`, 'Disconnect')) return;
+    try { await ctPost('disconnect', { id: c.id, network: net }); toast(`${c.name} left ${net}`); }
+    catch (e) { toast(`${c.name}: ${e.message}`, false); }
+    loadContainers();
+  }
+
+  async function ctAction(id, action, engine = ct.engine) {
+    const c = findCt(id, engine) || ct.cur;
+    if (action !== 'start') {
+      const what = action === 'stop' ? 'Its published ports close until it is started again.' : 'It is stopped and started again; open connections drop.';
+      if (!await confirmAction(`${action === 'stop' ? 'Stop' : 'Restart'} ${c.name}?`, what, action === 'stop' ? 'Stop' : 'Restart')) return;
+    }
+    try {
+      const after = await post('/api/containers/action', { engine, id, action });
+      toast(`${after.name} is ${after.running ? 'running' : 'stopped'}`);
+    } catch (e) { toast(`${c.name}: ${e.message}`, false); }
+    loadContainers();
+  }
+
+  function renderHostPorts() {
+    const rows = ct.data.host_ports, conflicts = rows.filter((u) => u.conflict).length;
+    $('#hp-meta').textContent = conflicts ? `${num(conflicts)} ${conflicts === 1 ? 'conflict' : 'conflicts'}` : `${num(rows.length)} ports in use, no conflicts`;
+    const owner = (o) => (o.kind === 'skyguard'
+      ? `<div>SkyGuard ${esc(o.name)}${o.failed ? ' <span class="muted">(could not start)</span>' : ''}</div>`
+      : `<div><button class="ip-link" type="button" data-action="ct-open-any" data-engine="${esc(o.kind)}" data-id="${esc(o.id)}" translate="no">${esc(o.name)}</button> <span class="muted">${esc(engineName(o.kind))}${o.host_ip ? ` · ${esc(o.host_ip)}` : ''}${o.running ? '' : ' · stopped'}</span></div>`);
+    $('#host-ports').innerHTML = rows.length ? rows.map((u) => {
+      const failed = u.owners.some((o) => o.failed);
+      const state = u.conflict ? '<span class="pill neg"><span class="dot"></span>Conflict</span>'
+        : failed ? '<span class="pill neg"><span class="dot"></span>Not listening</span>'
+        : u.owners.some((o) => o.running) ? '<span class="pill">In use</span>' : '<span class="muted">Free while stopped</span>';
+      const targets = u.owners.map((o) => `<div>${o.target ? esc(o.target + (u.proto === 'udp' ? '/udp' : '')) : '—'}</div>`).join('');
+      return `<tr class="stacked"><td class="n num">${u.port}${u.proto === 'udp' ? '/udp' : ''}</td><td>${u.owners.map(owner).join('')}</td><td class="num muted">${targets}</td><td class="n">${state}</td></tr>`;
+    }).join('') : emptyRow(4, 'No container publishes a port and SkyGuard listens on none.');
+  }
+
+  function renderCtNetworks() {
+    const { ns, eng } = ctView();
+    $('#net-meta').textContent = eng.available ? `${num(ns.length)} on ${engineName(eng.name)}` : '';
+    $('#net-form').hidden = ct.data.read_only || !eng.available;
+    $('#net-form').elements.name.maxLength = ct.engine === 'incus' ? 15 : 63;
+    if (!ns.length) { $('#ct-networks').innerHTML = emptyBlock('No networks.'); return; }
+    const max = Math.max(1, ...ns.map((n) => n.members.length));
+    $('#ct-networks').innerHTML = ns.map((n) => `<li>
+      <span class="who"><button class="ip-link" type="button" data-action="net-pick" data-net="${esc(n.name)}" translate="no">${esc(n.name)}</button><span class="muted">${esc(n.builtin ? 'default bridge, no name lookup' : n.driver)}${n.subnet ? ` · ${esc(n.subnet)}` : ''}</span></span>
+      <span class="n num">${num(n.members.length)}</span><span></span>
+      <span class="bar" style="width:${(100 * n.members.length / max).toFixed(1)}%"></span></li>`).join('');
+  }
+  // Which container ports anyone on the internet can reach, and whether a ban stops them there.
+  function renderExposure() {
+    const open = ct.data.host_ports.filter((u) => u.owners.some((o) => o.kind !== 'skyguard' && o.running && !o.host_ip));
+    const cov = ct.data.ban_coverage || {}, hasDocker = open.some((u) => u.owners.some((o) => o.kind === 'docker'));
+    const el = $('#ban-cover');
+    el.className = 'cover';
+    if (!open.length) el.textContent = 'No container publishes a port on every address: they are reachable from this host only.';
+    else if (cov.method === 'none' || cov.method === 'log') el.textContent = 'Auto-ban only logs (method none), so nothing stops a banned IP at these ports.';
+    else if (hasDocker && cov.method === 'ufw') { el.classList.add('bad'); el.textContent = "Banned IPs can still reach the Docker ports below: ufw's rules never see traffic Docker forwards. Set auto_ban.method to iptables to cover them."; }
+    else if (hasDocker && cov.docker_chain && !cov.docker_covered) { el.classList.add('bad'); el.innerHTML = 'Banned IPs can still reach the Docker ports below: SkyGuard\'s chain is missing from DOCKER-USER. Restart SkyGuard, or run <code>iptables -I DOCKER-USER 1 -j SKYGUARD</code>.'; }
+    else el.textContent = hasDocker ? "Bans cover them: SkyGuard's chain sits at the top of DOCKER-USER, where Docker's forwarded traffic passes first." : 'Bans cover them: Incus proxies accept on the host, behind the SKYGUARD chain.';
+    $('#open-meta').textContent = open.length ? `${num(open.length)} ${open.length === 1 ? 'port' : 'ports'}` : '';
+    $('#open-ports').innerHTML = open.map((u) => {
+      const o = u.owners.find((x) => x.kind !== 'skyguard' && x.running && !x.host_ip);
+      return `<li><span class="who"><span class="num">${u.port}${u.proto === 'udp' ? '/udp' : ''}</span><button class="ip-link" type="button" data-action="ct-open-any" data-engine="${esc(o.kind)}" data-id="${esc(o.id)}" translate="no">${esc(o.name)}</button><span class="muted">${esc(engineName(o.kind))} · to ${esc(o.target)}</span></span><span></span><span></span></li>`;
+    }).join('');
+  }
+  async function createNetwork(f) {
+    const name = f.elements.name.value.trim(), btn = $('#net-submit');
+    if (!name) { f.elements.name.focus(); return; }
+    btn.disabled = true;
+    try { await ctPost('networks', { name }); toast(`Network ${name} created`); f.reset(); }
+    catch (e) { toast(`Not created: ${e.message}`, false); }
+    btn.disabled = false;
+    loadContainers();
+  }
+
+  // ── one container ───────────────────────────────────────────────────────
+  async function openCt(id, engine = ct.engine) {
+    if (engine !== ct.engine) { ct.engine = engine; writeHash(); renderEngines(); renderBay(); renderCtNetworks(); renderCtFinding(); }
+    ct.sheet = id;
+    const sheet = $('#ct-sheet');
+    const c = findCt(id);
+    $('#ct-title').textContent = c ? c.name : id;
+    $('#ct-tags').innerHTML = ''; $('#ct-actions').innerHTML = ''; $('#ct-note').textContent = '';
+    $('#ct-facts').innerHTML = ['State', 'Image', 'Created', 'Address'].map((k) => `<div><dt>${k}</dt><dd><span class="skeleton">000000</span></dd></div>`).join('');
+    $('#port-rows').innerHTML = ''; $('#ct-nets').innerHTML = skeletonRows(4, 1); $('#ct-mounts').innerHTML = '';
+    ['#ports-msg', '#limits-msg'].forEach((s) => { $(s).textContent = ''; });
+    if (!sheet.open) sheet.showModal();
+    await refreshSheet();
+  }
+  async function refreshSheet() {
+    try { renderSheet(await api(`/api/containers/inspect?engine=${encodeURIComponent(ct.engine)}&id=${encodeURIComponent(ct.sheet)}`)); }
+    catch (e) { blockError($('#ct-facts'), 'the container', e); }
+  }
+  function renderSheet(c) {
+    ct.cur = c; ct.sheet = c.id;
+    const ro = ct.data.read_only, docker = c.engine === 'docker', locked = !!c.network_mode;
+    $('#ct-title').textContent = c.name;
+    $('#ct-tags').innerHTML = `<span class="pill ${STATE_TONE[c.state] || ''}"><span class="dot"></span>${esc(c.state)}</span> <span class="pill">${esc(engineName(c.engine))}${c.kind === 'virtual-machine' ? ' VM' : ''}</span>${c.project ? ` <span class="pill" title="Docker Compose project">${esc(c.project)}</span>` : ''}${c.self ? ' <span class="pill">SkyGuard</span>' : ''}`;
+    const addr = locked ? c.network_mode : (c.networks.find((e) => e.ip) || {}).ip;
+    $('#ct-facts').innerHTML = [['State', c.status || c.state], ['Image', c.image || '—'], ['Created', c.created ? stamp(c.created) : '—'], ['Address', addr ? addr.replace(/\/\d+$/, '') : '—']]
+      .map(([k, v]) => `<div><dt>${k}</dt><dd title="${esc(v)}">${esc(v)}</dd></div>`).join('');
+    const btn = (action, label, primary) => `<button class="btn${primary ? ' primary' : ''}" type="button" data-action="ct-sheet-action" data-do="${action}">${label}</button>`;
+    $('#ct-actions').innerHTML = ro ? '' : c.self ? '' : c.running ? btn('restart', 'Restart') + btn('stop', 'Stop') : btn('start', 'Start', true);
+    $('#ct-note').textContent = c.self ? "This is SkyGuard's own container: restart or change it with docker compose on the host, or the dashboard would go down with it."
+      : ro ? 'Read-only: containers.read_only is set in the config file.' : '';
+
+    // ports
+    const pf = $('#ports-form'), editable = !ro && !c.self && !locked && !(c.kind === 'virtual-machine');
+    $('#port-rows').innerHTML = c.ports.length ? c.ports.map((p) => portRow(p, c)).join('') : `<div class="empty small">${locked ? "It uses the host's network: whatever it listens on is open on the host directly." : 'No published ports.'}</div>`;
+    $$('input, select, button', pf).forEach((el) => { el.disabled = !editable; });
+    $('[data-action="port-add"]').hidden = !editable;
+    $('#ports-submit').hidden = !editable;
+    $('#ports-submit').textContent = docker ? 'Save and recreate' : 'Save ports';
+    $('#ports-hint').textContent = locked || c.self ? '' : c.kind === 'virtual-machine' ? 'Virtual machines take only NAT proxy devices with a fixed address; add them with incus config device add.'
+      : docker ? `Docker cannot change the ports of an existing container, so saving recreates ${c.name} from the same image with the same settings, volumes and networks. It restarts once; if the new one fails to start, the old one is put back.${c.project ? ` It belongs to the Compose project ${c.project}: the next docker compose up puts the compose file's ports back, so change them there too.` : ''}`
+      : 'Incus adds and removes proxy devices on the running instance; nothing restarts.';
+    pf.dataset.exposed = (c.exposed || []).join(',');
+
+    // networks
+    $('#ct-nets').innerHTML = locked ? emptyRow(4, `Network mode ${c.network_mode}: it joins no networks.`) : c.networks.length ? c.networks.map((e) => `<tr><td class="mono" translate="no">${esc(e.network)}</td><td class="num">${esc((e.ip || '—').replace(/\/\d+$/, ''))}</td>
+      <td class="data mono">${esc((e.aliases || []).join(', ') || '—')}</td><td class="n">${ro || c.self ? '' : `<button class="btn small" type="button" data-action="jack" data-id="${esc(c.id)}" data-net="${esc(e.network)}">Disconnect</button>`}</td></tr>`).join('')
+      : emptyRow(4, 'On no network. Plug it in from the patch bay.');
+
+    // restart and limits
+    const eng = ct.data.engines.find((x) => x.name === c.engine), lf = $('#limits-form');
+    $('#restart-group').innerHTML = (eng ? eng.restart_policies : [c.restart]).map((r) => `<button type="button" data-restart="${esc(r)}" aria-pressed="${r === c.restart}">${esc(RESTART_LABELS[r] || r)}</button>`).join('');
+    lf.elements.memory_mb.value = c.memory_mb || 0;
+    lf.elements.cpus.value = c.cpus || 0;
+    lf.elements.cpus.step = docker ? '0.25' : '1';
+    $('#cpu-hint').textContent = docker ? '0 = no limit; 0.5 is half a CPU' : '0 = no limit; whole CPUs';
+    $('#limits-hint').textContent = docker ? 'Setting or raising a limit applies at once. Removing one recreates the container, because Docker cannot lift a limit in place.' : 'Applies at once.';
+    $$('input, button', lf).forEach((el) => { el.disabled = ro || c.self; });
+    $('#limits-submit').hidden = ro || c.self;
+
+    $('#ct-mounts-block').hidden = !(c.mounts || []).length;
+    $('#ct-mounts').innerHTML = (c.mounts || []).map((m) => `<li class="mono">${esc(m)}</li>`).join('');
+  }
+  function portRow(p = {}, c = ct.cur) {
+    const inherited = p.inherited ? ' <span class="muted">from a profile</span>' : '';
+    return `<div class="port-row">
+      <input class="input mono" name="host_ip" value="${esc(p.host_ip || '')}" placeholder="All addresses" aria-label="Host address" spellcheck="false" autocomplete="off">
+      <input class="input mono" name="host_port" type="number" min="${c && c.engine === 'docker' ? 0 : 1}" max="65535" value="${p.host_port == null ? '' : p.host_port}" placeholder="8080" aria-label="Host port" required>
+      <span class="arrow" aria-hidden="true">→</span>
+      <input class="input mono" name="container_port" type="number" min="1" max="65535" value="${p.container_port || ''}" placeholder="80" aria-label="Container port" required>
+      <select class="input" name="proto" aria-label="Protocol"><option value="tcp"${p.proto === 'udp' ? '' : ' selected'}>TCP</option><option value="udp"${p.proto === 'udp' ? ' selected' : ''}>UDP</option></select>
+      <button class="icon-btn small" type="button" data-action="port-remove" aria-label="Remove this port"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>${inherited}
+    </div>`;
+  }
+  function addPortRow() {
+    const rows = $('#port-rows'), first = (($('#ports-form').dataset.exposed || '').split(',')[0] || '').split('/');
+    if ($('.empty', rows)) rows.innerHTML = '';
+    rows.insertAdjacentHTML('beforeend', portRow({ container_port: Number(first[0]) || '', proto: first[1] || 'tcp', host_port: null }));
+    $('.port-row:last-child input[name="host_port"]', rows).focus();
+  }
+  async function savePorts(f) {
+    const c = ct.cur, specs = [];
+    for (const row of $$('.port-row', f)) {
+      const v = (n) => $(`[name="${n}"]`, row).value.trim();
+      if (!v('host_port') && !v('container_port')) continue;
+      specs.push(`${hostPart(v('host_ip'))}${v('host_port')}:${v('container_port')}/${v('proto')}`);
+    }
+    const msg = $('#ports-msg'), btn = $('#ports-submit'), label = btn.textContent;
+    btn.disabled = true; btn.textContent = c.engine === 'docker' ? 'Recreating…' : 'Saving…'; msg.textContent = '';
+    try {
+      const after = await post('/api/containers/ports', { engine: c.engine, id: c.id, ports: specs.join(',') });
+      renderSheet(after);
+      $('#ports-msg').textContent = `Saved at ${clock(new Date())}`;
+      toast(`${after.name}: ${after.ports.length ? after.ports.map(portLabel).join(', ') : 'no published ports'}`);
+    } catch (e) { msg.textContent = e.message; toast(`Ports not changed: ${e.message}`, false); }
+    btn.disabled = false; btn.textContent = label;
+    loadContainers();
+  }
+  async function saveLimits(f) {
+    const c = ct.cur, pressed = $('#restart-group [aria-pressed="true"]');
+    const msg = $('#limits-msg'), btn = $('#limits-submit');
+    btn.disabled = true; btn.textContent = 'Saving…'; msg.textContent = '';
+    try {
+      const after = await post('/api/containers/settings', { engine: c.engine, id: c.id, restart: pressed ? pressed.dataset.restart : '', memory_mb: f.elements.memory_mb.value.trim() || '0', cpus: f.elements.cpus.value.trim() || '0' });
+      renderSheet(after);
+      $('#limits-msg').textContent = `Saved at ${clock(new Date())}`;
+      toast(`${after.name}: restart ${RESTART_LABELS[after.restart] ? RESTART_LABELS[after.restart].toLowerCase() : after.restart}, ${after.memory_mb ? `${num(after.memory_mb)} MB` : 'no memory limit'}, ${after.cpus ? `${after.cpus} CPUs` : 'no CPU limit'}`);
+    } catch (e) { msg.textContent = e.message; toast(`Not saved: ${e.message}`, false); }
+    btn.disabled = false; btn.textContent = 'Save';
+    loadContainers();
+  }
+
   // ── routing ─────────────────────────────────────────────────────────────
   const SCREENS = {
     overview: { title: 'Overview', load: loadOverview, live: true },
@@ -489,6 +946,7 @@
     attackers: { title: 'Attackers and bans', load: loadAttackers, live: true },
     credentials: { title: 'Captured credentials', load: loadCredentials, live: true },
     services: { title: 'Honeypots and services', load: loadServices, live: true },
+    containers: { title: 'Containers', load: loadContainers, live: true },
     settings: { title: 'Auto-ban and firewall', load: loadSettings, live: false },
   };
   let current = 'overview';
@@ -509,6 +967,7 @@
       for (const k of ['ip', 'service', 'country']) { const v = f.elements[k].value.trim(); if (v) p.set(k, v); }
       if (state.conn.action) p.set('action', state.conn.action);
     }
+    if (current === 'containers' && ct.engine && ct.data && ct.data.engines && ct.data.engines.length > 1) p.set('engine', ct.engine);
     const hash = '#' + current + (p.toString() ? '?' + p : '');
     if (location.hash !== hash) history.replaceState(null, '', hash);
   }
@@ -516,6 +975,7 @@
     if (['24h', '7d', '30d'].includes(p.get('range'))) state.range = p.get('range');
     else if (name === 'overview' || name === 'credentials') state.range = '24h';
     $$('[data-range]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.range === state.range)));
+    if (name === 'containers' && ['docker', 'incus'].includes(p.get('engine'))) ct.engine = p.get('engine');
     if (name === 'overview') state.metric = METRICS.some((m) => m.key === p.get('metric')) ? p.get('metric') : 'total';
     if (name === 'connections') {
       const f = $('#conn-filters');
@@ -551,6 +1011,12 @@
   // ── events ──────────────────────────────────────────────────────────────
   document.addEventListener('click', (ev) => {
     const t = ev.target;
+    // While a cable is lifted, the next click drops it: on a container, on a network, or nowhere.
+    if (ct.patch) { ev.preventDefault(); dropPatch(t); return; }
+    const engBtn = t.closest('[data-engine]:not([data-action])');
+    if (engBtn) { ct.engine = engBtn.dataset.engine; writeHash(); loadContainers(); return; }
+    const restart = t.closest('[data-restart]');
+    if (restart) { pressOnly(restart.parentElement, restart.dataset.restart, 'restart'); return; }
     const range = t.closest('[data-range]');
     if (range) {
       state.range = range.dataset.range;
@@ -596,6 +1062,29 @@
       case 'export': location.href = '/api/export?' + connParams(); break;
       case 'page-next': state.conn.offset += state.conn.limit; loadConnections(); break;
       case 'page-prev': state.conn.offset = Math.max(0, state.conn.offset - state.conn.limit); loadConnections(); break;
+      case 'patch': startPatch(a.dataset.id); break;
+      case 'jack': jack(a); break;
+      case 'net-pick': {
+        // one network lit at a time: its bus, its jacks and its cables; the rest step back
+        ct.hl = ct.hl === a.dataset.net ? '' : a.dataset.net;
+        const bay = $('#bay');
+        if (ct.hl) bay.dataset.hl = ct.hl; else bay.removeAttribute('data-hl');
+        $$('.jack-cell, .net-head', bay).forEach((el) => el.classList.toggle('lit', !!ct.hl && el.dataset.net === ct.hl));
+        $$('.net-head', bay).forEach((el) => el.setAttribute('aria-pressed', String(el.dataset.net === ct.hl)));
+        drawCables();
+        break;
+      }
+      case 'ct-open': openCt(a.dataset.id); break;
+      case 'ct-open-any': openCt(a.dataset.id, a.dataset.engine); break;
+      case 'ct-start': ctAction(a.dataset.id, 'start'); break;
+      case 'ct-stop': ctAction(a.dataset.id, 'stop'); break;
+      case 'ct-sheet-action': ctAction(ct.cur.id, a.dataset.do, ct.cur.engine).then(() => { if ($('#ct-sheet').open) refreshSheet(); }); break;
+      case 'port-add': addPortRow(); break;
+      case 'port-remove': {
+        a.closest('.port-row').remove();
+        if (!$('.port-row', $('#port-rows'))) $('#port-rows').innerHTML = '<div class="empty small">No published ports. Save to unpublish them all.</div>';
+        break;
+      }
     }
   });
   document.addEventListener('change', (ev) => {
@@ -607,6 +1096,15 @@
   $('#ban-form').addEventListener('submit', (ev) => { ev.preventDefault(); submitBan(ev.target); });
   $('#ban-form').addEventListener('input', () => { $('#ban-error').textContent = ''; });
   $('#settings-form').addEventListener('submit', (ev) => { ev.preventDefault(); saveSettings(ev.target); });
+  $('#connect-form').addEventListener('submit', (ev) => { ev.preventDefault(); submitConnect(ev.target); });
+  $('#connect-form').addEventListener('input', () => { $('#connect-error').textContent = ''; });
+  $('#connect-form').addEventListener('focusin', (ev) => { if (ev.target.name === 'newname') $('#connect-form input[value="new"]').checked = true; });
+  $('#ports-form').addEventListener('submit', (ev) => { ev.preventDefault(); savePorts(ev.target); });
+  $('#limits-form').addEventListener('submit', (ev) => { ev.preventDefault(); saveLimits(ev.target); });
+  $('#net-form').addEventListener('submit', (ev) => { ev.preventDefault(); createNetwork(ev.target); });
+  $('#bay').addEventListener('pointermove', movePatch);
+  document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && ct.patch) { ev.preventDefault(); endPatch(); } });
+  $('#ct-sheet').addEventListener('click', (ev) => { if (ev.target === ev.currentTarget) ev.currentTarget.close(); });
   // KPI tabs follow the arrow keys, as a tablist should.
   $('#kpis').addEventListener('keydown', (ev) => {
     if (ev.key !== 'ArrowRight' && ev.key !== 'ArrowLeft') return;
@@ -619,7 +1117,8 @@
   $('#ip-sheet').addEventListener('click', (ev) => { if (ev.target === ev.currentTarget) ev.currentTarget.close(); });
   window.addEventListener('hashchange', () => show(...parseHash()));
   let resizeTimer;
-  window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (current === 'connections') loadConnections(); }, 200); });
+  window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (current === 'connections') loadConnections(); if (current === 'containers') drawCables(); }, 200); });
+  if (document.fonts) document.fonts.ready.then(() => { if (current === 'containers') drawCables(); });
 
   api('/api/info').then((info) => {
     state.info = info;
@@ -627,5 +1126,5 @@
   }).catch(() => {});
   show(...parseHash());
   // Live screens refresh every 30 seconds while the tab is visible; old values stay until new ones arrive.
-  setInterval(() => { if (!document.hidden && SCREENS[current].live && !document.querySelector('dialog[open]')) refresh(); }, 30000);
+  setInterval(() => { if (!document.hidden && SCREENS[current].live && !ct.patch && !document.querySelector('dialog[open]')) refresh(); }, 30000);
 })();

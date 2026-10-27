@@ -121,3 +121,32 @@ Anywhere (v6)              DENY        2001:db8::1
 		t.Error("expected exact DENY matches")
 	}
 }
+
+func TestIPTablesBansCoverDockerPublishedPorts(t *testing.T) {
+	fw, f := newFake()
+	for _, ip := range []string{"203.0.113.7", "203.0.113.8"} {
+		if err := fw.Ban(ip); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := f.rules["iptables DOCKER-USER -j SKYGUARD"]; n != 1 {
+		t.Errorf("DOCKER-USER jump inserted %d times, want once", n)
+	}
+
+	// Without Docker there is no DOCKER-USER chain and nothing is hooked.
+	fw, f = newFake()
+	fw.run = func(name string, args ...string) ([]byte, error) {
+		if len(args) > 3 && args[2] == "-S" && args[3] == DockerChain {
+			return []byte("iptables: No chain/target/match by that name."), exitErr(1)
+		}
+		return f.run(name, args...)
+	}
+	if err := fw.Ban("203.0.113.9"); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, "-I DOCKER-USER") {
+			t.Errorf("hooked a chain that does not exist: %s", c)
+		}
+	}
+}

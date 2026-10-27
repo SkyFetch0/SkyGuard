@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -80,5 +81,22 @@ analysis:
 	}
 	if strings.Contains(err.Error(), `"f"`) {
 		t.Errorf("disabled honeypot should not claim its port: %v", err)
+	}
+}
+
+func TestContainersNeedAnAuthenticatedDashboard(t *testing.T) {
+	base := "dashboard: {enabled: true, listen: \"127.0.0.1:9090\"%s}\ncontainers: {docker: {enabled: true}}\n"
+	if _, err := Parse([]byte(fmt.Sprintf(base, ""))); err == nil || !strings.Contains(err.Error(), "dashboard.auth") {
+		t.Errorf("container management without a password: %v", err)
+	}
+	if _, err := Parse([]byte(fmt.Sprintf(base, ", auth: {username: admin, password: CHANGE_ME_NOW}"))); err == nil {
+		t.Error("container management with the example password accepted")
+	}
+	cfg, err := Parse([]byte(fmt.Sprintf(base, ", auth: {username: admin, password: \"long enough pw\"}")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Containers.Docker.Socket != DefaultDockerSocket || cfg.Containers.Incus.Socket != DefaultIncusSocket || cfg.Containers.Incus.Enabled {
+		t.Errorf("defaults %+v", cfg.Containers)
 	}
 }

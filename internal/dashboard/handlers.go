@@ -543,5 +543,6 @@ func (d *Dashboard) handleInfo(w http.ResponseWriter, _ *http.Request) {
 		"firewall_method":  d.fw.Method(),
 		"auto_ban_enabled": ab.Enabled,
 		"score_threshold":  ab.ScoreThreshold,
+		"containers":       d.ctr != nil,
 	})
 }

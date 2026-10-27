@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/skyguard/skyguard/internal/config"
+	"github.com/skyguard/skyguard/internal/containers"
 	"github.com/skyguard/skyguard/internal/firewall"
 	"github.com/skyguard/skyguard/internal/netutil"
 	"github.com/skyguard/skyguard/internal/storage"
@@ -61,6 +62,7 @@ type Dashboard struct {
 	fw       firewall.Firewall
 	settings *storage.Settings
 	bans     Controller
+	ctr      *containers.Manager // nil unless the config enables an engine
 	logger   *slog.Logger
 	server   *http.Server
 }
@@ -170,6 +172,7 @@ func (d *Dashboard) routes() http.Handler {
 	api.HandleFunc("POST /api/settings", d.csrf(d.handlePostSettings))
 	api.HandleFunc("POST /api/ban", d.csrf(d.handleBan))
 	api.HandleFunc("POST /api/unban", d.csrf(d.handleUnban))
+	d.containerRoutes(api)
 
 	var protected http.Handler = api
 	if d.cfg.Auth.Username != "" && d.cfg.Auth.Password != "" {

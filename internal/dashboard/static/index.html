@@ -34,6 +34,9 @@
     <a href="#services" data-nav="services" data-tip="Honeypots and services" aria-label="Honeypots and services">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/></svg><span class="label">Honeypots</span>
     </a>
+    <a href="#containers" data-nav="containers" data-tip="Containers" aria-label="Containers">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9z"/><path d="m4 7.5 8 4.5 8-4.5M12 12v9"/></svg><span class="label">Containers</span>
+    </a>
     <div class="bottom">
       <a href="#settings" data-nav="settings" data-tip="Auto-ban and firewall" aria-label="Auto-ban and firewall settings">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span class="label">Settings</span>
@@ -230,6 +233,51 @@
       </article>
     </section>
 
+    <!-- CONTAINERS: what runs next to SkyGuard, and how is it wired? -->
+    <section class="screen" id="screen-containers" data-screen="containers" hidden>
+      <div class="title-row">
+        <div>
+          <p class="brandline" translate="no"><b>SkyGuard</b> · <span data-host>this server</span></p>
+          <h1>Containers</h1>
+          <p class="sub" id="ct-sub">Loading the containers on this server…</p>
+        </div>
+        <div class="title-tools">
+          <div class="choice" role="group" aria-label="Container engine" id="ct-engines" hidden></div>
+          <span class="stamp" data-stamp>—</span>
+          <button class="icon-btn" type="button" data-action="refresh" aria-label="Refresh now"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button>
+        </div>
+      </div>
+      <article class="panel">
+        <header><h2>Patch bay</h2><span class="meta" id="bay-meta">Click a container's socket, then another container or a network</span></header>
+        <div class="bay-wrap" id="bay-wrap"><div class="bay" id="bay"></div></div>
+        <p class="stamp bay-help" id="bay-help" role="status"></p>
+      </article>
+      <div class="grid">
+        <article class="panel span-7">
+          <header><h2>Host ports</h2><span class="meta" id="hp-meta">Who holds each port on this server</span></header>
+          <div class="table-wrap"><table>
+            <thead><tr><th class="n">Port</th><th>Held by</th><th>Forwards to</th><th class="n">State</th></tr></thead>
+            <tbody id="host-ports"></tbody>
+          </table></div>
+        </article>
+        <div class="span-5 stack">
+          <article class="panel">
+            <header><h2>Networks</h2><span class="meta" id="net-meta"></span></header>
+            <ol class="rank" id="ct-networks"></ol>
+            <form class="filters net-form" id="net-form">
+              <label class="grow-field"><span class="sr-only">New network name</span><input class="input mono" name="name" placeholder="New network, e.g. backend…" maxlength="63" autocomplete="off" spellcheck="false" translate="no" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*"></label>
+              <button class="btn" type="submit" id="net-submit">Create network</button>
+            </form>
+          </article>
+          <article class="panel grow">
+            <header><h2>Open to the internet</h2><span class="meta" id="open-meta"></span></header>
+            <p class="cover" id="ban-cover"></p>
+            <ol class="rank" id="open-ports"></ol>
+          </article>
+        </div>
+      </div>
+    </section>
+
     <!-- SETTINGS -->
     <section class="screen" id="screen-settings" data-screen="settings" hidden>
       <div class="title-row">
@@ -307,6 +355,45 @@
     <div><h3>Activity by day</h3><div class="chart" id="ip-chart" style="min-height:120px"></div></div>
     <div><h3>Credentials tried</h3><div class="table-wrap"><table><thead><tr><th>Time</th><th>Honeypot</th><th>Username</th><th>Password</th></tr></thead><tbody id="ip-creds"></tbody></table></div></div>
     <div><h3>Latest connections</h3><div class="table-wrap"><table><thead><tr><th>Time</th><th>Service</th><th class="n">Port</th><th>Details</th><th class="n">Outcome</th></tr></thead><tbody id="ip-conns"></tbody></table></div></div>
+  </div>
+</dialog>
+
+<!-- Patch one container to another -->
+<dialog class="modal" id="connect-dialog" aria-labelledby="connect-title">
+  <form method="dialog" id="connect-form">
+    <h2 id="connect-title">Connect</h2>
+    <p id="connect-text"></p>
+    <div class="options" id="connect-options" role="radiogroup" aria-labelledby="connect-title"></div>
+    <p class="stamp" id="connect-error" role="alert"></p>
+    <div class="dialog-actions"><button class="btn" type="button" data-action="close-dialog">Cancel</button><button class="btn primary" type="submit" id="connect-submit">Connect</button></div>
+  </form>
+</dialog>
+
+<!-- One container, in detail -->
+<dialog class="sheet" id="ct-sheet" aria-labelledby="ct-title">
+  <div class="sheet-body">
+    <div class="sheet-head"><h2 id="ct-title">—</h2><span id="ct-tags"></span><button class="icon-btn" type="button" data-action="close-dialog" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+    <dl class="facts" id="ct-facts"></dl>
+    <div class="form-actions" id="ct-actions"></div>
+    <p class="stamp" id="ct-note"></p>
+    <form id="ports-form" class="sheet-form">
+      <div class="sheet-form-head"><h3>Published ports</h3><button class="card-link" type="button" data-action="port-add">Add a port</button></div>
+      <div class="port-rows" id="port-rows"></div>
+      <p class="hint" id="ports-hint"></p>
+      <div class="form-actions"><button class="btn primary" type="submit" id="ports-submit">Save ports</button><span class="stamp" id="ports-msg" role="status"></span></div>
+    </form>
+    <div><h3>Networks</h3><div class="table-wrap"><table><thead><tr><th>Network</th><th>Address</th><th>Aliases</th><th></th></tr></thead><tbody id="ct-nets"></tbody></table></div></div>
+    <form id="limits-form" class="sheet-form">
+      <h3>Restart and limits</h3>
+      <div class="field"><span>When it stops</span><div class="choice" role="group" aria-label="Restart policy" id="restart-group"></div></div>
+      <div class="limits">
+        <label class="field"><span>Memory limit</span><span class="unit-input"><input class="input mono" name="memory_mb" type="number" min="0" step="1" inputmode="numeric" autocomplete="off"><span>MB</span></span><span class="hint">0 = no limit</span></label>
+        <label class="field"><span>CPU limit</span><span class="unit-input"><input class="input mono" name="cpus" type="number" min="0" step="0.25" inputmode="decimal" autocomplete="off"><span>CPUs</span></span><span class="hint" id="cpu-hint">0 = no limit</span></label>
+      </div>
+      <p class="hint" id="limits-hint"></p>
+      <div class="form-actions"><button class="btn primary" type="submit" id="limits-submit">Save</button><span class="stamp" id="limits-msg" role="status"></span></div>
+    </form>
+    <div id="ct-mounts-block"><h3>Storage</h3><ul class="mounts" id="ct-mounts"></ul></div>
   </div>
 </dialog>
 

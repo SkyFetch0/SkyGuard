@@ -133,7 +133,32 @@ func (f *IPTablesFirewall) ensureChain(bin string) error {
 			return fmt.Errorf("%s -I INPUT -j %s: %w (%s)", bin, Chain, err, strings.TrimSpace(string(out)))
 		}
 	}
+	f.hookDockerUser(bin)
 	return nil
+}
+
+// DockerChain is where Docker leaves room for the operator's own rules.
+const DockerChain = "DOCKER-USER"
+
+// hookDockerUser makes bans cover the ports Docker publishes too: that
+// traffic is DNAT-ed in PREROUTING and crosses FORWARD, never INPUT, so a
+// banned IP could still reach every container. Docker jumps to DOCKER-USER
+// before its own rules and never flushes it. The check repeats on every ban,
+// because Docker may start after SkyGuard.
+func (f *IPTablesFirewall) hookDockerUser(bin string) {
+	if _, err := f.ipt(bin, "-S", DockerChain); err != nil {
+		return // no Docker on this host (yet)
+	}
+	ok, err := f.exists(bin, DockerChain, "-j", Chain)
+	if err != nil || ok {
+		return
+	}
+	if out, err := f.ipt(bin, "-I", DockerChain, "1", "-j", Chain); err != nil {
+		f.logger.Warn("could not hook bans into Docker's forwarding path; banned IPs can still reach published container ports",
+			"binary", bin, "error", err, "output", strings.TrimSpace(string(out)))
+		return
+	}
+	f.logger.Info("bans now also cover ports published by Docker containers", "binary", bin, "chain", DockerChain)
 }
 
 func (f *IPTablesFirewall) binFor(ip string) (string, string, error) {
@@ -166,6 +191,7 @@ func (f *IPTablesFirewall) Ban(ip string) error {
 	if ok {
 		return nil
 	}
+	f.hookDockerUser(bin)
 	if out, err := f.ipt(bin, "-I", Chain, "1", "-s", canon, "-j", "DROP"); err != nil {
 		return fmt.Errorf("%s ban %s: %w (%s)", bin, canon, err, strings.TrimSpace(string(out)))
 	}
@@ -237,4 +263,17 @@ func (f *IPTablesFirewall) List() ([]string, error) {
 		lines = append(lines, splitNonEmptyLines(string(out))...)
 	}
 	return lines, nil
+}
+
+// CoversDocker reports whether bans reach the ports Docker publishes:
+// docker is false when the host has no DOCKER-USER chain (no Docker), and
+// covered says whether SkyGuard's chain is hooked into it.
+func (f *IPTablesFirewall) CoversDocker() (docker, covered bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, err := f.ipt(f.v4, "-S", DockerChain); err != nil {
+		return false, false
+	}
+	ok, err := f.exists(f.v4, DockerChain, "-j", Chain)
+	return true, err == nil && ok
 }

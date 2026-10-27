@@ -118,6 +118,7 @@ else
     for bin in iptables ip6tables iptables-legacy ip6tables-legacy iptables-nft ip6tables-nft; do
         command -v "$bin" &>/dev/null || continue
         while "$bin" -w 5 -D INPUT -j SKYGUARD 2>/dev/null; do :; done
+        while "$bin" -w 5 -D DOCKER-USER -j SKYGUARD 2>/dev/null; do :; done
         "$bin" -w 5 -F SKYGUARD 2>/dev/null || true
         "$bin" -w 5 -X SKYGUARD 2>/dev/null || true
     done

@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 
 	"github.com/skyguard/skyguard/internal/config"
+	"github.com/skyguard/skyguard/internal/containers"
 	"github.com/skyguard/skyguard/internal/dashboard"
 	"github.com/skyguard/skyguard/internal/honeypot"
 	"github.com/skyguard/skyguard/internal/stealth"
@@ -199,4 +201,46 @@ func (s *Server) SetServiceEnabled(name string, enabled bool) error {
 	}
 	s.logger.Info("honeypot switched from the dashboard", "name", rt.name, "enabled", enabled)
 	return nil
+}
+
+// containerManager builds the container manager when the config enables an
+// engine. It is told which host ports SkyGuard's own listeners hold, so a
+// container is never moved onto one of them.
+func (s *Server) containerManager() *containers.Manager {
+	cc := s.cfg.Containers
+	var engines []containers.Engine
+	if cc.Docker.Enabled {
+		engines = append(engines, containers.NewDocker(cc.Docker.Socket, s.logger.With("engine", "docker")))
+	}
+	if cc.Incus.Enabled {
+		engines = append(engines, containers.NewIncus(cc.Incus.Socket, cc.Incus.Project, s.logger.With("engine", "incus")))
+	}
+	if len(engines) == 0 {
+		return nil
+	}
+	s.logger.Warn("container management is enabled: the dashboard can control the host's containers, so keep its password strong and its address private",
+		"docker", cc.Docker.Enabled, "incus", cc.Incus.Enabled, "read_only", cc.ReadOnly)
+	m := containers.NewManager(engines, cc.ReadOnly, s.logger.With("component", "containers"))
+	m.Reserved = s.ReservedPorts
+	return m
+}
+
+// ReservedPorts lists the host ports SkyGuard's listeners hold or tried to
+// take, and the dashboard's own port.
+func (s *Server) ReservedPorts() []containers.Reserved {
+	var out []containers.Reserved
+	for _, st := range s.Services() {
+		if !st.Enabled || (!st.Running && st.Error == "") {
+			continue
+		}
+		out = append(out, containers.Reserved{Port: st.Port, Proto: "tcp", Owner: st.Kind + " " + st.Name, Failed: st.Error})
+	}
+	if s.cfg.Dashboard.Enabled {
+		if _, p, err := net.SplitHostPort(s.cfg.Dashboard.Listen); err == nil {
+			if n, err := strconv.Atoi(p); err == nil {
+				out = append(out, containers.Reserved{Port: n, Proto: "tcp", Owner: "dashboard"})
+			}
+		}
+	}
+	return out
 }

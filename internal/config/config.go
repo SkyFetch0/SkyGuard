@@ -22,8 +22,35 @@ type Config struct {
 	Whitelist   WhitelistConfig      `yaml:"whitelist"`
 	Blacklist   BlacklistConfig      `yaml:"blacklist"`
 	Dashboard   DashboardConfig      `yaml:"dashboard"`
+	Containers  ContainersConfig     `yaml:"containers"`
 	Logging     LoggingConfig        `yaml:"logging"`
 }
+
+// ContainersConfig lets the dashboard manage the host's Docker containers
+// and Incus instances. Either socket is equivalent to root on the host, so
+// both engines are off unless enabled here.
+type ContainersConfig struct {
+	ReadOnly bool              `yaml:"read_only"` // list only, no changes
+	Docker   ContainerEngine   `yaml:"docker"`
+	Incus    IncusEngineConfig `yaml:"incus"`
+}
+
+type ContainerEngine struct {
+	Enabled bool   `yaml:"enabled"`
+	Socket  string `yaml:"socket"`
+}
+
+type IncusEngineConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Socket  string `yaml:"socket"`
+	Project string `yaml:"project"` // empty = the default project
+}
+
+// Default engine sockets.
+const (
+	DefaultDockerSocket = "/var/run/docker.sock"
+	DefaultIncusSocket  = "/var/lib/incus/unix.socket"
+)
 
 type GeneralConfig struct {
 	LogLevel string `yaml:"log_level"`
@@ -246,6 +273,12 @@ func applyDefaults(cfg *Config, banDurationSet bool) {
 	if cfg.Dashboard.Listen == "" {
 		cfg.Dashboard.Listen = DefaultDashboardListen
 	}
+	if cfg.Containers.Docker.Socket == "" {
+		cfg.Containers.Docker.Socket = DefaultDockerSocket
+	}
+	if cfg.Containers.Incus.Socket == "" {
+		cfg.Containers.Incus.Socket = DefaultIncusSocket
+	}
 	if cfg.Logging.DBPath == "" {
 		cfg.Logging.DBPath = filepath.Join(cfg.General.DataDir, "skyguard.db")
 	}
@@ -352,6 +385,16 @@ func (c *Config) Validate() error {
 			if host == "" || ip == nil || ip.IsUnspecified() || ip.IsLoopback() {
 				claim(port, "dashboard")
 			}
+		}
+	}
+
+	if c.Containers.Docker.Enabled || c.Containers.Incus.Enabled {
+		if !c.Dashboard.Enabled {
+			errs = append(errs, errors.New("containers: container management is part of the dashboard; enable the dashboard too"))
+		}
+		// Whoever reaches an unauthenticated panel would get root on the host.
+		if pw := c.Dashboard.Auth.Password; c.Dashboard.Auth.Username == "" || len(pw) < 8 || pw == "CHANGE_ME_NOW" {
+			errs = append(errs, errors.New("containers: container management needs dashboard.auth with a strong password (8+ characters, not the example's)"))
 		}
 	}
 

@@ -93,6 +93,7 @@ Passthrough services only apply steps 1–4 (real users must not be rate-limited
 | 🛡️ **DoS guard** | Semaphore caps concurrent connections at 4 096 |
 | 📦 **Storage** | Single-file SQLite, WAL mode, auto-purge old records |
 | 🌐 **Dashboard** | Browser UI with live polling + JSON REST API |
+| 🧩 **Containers** | Opt-in Docker and Incus management: start/stop, published ports, restart policy, limits, and a patch bay to wire containers into each other's networks |
 | 🐳 **Docker** | Multi-stage image (`golang:1.27` → `debian:trixie-slim` with iptables-legacy + iptables-nft), built-in health check |
 | ⚙️ **Config** | Single YAML file; hot-toggleable services (`enabled: false`) |
 | 0️⃣ **Zero deps** | CGO disabled — pure Go binary, no shared libraries |
@@ -243,6 +244,80 @@ analysis:
 
 ---
 
+## Containers (Docker and Incus)
+
+The dashboard can manage the containers that run next to SkyGuard. Both
+engines are spoken to directly over their unix sockets (Docker Engine API,
+Incus REST API), so no CLI is needed inside SkyGuard's container. Access to
+either socket is equivalent to root on the host, so it is **off** until you
+enable it, it requires `dashboard.auth`, and `read_only: true` limits it to
+listing.
+
+```yaml
+containers:
+  read_only: false
+  docker: { enabled: true, socket: /var/run/docker.sock }
+  incus:  { enabled: false, socket: /var/lib/incus/unix.socket, project: "" }
+```
+
+With docker compose, mount the sockets you enable (`docker-compose.yml` has
+the lines commented out; the installer adds them when you say yes):
+
+```yaml
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/incus:/var/lib/incus:ro   # the directory: Incus recreates its socket on restart
+```
+
+What each change does:
+
+| Change | Docker | Incus |
+|---|---|---|
+| Start / stop / restart | in place (10 s stop timeout) | in place (30 s) |
+| Join / leave a network | `network connect` / `disconnect`, live | a `nic` device added / removed live (a profile's nic is masked with `type: none`) |
+| Published ports | **recreates the container** (Docker cannot change ports in place): same image ID, config, labels, networks with aliases and static IPs, named and anonymous volumes; the old one is renamed aside and removed only after the new one starts, otherwise it is put back unchanged | proxy devices (`listen tcp:0.0.0.0:8080`, `connect tcp:127.0.0.1:80`) added / removed live |
+| Restart policy | live (`no`, `on-failure`, `unless-stopped`, `always`) | `boot.autostart` (`no`, `last-state`, `always`) |
+| Memory / CPU limit | set or raise live; removing one recreates the container | `limits.memory` / `limits.cpu`, live |
+
+A port is refused before anything changes when another running container
+publishes it, a SkyGuard listener (or the dashboard) holds it, or a program on
+the host is bound to it. SkyGuard's own container is protected: it can be
+listed but not stopped, restarted or re-ported from the panel. A container
+that belongs to a Compose project gets its compose file's ports back on the
+next `docker compose up`, so change those there too; the sheet says so.
+
+**Bans cover container ports.** Traffic to a port Docker publishes is DNAT-ed
+and crosses `FORWARD`, never `INPUT`, so a ban in `INPUT` alone let a banned IP
+keep reaching every container. SkyGuard now also jumps to its `SKYGUARD` chain
+from the top of `DOCKER-USER` (checked again on every ban, since Docker may
+start later); `uninstall.sh` removes the jump. Incus proxy devices accept on
+the host and are covered through `INPUT`. With `method: ufw` Docker's ports
+are not covered (ufw never sees forwarded traffic); use `iptables`.
+
+### Sharing ports 80/443 with a reverse proxy (Nginx Proxy Manager, Traefik, Caddy)
+
+Only one process can listen on a port. If a reverse proxy container publishes
+80 and 443, SkyGuard's `fake-http` honeypot (port 80) and an HTTPS
+`passthrough` (port 443) cannot have them, and SkyGuard refuses to start with
+the owner named (`address already in use`). The installer detects this and
+leaves those listeners off. Pick one of:
+
+1. **The proxy keeps 80/443 (recommended).** Disable `fake-http` or move it
+   to a port nothing real uses (`port: 8081`), and leave the passthrough off.
+   The *Host ports* table shows who holds what; bans still protect the proxy
+   through `DOCKER-USER`.
+2. **SkyGuard in front.** Publish the proxy on loopback only
+   (`127.0.0.1:8080:80`, `127.0.0.1:8443:443`) and let SkyGuard forward with
+   two `passthrough_services` (80 → `127.0.0.1:8080`, 443 →
+   `127.0.0.1:8443`). Every connection is then logged, scored and bannable
+   before it reaches the proxy, but the proxy sees `127.0.0.1` as the client
+   address (TCP passthrough has no PROXY protocol), so its own access lists
+   and logs lose the real IP. Change the ports from the container's sheet in
+   the dashboard, or in its compose file.
+
+SkyGuard's listeners bind every address (`:80`), so the proxy cannot keep
+`127.0.0.1:80` either: in option 2 it moves to other ports.
+
 ## Dashboard & REST API
 
 Access the dashboard via an SSH tunnel (never expose it directly):
@@ -259,6 +334,7 @@ ssh -L 9090:127.0.0.1:9090 user@your-server
 - **Attackers and bans** — threat scores against the auto-ban threshold, active bans with confirmed unban, ban reasons, a ban dialog (1 h / 1 day / 7 days / permanent).
 - **Captured credentials** — most tried usernames and passwords, attempts per honeypot and over time, the most frequent pairs.
 - **Honeypots and services** — switch each honeypot on or off at runtime (the listener opens or closes at once; the choice survives restarts until you change that honeypot in the config file), with 24-hour activity per service. Stealth and passthrough services are shown read-only: turning them off from a panel you usually reach through them could cut your own session.
+- **Containers** (opt-in, see [Containers](#containers-docker-and-incus)) — a *patch bay*: the server's Docker containers or Incus instances down the left, their networks across the top, a cable from each container to every network it is on. Click a container's socket and a cable follows the pointer; drop it on another container and the two get a network in common (join one of the other's, or a new one for the pair), drop it on a network to join it, click a lit jack to leave. Start, stop and restart; edit published ports, restart policy and memory/CPU limits in a side sheet. A host-port table names whoever holds each port (SkyGuard listeners included) and flags conflicts; *Open to the internet* lists every container port bound on all addresses and whether a ban stops traffic there.
 - **Auto-ban and firewall** — switch, threshold stepper, ban length, and the SKYGUARD chain's current rules.
 - **IP detail** — a side sheet with score, daily activity, credentials and connections for any address.
 
@@ -289,6 +365,14 @@ State-changing `POST` endpoints require the header `X-SkyGuard-Request: 1` (CSRF
 | `GET`/`POST` | `/api/settings` | Auto-ban settings (partial updates) |
 | `POST` | `/api/ban` | `ip`, `duration` (`24h`, `7d`, `0` = permanent), `permanent`, `reason` — whitelisted IPs are refused |
 | `POST` | `/api/unban` | `ip` — also resets the IP's score |
+| `GET` | `/api/containers` | `enabled`, engines and their state, containers, networks, `host_ports` (every claimant per port, conflicts first), `ban_coverage` |
+| `GET` | `/api/containers/inspect?engine=&id=` | One container with restart policy, limits, mounts |
+| `POST` | `/api/containers/action` | `engine`, `id`, `action` = `start` \| `stop` \| `restart` |
+| `POST` | `/api/containers/connect` | `engine`, `id`, `network`, `create=1` to create the network first |
+| `POST` | `/api/containers/disconnect` | `engine`, `id`, `network` |
+| `POST` | `/api/containers/ports` | `engine`, `id`, `ports` in `docker run -p` form, comma separated (`8080:80,127.0.0.1:8443:443/tcp`); empty unpublishes all |
+| `POST` | `/api/containers/settings` | `engine`, `id`, `restart`, `memory_mb`, `cpus` (0 removes a limit) |
+| `POST` | `/api/containers/networks` | `engine`, `name` — create a bridge network |
 
 ```bash
 curl -u admin:password http://localhost:9090/api/stats
@@ -329,6 +413,7 @@ skyguard/
 
 > SkyGuard is a **detection and logging** layer. It complements — but does not replace — a properly configured host firewall and a patched OS.
 
+- **Container management is root on the host.** Enable `containers.docker` / `containers.incus` only with a strong dashboard password, keep the dashboard on loopback, and prefer `read_only: true` if you only want to look.
 - **Never expose the dashboard publicly.** It binds to `127.0.0.1` by default. Use an SSH tunnel or an mTLS reverse proxy.
 - **Add your own IP to `whitelist.ips`** before enabling auto-ban — you can lock yourself out.
 - **Rotate the default password.** The example config ships with `CHANGE_ME_NOW`.

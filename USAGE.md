@@ -22,6 +22,7 @@
    - [3f. Whitelist and Blacklist](#3f-whitelist-and-blacklist)
    - [3g. Dashboard Authentication](#3g-dashboard-authentication)
    - [3h. Logging and Retention](#3h-logging-and-retention)
+   - [3i. Containers (Docker and Incus)](#3i-containers-docker-and-incus)
 4. [Stealth SSH Setup](#4-stealth-ssh-setup)
 5. [Honeypot Services](#5-honeypot-services)
 6. [Dashboard Usage](#6-dashboard-usage)
@@ -479,6 +480,41 @@ logging:
 | `logging.retention_days` | int | `30` | Connection records older than this many days are deleted automatically. |
 | `logging.log_first_bytes` | int | `512` | Number of bytes to capture from the beginning of each connection payload. |
 
+
+---
+
+### 3i. Containers (Docker and Incus)
+
+```yaml
+containers:
+  read_only: false        # true: the Containers screen lists, nothing changes
+  docker:
+    enabled: true
+    socket: "/var/run/docker.sock"
+  incus:
+    enabled: false
+    socket: "/var/lib/incus/unix.socket"
+    project: ""           # empty = the default project
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `containers.docker.enabled` | `false` | Manage the host's Docker containers from the dashboard. |
+| `containers.docker.socket` | `/var/run/docker.sock` | Docker Engine API socket. Mount it into SkyGuard's container. |
+| `containers.incus.enabled` | `false` | Manage Incus instances. |
+| `containers.incus.socket` | `/var/lib/incus/unix.socket` | Incus REST API socket. Mount `/var/lib/incus` (read-only is enough), not the socket file, which Incus recreates when it restarts. |
+| `containers.incus.project` | `""` | Incus project. |
+| `containers.read_only` | `false` | List only. |
+
+Either socket gives root on the host. Validation refuses container management
+without `dashboard.auth` or with the dashboard disabled. Every change is
+logged with the client address (`container change requested`, `container
+changed from the dashboard`).
+
+See the README's *Containers* section for what each change does, how port
+changes recreate a Docker container safely, and how to share ports 80/443 with
+a reverse proxy such as Nginx Proxy Manager.
+
 ---
 
 ## 4. Stealth SSH Setup
@@ -871,6 +907,26 @@ Whitelisted and loopback addresses cannot be banned (`400`).
 | `GET /api/credentials/breakdown?range=…` | `usernames`, `passwords`, `services` |
 | `GET /api/services` | every configured service: `kind`, `type`, `port`, `enabled`, `running`, `toggleable`, `error`, `hits_24h`, `credentials_24h`, `hourly` |
 | `POST /api/services` | `name`, `enabled` — switches a **honeypot** on or off at runtime (stealth and passthrough are config-managed and refused with `409`) |
+
+#### Containers
+
+Present when `containers.docker` or `containers.incus` is enabled; otherwise
+`GET /api/containers` returns `{"enabled": false}` and changes return `404`.
+Changes return the container as it is afterwards (a recreated Docker
+container has a new `id`). Errors: `400` malformed input, `403` read-only,
+`404` unknown container, `409` refused (port in use, SkyGuard's own container,
+the engine's own error message).
+
+| Endpoint | Returns / takes |
+|---|---|
+| `GET /api/containers` | `engines` (`name`, `available`, `version`, `error`, `restart_policies`), `containers`, `networks` (`members`, `attachable`, `builtin`), `host_ports` (`port`, `proto`, `owners`, `conflict`), `ban_coverage` (`method`, `docker_chain`, `docker_covered`), `read_only` |
+| `GET /api/containers/inspect?engine=&id=` | one container with `restart`, `memory_mb`, `cpus`, `mounts`, `exposed` |
+| `POST /api/containers/action` | `engine`, `id`, `action` (`start`, `stop`, `restart`) |
+| `POST /api/containers/connect` | `engine`, `id`, `network`, optional `create=1` |
+| `POST /api/containers/disconnect` | `engine`, `id`, `network` |
+| `POST /api/containers/ports` | `engine`, `id`, `ports`: `8080:80,127.0.0.1:8443:443/tcp,[::1]:53:53/udp` (empty = none) |
+| `POST /api/containers/settings` | `engine`, `id`, `restart`, `memory_mb`, `cpus` (omit a field to keep it, `0` removes a limit) |
+| `POST /api/containers/networks` | `engine`, `name` |
 
 A honeypot switched from the dashboard stays that way across restarts. When
 you later change that honeypot's `enabled` value in the config file, the file

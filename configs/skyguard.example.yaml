@@ -138,6 +138,23 @@ dashboard:
     username: "admin"
     password: "CHANGE_ME_NOW"   # use a strong password
 
+# ── Containers ───────────────────────────────────────────────────────────────
+# The dashboard's Containers screen: list the host's Docker containers and
+# Incus instances, start/stop them, change their published ports, restart
+# policy and limits, and patch them into each other's networks.
+# Access to either socket is equivalent to root on the host, so this needs
+# dashboard.auth, and it is off until enabled here. With docker compose, also
+# mount the socket (see docker-compose.yml).
+containers:
+  read_only: false        # true: list only, no changes
+  docker:
+    enabled: false
+    socket: "/var/run/docker.sock"
+  incus:
+    enabled: false
+    socket: "/var/lib/incus/unix.socket"
+    project: ""           # empty = the default project
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging:
   database: "sqlite"

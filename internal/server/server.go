@@ -131,6 +131,9 @@ func New(cfg *config.Config, db *storage.DB, logger *slog.Logger) (*Server, erro
 
 	if cfg.Dashboard.Enabled {
 		s.dash = dashboard.New(cfg.Dashboard, db, fw, settings, s, logger)
+		if m := s.containerManager(); m != nil {
+			s.dash.SetContainers(m)
+		}
 	}
 	s.warnRiskyConfig()
 	return s, nil

@@ -17,6 +17,12 @@ services:
     volumes:
       - ./data:/data
       - ./configs/skyguard.yaml:/etc/skyguard/skyguard.yaml:ro
+      # Container management (containers.docker / containers.incus in the
+      # config): uncomment the engines you enable. Either socket is root on
+      # the host. Incus's directory is mounted because its socket is
+      # recreated whenever Incus restarts.
+      # - /var/run/docker.sock:/var/run/docker.sock
+      # - /var/lib/incus:/var/lib/incus:ro
     environment:
       - SKYGUARD_CONFIG=/etc/skyguard/skyguard.yaml
       - TZ=Europe/Istanbul   # only affects log display; data is stored in UTC

@@ -115,6 +115,10 @@ declare -A I18N_EN=(
     [dash_pass_mismatch]="Passwords do not match. Try again."
     [dash_pass_generated]="Empty password not allowed. Generated: %s"
     [q_log_retention]="Log retention in days"
+    [sec_containers]="Container management"
+    [containers_desc]="The dashboard can list, start and stop, re-port and re-wire this server's Docker containers and Incus instances. Their sockets are equivalent to root, so keep the dashboard password strong."
+    [q_containers_docker]="Manage Docker containers from the dashboard?"
+    [q_containers_incus]="Manage Incus instances from the dashboard?"
 
     # summary
     [sum_install_dir]="Install directory"
@@ -267,6 +271,10 @@ declare -A I18N_TR=(
     [dash_pass_mismatch]="Parolalar eşleşmiyor. Tekrar deneyin."
     [dash_pass_generated]="Boş parola kullanılamaz. Oluşturulan: %s"
     [q_log_retention]="Log saklama süresi (gün)"
+    [sec_containers]="Konteyner yönetimi"
+    [containers_desc]="Dashboard bu sunucudaki Docker konteynerlerini ve Incus instance'larını listeleyebilir, başlatıp durdurabilir, portlarını ve ağlarını değiştirebilir. Bu soketlere erişim root yetkisine eşittir; dashboard parolasını güçlü tutun."
+    [q_containers_docker]="Docker konteynerleri dashboard'dan yönetilsin mi?"
+    [q_containers_incus]="Incus instance'ları dashboard'dan yönetilsin mi?"
 
     # summary
     [sum_install_dir]="Kurulum dizini"
@@ -439,6 +447,12 @@ port_owner() {
     [[ -z "$line" ]] && return 0
     proc=$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$line")
     [[ "$proc" == "skyguard" ]] && return 0
+    # A port Docker publishes belongs to docker-proxy; name the container instead.
+    if [[ "$proc" == "docker-proxy" ]] && command -v docker &>/dev/null; then
+        local names
+        names=$(docker ps --filter "publish=${port}" --format '{{.Names}}' 2>/dev/null | paste -sd, - || true)
+        [[ -n "$names" ]] && proc="docker container ${names}"
+    fi
     echo "${proc:-unknown}"
 }
 
@@ -634,6 +648,18 @@ if confirm "$(t q_enable_dashboard "$DASHBOARD_PORT")"; then
 fi
 
 LOG_RETENTION=$(prompt_match "$(t q_log_retention)" "90" "$RE_INT")
+
+# -- container management (needs the dashboard, which always has a password here) --
+CONTAINERS_DOCKER=false
+CONTAINERS_INCUS=false
+if $DASHBOARD_ENABLED; then
+    section "$(t sec_containers)"
+    info "$(t containers_desc)"
+    confirm "$(t q_containers_docker)" "n" && CONTAINERS_DOCKER=true
+    if [[ -S /var/lib/incus/unix.socket ]]; then
+        confirm "$(t q_containers_incus)" "n" && CONTAINERS_INCUS=true
+    fi
+fi
 
 # -- port conflicts --
 # A honeypot cannot bind a port another process already holds; SkyGuard would
@@ -927,6 +953,17 @@ dashboard:
     username: $(yaml_str "${DASHBOARD_USER}")
     password: $(yaml_str "${DASHBOARD_PASS}")
 
+# Container management in the dashboard (the sockets are mounted into the
+# container by docker-compose.yml when enabled).
+containers:
+  read_only: false
+  docker:
+    enabled: ${CONTAINERS_DOCKER}
+    socket: "/var/run/docker.sock"
+  incus:
+    enabled: ${CONTAINERS_INCUS}
+    socket: "/var/lib/incus/unix.socket"
+
 logging:
   database: "sqlite"
   db_path: "/data/skyguard.db"
@@ -952,6 +989,11 @@ fi
 # itself; we only make sure the jump exists early so bans win over ACCEPTs.
 iptables -N SKYGUARD 2>/dev/null || true
 iptables -C INPUT -j SKYGUARD 2>/dev/null || iptables -I INPUT 1 -j SKYGUARD
+# Ports Docker publishes are reached through FORWARD, not INPUT: hook the
+# same chain into DOCKER-USER so a ban covers the containers too.
+if iptables -nL DOCKER-USER &>/dev/null; then
+    iptables -C DOCKER-USER -j SKYGUARD 2>/dev/null || iptables -I DOCKER-USER 1 -j SKYGUARD
+fi
 
 [[ "$FW_FRONTEND" != "iptables" ]] && info "$(t fw_frontend "$FW_FRONTEND")"
 
@@ -1024,6 +1066,15 @@ fi
 section "$(t sec_phase6)"
 TZ_VAL=$(cat /etc/timezone 2>/dev/null || timedatectl show --value -p Timezone 2>/dev/null || echo "UTC")
 
+# The engine sockets, only when container management is enabled. Incus's
+# directory is mounted rather than its socket, which is recreated whenever
+# Incus restarts.
+compose_socket_mounts() {
+    $CONTAINERS_DOCKER && echo "      - /var/run/docker.sock:/var/run/docker.sock"
+    $CONTAINERS_INCUS && echo "      - /var/lib/incus:/var/lib/incus:ro"
+    return 0
+}
+
 cat > "${INSTALL_DIR}/docker-compose.yml" <<COMPOSE
 services:
   skyguard:
@@ -1038,6 +1089,7 @@ services:
     volumes:
       - ${DATA_DIR}:/data
       - ${CONFIG_FILE}:/etc/skyguard/skyguard.yaml:ro
+$(compose_socket_mounts)
     environment:
       - SKYGUARD_CONFIG=/etc/skyguard/skyguard.yaml
       - TZ=${TZ_VAL}
