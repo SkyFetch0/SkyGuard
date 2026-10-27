@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -333,4 +334,214 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dd", d/day)
 	}
 	return d.String()
+}
+
+// chartRange maps the ?range= parameter to a window and its bucket size.
+type chartRange struct {
+	Name  string        `json:"name"`
+	Span  time.Duration `json:"-"`
+	Step  time.Duration `json:"-"`
+	Since time.Time     `json:"since"`
+	Until time.Time     `json:"until"`
+	// Bucket is "hour" or "day".
+	Bucket string `json:"bucket"`
+}
+
+func parseRange(q url.Values) chartRange {
+	r := chartRange{Name: "24h", Span: 24 * time.Hour, Step: time.Hour, Bucket: "hour"}
+	switch q.Get("range") {
+	case "7d":
+		r = chartRange{Name: "7d", Span: 7 * 24 * time.Hour, Step: time.Hour, Bucket: "hour"}
+	case "30d":
+		r = chartRange{Name: "30d", Span: 30 * 24 * time.Hour, Step: 24 * time.Hour, Bucket: "day"}
+	}
+	// The window ends at the end of the current bucket, so the last bar is
+	// the bucket in progress and the first is a whole one.
+	r.Until = time.Now().UTC().Truncate(r.Step).Add(r.Step)
+	r.Since = r.Until.Add(-r.Span)
+	return r
+}
+
+// handleSummary returns everything the overview needs for one range: the
+// counters for this and the previous period, where connections ended up,
+// and the busiest sources, services, countries and ports.
+func (d *Dashboard) handleSummary(w http.ResponseWriter, r *http.Request) {
+	rg := parseRange(r.URL.Query())
+	cur, err := d.db.Summary(rg.Since, rg.Until)
+	if err != nil {
+		d.internalError(w, "summary", err)
+		return
+	}
+	prev, err := d.db.Summary(rg.Since.Add(-rg.Span), rg.Since)
+	if err != nil {
+		d.internalError(w, "summary", err)
+		return
+	}
+	stats, err := d.db.GetStats()
+	if err != nil {
+		d.internalError(w, "summary", err)
+		return
+	}
+	outcomes, err := d.db.Outcomes(rg.Since, rg.Until)
+	if err != nil {
+		d.internalError(w, "outcomes", err)
+		return
+	}
+	sources, err := d.db.TopSources(rg.Since, rg.Until, 8)
+	if err != nil {
+		d.internalError(w, "top sources", err)
+		return
+	}
+	out := map[string]any{
+		"range":       rg,
+		"current":     cur,
+		"previous":    prev,
+		"active_bans": stats.ActiveBans,
+		"outcomes":    outcomes,
+		"top_sources": sources,
+	}
+	for _, by := range []string{"service", "country", "port"} {
+		rows, err := d.db.Breakdown(by, rg.Since, rg.Until, 8)
+		if err != nil {
+			d.internalError(w, "breakdown", err)
+			return
+		}
+		out[by+"s"] = rows
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleSeries returns per-hour (24h, 7d) or per-day (30d) counts.
+func (d *Dashboard) handleSeries(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	rg := parseRange(q)
+	var f storage.SeriesFilter
+	if v := q.Get("ip"); v != "" {
+		f.IP = netutil.NormalizeIP(v)
+		if net.ParseIP(f.IP) == nil {
+			writeError(w, http.StatusBadRequest, "invalid ip")
+			return
+		}
+	}
+	if v := q.Get("port"); v != "" {
+		p, err := strconv.Atoi(v)
+		if err != nil || p < 1 || p > 65535 {
+			writeError(w, http.StatusBadRequest, "invalid port")
+			return
+		}
+		f.Port = p
+	}
+	buckets, err := d.db.Series(rg.Since, rg.Until, rg.Step, f)
+	if err != nil {
+		d.internalError(w, "series", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"range": rg, "buckets": buckets})
+}
+
+// handleCredentialBreakdown returns the most tried usernames and passwords
+// and the credentials per service for one range.
+func (d *Dashboard) handleCredentialBreakdown(w http.ResponseWriter, r *http.Request) {
+	rg := parseRange(r.URL.Query())
+	out := map[string]any{"range": rg}
+	for _, by := range []string{"username", "password", "service"} {
+		rows, err := d.db.CredentialBreakdown(by, rg.Since, rg.Until, 10)
+		if err != nil {
+			d.internalError(w, "credential breakdown", err)
+			return
+		}
+		out[by+"s"] = rows
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// serviceView is a service with its traffic over the last 24 hours.
+type serviceView struct {
+	ServiceStatus
+	Hits24h        int64   `json:"hits_24h"`
+	Credentials24h int64   `json:"credentials_24h"`
+	Hourly         []int64 `json:"hourly"` // connections per hour, oldest first
+}
+
+func (d *Dashboard) handleServices(w http.ResponseWriter, _ *http.Request) {
+	until := time.Now().UTC()
+	since := until.Add(-24 * time.Hour)
+	hits, err := d.db.Breakdown("port", since, until, 1000)
+	if err != nil {
+		d.internalError(w, "services", err)
+		return
+	}
+	creds, err := d.db.CredentialBreakdown("service", since, until, 1000)
+	if err != nil {
+		d.internalError(w, "services", err)
+		return
+	}
+	byPort := map[string]int64{}
+	for _, h := range hits {
+		byPort[h.Key] = h.Count
+	}
+	byService := map[string]int64{}
+	for _, c := range creds {
+		byService[c.Key] = c.Count
+	}
+	out := []serviceView{}
+	for _, s := range d.bans.Services() {
+		v := serviceView{ServiceStatus: s, Hits24h: byPort[strconv.Itoa(s.Port)]}
+		series, err := d.db.Series(since, until, time.Hour, storage.SeriesFilter{Port: s.Port})
+		if err != nil {
+			d.internalError(w, "services", err)
+			return
+		}
+		for _, b := range series {
+			v.Hourly = append(v.Hourly, b.Total)
+		}
+		if s.Kind == "honeypot" {
+			v.Credentials24h = byService[s.Type]
+		}
+		out = append(out, v)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleSetService switches a honeypot: form fields name and enabled.
+func (d *Dashboard) handleSetService(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid form")
+		return
+	}
+	name := strings.TrimSpace(r.PostForm.Get("name"))
+	if name == "" || !r.PostForm.Has("enabled") {
+		writeError(w, http.StatusBadRequest, "name and enabled are required")
+		return
+	}
+	enabled := parseBool(r.PostForm.Get("enabled"))
+	if err := d.bans.SetServiceEnabled(name, enabled); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	d.logger.Info("service switched via dashboard", "name", name, "enabled", enabled)
+	for _, s := range d.bans.Services() {
+		if s.Name == name {
+			writeJSON(w, http.StatusOK, s)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// Version is the running build, set by main.
+var Version = "dev"
+
+// handleInfo names the product and its scope for the shell: the host this
+// SkyGuard protects, its version and the firewall backend.
+func (d *Dashboard) handleInfo(w http.ResponseWriter, _ *http.Request) {
+	host, _ := os.Hostname()
+	ab := d.settings.AutoBan()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"host":             host,
+		"version":          Version,
+		"firewall_method":  d.fw.Method(),
+		"auto_ban_enabled": ab.Enabled,
+		"score_threshold":  ab.ScoreThreshold,
+	})
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/skyguard/skyguard/internal/config"
+	"github.com/skyguard/skyguard/internal/dashboard"
 	"github.com/skyguard/skyguard/internal/server"
 	"github.com/skyguard/skyguard/internal/storage"
 )
@@ -63,6 +64,7 @@ func main() {
 	}
 
 	logger = setupLogger(cfg.General.LogLevel)
+	dashboard.Version = Version
 	logger.Info("SkyGuard starting", "version", Version, "config", *configPath)
 
 	db, err := storage.New(cfg.Logging.DBPath)

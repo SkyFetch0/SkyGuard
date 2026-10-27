@@ -26,7 +26,8 @@ stealth_services:
 
 # ── Honeypot Services ─────────────────────────────────────────────────────────
 # Fake services that log attacker activity and contribute to threat scoring.
-# Toggle individual honeypots with "enabled: true/false" + restart.
+# Toggle honeypots with "enabled: true/false" + restart, or switch them at
+# runtime on the dashboard's Honeypots screen (kept until you edit that entry here).
 #
 # NOTE: a honeypot cannot bind a port another process already uses. The real
 # sshd normally holds port 22, so fake-ssh is disabled here; run

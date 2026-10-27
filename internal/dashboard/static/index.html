@@ -2,400 +2,316 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#171719">
 <title>SkyGuard</title>
-<style>
-:root{
-  --bg:#0b0f1a;--surface:#111827;--surface2:#1a2234;--border:#1f2d45;
-  --text:#e2e8f0;--text2:#94a3b8;--text3:#4a5568;
-  --accent:#3b82f6;--accent2:#1d4ed8;
-  --green:#22c55e;--yellow:#f59e0b;--red:#ef4444;--orange:#f97316;--purple:#a855f7;
-  --font:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column}
-a{color:var(--accent);text-decoration:none}
-
-/* ── Layout ── */
-.layout{display:flex;flex:1;min-height:0}
-.sidebar{width:220px;flex-shrink:0;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:1rem 0}
-.sidebar-logo{padding:.5rem 1.25rem 1.25rem;display:flex;align-items:center;gap:.6rem;border-bottom:1px solid var(--border);margin-bottom:.75rem}
-.sidebar-logo span{font-size:1.1rem;font-weight:700;color:#60a5fa;letter-spacing:-.02em}
-.sidebar-logo .dot{width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0;animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.nav-item{display:flex;align-items:center;gap:.6rem;padding:.55rem 1.25rem;font-size:.85rem;color:var(--text2);cursor:pointer;transition:all .15s;border-left:2px solid transparent}
-.nav-item:hover{color:var(--text);background:var(--surface2)}
-.nav-item.active{color:#60a5fa;background:rgba(59,130,246,.08);border-left-color:#3b82f6}
-.nav-icon{font-size:.95rem;width:18px;text-align:center;flex-shrink:0}
-.sidebar-section{font-size:.65rem;font-weight:600;letter-spacing:.08em;color:var(--text3);padding:.75rem 1.25rem .25rem;text-transform:uppercase}
-.main{flex:1;overflow-y:auto;min-width:0}
-.topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:.75rem 1.75rem;display:flex;align-items:center;gap:1rem;position:sticky;top:0;z-index:10}
-.topbar-title{font-size:.95rem;font-weight:600}
-.topbar-right{margin-left:auto;display:flex;align-items:center;gap:.75rem}
-.live-badge{display:flex;align-items:center;gap:.4rem;font-size:.75rem;color:var(--green)}
-.live-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 1.5s infinite}
-.last-update{font-size:.75rem;color:var(--text3)}
-.content{padding:1.5rem 1.75rem}
-
-/* ── Tabs ── */
-.tabs{display:flex;gap:.25rem;margin-bottom:1.5rem;border-bottom:1px solid var(--border);padding-bottom:0}
-.tab{padding:.5rem 1rem;font-size:.85rem;color:var(--text2);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .15s}
-.tab:hover{color:var(--text)}
-.tab.active{color:#60a5fa;border-bottom-color:#3b82f6}
-.tab-panel{display:none}
-.tab-panel.active{display:block}
-
-/* ── Stats grid ── */
-.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:.75rem;margin-bottom:1.5rem}
-.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:.625rem;padding:1rem 1.125rem;position:relative;overflow:hidden}
-.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;border-radius:2px 2px 0 0}
-.stat-card.c-blue::before{background:var(--accent)}
-.stat-card.c-orange::before{background:var(--orange)}
-.stat-card.c-green::before{background:var(--green)}
-.stat-card.c-red::before{background:var(--red)}
-.stat-card.c-purple::before{background:var(--purple)}
-.stat-card.c-yellow::before{background:var(--yellow)}
-.stat-label{font-size:.7rem;color:var(--text2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.375rem}
-.stat-val{font-size:1.75rem;font-weight:700;line-height:1}
-.stat-sub{font-size:.7rem;color:var(--text3);margin-top:.3rem}
-.stat-card.c-blue .stat-val{color:#60a5fa}
-.stat-card.c-orange .stat-val{color:var(--orange)}
-.stat-card.c-green .stat-val{color:var(--green)}
-.stat-card.c-red .stat-val{color:var(--red)}
-.stat-card.c-purple .stat-val{color:var(--purple)}
-.stat-card.c-yellow .stat-val{color:var(--yellow)}
-
-/* ── Charts ── */
-.chart-container{background:var(--surface);border:1px solid var(--border);border-radius:.625rem;padding:1.125rem;margin-bottom:1.5rem}
-.chart-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem}
-.chart-title{font-size:.85rem;font-weight:600}
-.chart-legend{display:flex;gap:1rem}
-.legend-item{display:flex;align-items:center;gap:.35rem;font-size:.7rem;color:var(--text2)}
-.legend-dot{width:8px;height:8px;border-radius:50%}
-#timeline-svg{width:100%;height:120px;display:block;overflow:visible}
-
-/* ── Search/Filter bar ── */
-.filter-bar{background:var(--surface);border:1px solid var(--border);border-radius:.625rem;padding:1rem 1.125rem;margin-bottom:1rem;display:flex;flex-wrap:wrap;gap:.6rem;align-items:flex-end}
-.filter-group{display:flex;flex-direction:column;gap:.3rem;min-width:130px}
-.filter-label{font-size:.65rem;color:var(--text2);text-transform:uppercase;letter-spacing:.06em}
-.filter-input{background:var(--surface2);border:1px solid var(--border);border-radius:.4rem;color:var(--text);font-size:.8rem;padding:.4rem .6rem;outline:none;transition:border .15s}
-.filter-input:focus{border-color:var(--accent)}
-.filter-input select,.filter-input option{background:var(--surface2)}
-select.filter-input{appearance:none;cursor:pointer}
-.filter-actions{display:flex;gap:.5rem;align-items:flex-end;margin-left:auto}
-
-/* ── Tables ── */
-.section{margin-bottom:1.5rem}
-.section-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:.625rem}
-.section-title{font-size:.85rem;font-weight:600}
-.section-meta{font-size:.75rem;color:var(--text3)}
-.tbl-wrap{background:var(--surface);border:1px solid var(--border);border-radius:.625rem;overflow:auto}
-table{width:100%;border-collapse:collapse}
-th{background:var(--bg);color:var(--text2);font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;padding:.625rem 1rem;text-align:left;white-space:nowrap;position:sticky;top:0;z-index:1}
-td{padding:.55rem 1rem;border-top:1px solid var(--border);font-size:.8rem;color:#cbd5e1;white-space:nowrap}
-tr:hover td{background:rgba(255,255,255,.025)}
-.tbl-scroll{max-height:380px;overflow-y:auto}
-
-/* ── Tags ── */
-.tag{display:inline-flex;align-items:center;padding:.15rem .5rem;border-radius:.25rem;font-size:.68rem;font-weight:600;letter-spacing:.02em}
-.tag-red{background:rgba(239,68,68,.15);color:#fca5a5}
-.tag-green{background:rgba(34,197,94,.15);color:#86efac}
-.tag-yellow{background:rgba(245,158,11,.15);color:#fde68a}
-.tag-blue{background:rgba(59,130,246,.15);color:#93c5fd}
-.tag-purple{background:rgba(168,85,247,.15);color:#d8b4fe}
-.tag-gray{background:rgba(100,116,139,.15);color:#94a3b8}
-
-/* ── Buttons ── */
-.btn{display:inline-flex;align-items:center;gap:.35rem;padding:.4rem .85rem;border-radius:.4rem;font-size:.78rem;font-weight:500;cursor:pointer;border:none;transition:all .15s;outline:none}
-.btn-primary{background:var(--accent);color:#fff}
-.btn-primary:hover{background:var(--accent2)}
-.btn-ghost{background:transparent;border:1px solid var(--border);color:var(--text2)}
-.btn-ghost:hover{border-color:#4a6080;color:var(--text)}
-.btn-danger{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.25);color:#fca5a5}
-.btn-danger:hover{background:rgba(239,68,68,.2)}
-.btn-sm{padding:.25rem .55rem;font-size:.72rem}
-.btn-export{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:#86efac}
-.btn-export:hover{background:rgba(34,197,94,.18)}
-
-/* ── Panels ── */
-.panel{background:var(--surface);border:1px solid var(--border);border-radius:.625rem;padding:1.125rem;margin-bottom:1rem}
-.panel-title{font-size:.8rem;font-weight:600;margin-bottom:.875rem;display:flex;align-items:center;gap:.5rem}
-.form-row{display:flex;flex-wrap:wrap;gap:.6rem;align-items:flex-end}
-.form-group{display:flex;flex-direction:column;gap:.3rem}
-.form-label{font-size:.68rem;color:var(--text2);text-transform:uppercase;letter-spacing:.05em}
-.form-input{background:var(--surface2);border:1px solid var(--border);border-radius:.4rem;color:var(--text);font-size:.82rem;padding:.45rem .65rem;outline:none;transition:border .15s;min-width:140px}
-.form-input:focus{border-color:var(--accent)}
-.form-msg{font-size:.75rem;margin-top:.5rem;min-height:1.1em}
-.form-msg.ok{color:var(--green)}
-.form-msg.err{color:var(--red)}
-.checkbox-row{display:flex;align-items:center;gap:.4rem;font-size:.82rem;cursor:pointer;user-select:none;color:var(--text2)}
-.checkbox-row input{accent-color:var(--accent);cursor:pointer}
-.divider{height:1px;background:var(--border);margin:.75rem 0}
-
-/* ── Score bar ── */
-.score-bar{display:flex;align-items:center;gap:.6rem}
-.score-track{flex:1;height:4px;background:var(--surface2);border-radius:2px;overflow:hidden;max-width:80px}
-.score-fill{height:100%;border-radius:2px;background:var(--red);transition:width .3s}
-.score-num{font-size:.78rem;font-weight:600;color:var(--red);min-width:35px;text-align:right}
-
-/* ── Pre/code ── */
-pre{background:var(--surface2);border:1px solid var(--border);border-radius:.5rem;padding:.875rem;font-size:.75rem;color:#cbd5e1;overflow:auto;white-space:pre-wrap;margin:0}
-
-/* ── Empty state ── */
-.empty{text-align:center;padding:2.5rem 1rem;color:var(--text3);font-size:.82rem}
-
-/* ── Toast ── */
-#toast{position:fixed;bottom:1.5rem;right:1.5rem;z-index:100;display:flex;flex-direction:column;gap:.5rem}
-.toast-item{background:var(--surface2);border:1px solid var(--border);border-radius:.5rem;padding:.65rem 1rem;font-size:.8rem;display:flex;align-items:center;gap:.5rem;animation:slideIn .2s ease}
-.toast-item.ok{border-left:3px solid var(--green)}
-.toast-item.err{border-left:3px solid var(--red)}
-@keyframes slideIn{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:none}}
-
-/* ── Grid layouts ── */
-.two-col{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
-.link-reset{background:none;border-top:0;border-right:0;border-bottom:0;font-family:inherit;text-align:left;width:100%}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-.link{color:#60a5fa;cursor:pointer;background:none;border:none;font:inherit;padding:0}
-.link:hover{text-decoration:underline}
-.data-cell{max-width:340px;overflow:hidden;text-overflow:ellipsis;color:var(--text2)}
-.hint{font-size:.75rem;color:var(--text2);line-height:1.5;margin-top:.5rem}
-.err-banner{display:none;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.3);color:#fca5a5;padding:.6rem 1rem;border-radius:.5rem;margin-bottom:1rem;font-size:.8rem}
-.pager{display:flex;gap:.5rem;align-items:center;justify-content:flex-end;margin-top:.6rem;font-size:.75rem;color:var(--text2)}
-/* ── Modal ── */
-.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:flex-start;justify-content:center;z-index:50;overflow-y:auto;padding:3rem 1rem}
-.modal-bg.open{display:flex}
-.modal{background:var(--surface);border:1px solid var(--border);border-radius:.75rem;width:100%;max-width:960px;padding:1.25rem}
-.modal-hdr{display:flex;align-items:center;gap:.75rem;margin-bottom:1rem}
-.modal-hdr h2{font-size:1rem}
-.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.5rem;margin-bottom:1rem}
-.kv div{background:var(--surface2);border-radius:.4rem;padding:.5rem .7rem;font-size:.78rem}
-.kv span{display:block;font-size:.65rem;color:var(--text2);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.2rem}
-@media(max-width:900px){.two-col{grid-template-columns:1fr}.stats-grid{grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}}
-/* On small screens the sidebar becomes a horizontal, scrollable nav bar
-   instead of disappearing (the old layout left phones without navigation). */
-@media(max-width:700px){
-  .layout{flex-direction:column}
-  .sidebar{width:auto;flex-direction:row;overflow-x:auto;padding:0;border-right:none;border-bottom:1px solid var(--border)}
-  .sidebar-logo,.sidebar-section{display:none}
-  .nav-item{border-left:none;border-bottom:2px solid transparent;white-space:nowrap;padding:.7rem .9rem;width:auto}
-  .nav-item.active{border-bottom-color:#3b82f6}
-  .content{padding:1rem}
-  .topbar{padding:.6rem 1rem;position:static}
-}
-</style>
+<link rel="preload" href="/assets/fonts/public-sans-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/assets/fonts/ibm-plex-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/assets/app.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M5 21a11 11 0 0 1 22 0' fill='none' stroke='%234a8ad6' stroke-width='3' stroke-linecap='round'/%3E%3Cpath d='M4 26h24' stroke='%23fff' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
 </head>
 <body>
-<div class="layout">
-  <nav class="sidebar" id="nav">
-    <div class="sidebar-logo"><div class="dot"></div><span>SkyGuard</span></div>
-    <button class="nav-item link-reset active" data-page="overview"><span class="nav-icon">&#9632;</span> Overview</button>
-    <button class="nav-item link-reset" data-page="logs"><span class="nav-icon">&#9776;</span> Connection Logs</button>
-    <button class="nav-item link-reset" data-page="threats"><span class="nav-icon">&#9888;</span> Threats</button>
-    <button class="nav-item link-reset" data-page="creds"><span class="nav-icon">&#128273;</span> Credentials</button>
-    <button class="nav-item link-reset" data-page="bans"><span class="nav-icon">&#128683;</span> Bans</button>
-    <div class="sidebar-section">System</div>
-    <button class="nav-item link-reset" data-page="firewall"><span class="nav-icon">&#128737;</span> Firewall</button>
-    <button class="nav-item link-reset" data-page="settings"><span class="nav-icon">&#9881;</span> Settings</button>
+<a class="skip" href="#main">Skip to content</a>
+<div class="app">
+  <nav class="rail" aria-label="Main">
+    <!-- the mark: the sky's arc held over the horizon line it guards -->
+    <a class="mark" href="#overview" aria-label="SkyGuard overview" data-tip="SkyGuard">
+      <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true"><path d="M5 21a11 11 0 0 1 22 0" fill="none" stroke="#4a8ad6" stroke-width="2.5" stroke-linecap="round"/><path d="M4 26h24" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/><path d="M16 10v4" stroke="#4a8ad6" stroke-width="2.5" stroke-linecap="round"/></svg>
+    </a>
+    <a href="#overview" data-nav="overview" data-tip="Overview" aria-label="Overview">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span class="label">Overview</span>
+    </a>
+    <a href="#connections" data-nav="connections" data-tip="Connections" aria-label="Connections">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><span class="label">Traffic</span>
+    </a>
+    <a href="#attackers" data-nav="attackers" data-tip="Attackers and bans" aria-label="Attackers and bans">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M6.5 17.5 17.5 6.5"/></svg><span class="label">Bans</span>
+    </a>
+    <a href="#credentials" data-nav="credentials" data-tip="Captured credentials" aria-label="Captured credentials">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M16 7l3 3M14 9l2 2"/></svg><span class="label">Credentials</span>
+    </a>
+    <a href="#services" data-nav="services" data-tip="Honeypots and services" aria-label="Honeypots and services">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/></svg><span class="label">Honeypots</span>
+    </a>
+    <div class="bottom">
+      <a href="#settings" data-nav="settings" data-tip="Auto-ban and firewall" aria-label="Auto-ban and firewall settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span class="label">Settings</span>
+      </a>
+    </div>
   </nav>
 
-  <div class="main">
-    <div class="topbar">
-      <span class="topbar-title" id="page-title">Overview</span>
-      <div class="topbar-right">
-        <div class="live-badge" id="live-badge"><div class="live-dot"></div>LIVE</div>
-        <span class="last-update" id="last-update">-</span>
-        <button class="btn btn-ghost btn-sm" data-action="refresh">&#8635; Refresh</button>
+  <main class="canvas" id="main" tabindex="-1">
+    <a class="icon-btn phone-settings" href="#settings" aria-label="Auto-ban and firewall settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg></a>
+    <!-- OVERVIEW: is the server under attack right now, and is SkyGuard stopping it? -->
+    <section class="screen" id="screen-overview" data-screen="overview">
+      <div class="title-row">
+        <div>
+          <p class="brandline" translate="no"><b>SkyGuard</b> · <span data-host>this server</span></p>
+          <h1>Overview</h1>
+          <p class="sub" id="finding">Loading the last 24 hours…</p>
+        </div>
+        <div class="title-tools">
+          <div class="choice" role="group" aria-label="Time range" data-range-group>
+            <button type="button" data-range="24h" aria-pressed="true">24 hours</button>
+            <button type="button" data-range="7d" aria-pressed="false">7 days</button>
+            <button type="button" data-range="30d" aria-pressed="false">30 days</button>
+          </div>
+          <span class="stamp" data-stamp>—</span>
+          <button class="icon-btn" type="button" data-action="refresh" aria-label="Refresh now"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button>
+        </div>
+      </div>
+
+      <div class="kpis" role="tablist" aria-label="Metric shown in the chart" id="kpis"></div>
+
+      <div class="grid">
+        <article class="panel span-8">
+          <header><h2 id="series-title">Connections per hour</h2><span class="meta" id="series-meta"></span></header>
+          <div class="chart" id="series-chart" style="min-height:220px"></div>
+        </article>
+        <article class="panel span-4">
+          <header><h2>Where connections ended</h2><span class="meta" id="flow-meta"></span></header>
+          <div id="flow"></div>
+        </article>
+
+        <article class="panel span-6">
+          <header><h2>Busiest sources</h2><a class="card-link" href="#attackers">All attackers</a></header>
+          <ol class="rank" id="sources"></ol>
+        </article>
+        <article class="panel span-3">
+          <header><h2>Targeted services</h2></header>
+          <ol class="rank" id="by-service"></ol>
+        </article>
+        <article class="panel span-3">
+          <header><h2 id="geo-title">Countries</h2></header>
+          <ol class="rank" id="by-geo"></ol>
+        </article>
+
+        <article class="panel span-12">
+          <header><h2>Latest events</h2><a class="card-link" href="#connections">All connections</a></header>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Time</th><th>Source</th><th>Country</th><th>Service</th><th class="n">Port</th><th>Details</th><th class="n">Outcome</th></tr></thead>
+            <tbody id="latest"></tbody>
+          </table></div>
+        </article>
+      </div>
+    </section>
+
+    <!-- CONNECTIONS: who connected, when, and what happened to them? -->
+    <section class="screen" id="screen-connections" data-screen="connections" hidden>
+      <div class="title-row">
+        <div>
+          <p class="brandline" translate="no"><b>SkyGuard</b> · <span data-host>this server</span></p>
+          <h1>Connections</h1>
+          <p class="sub" id="conn-sub">Every connection SkyGuard saw, newest first.</p>
+        </div>
+        <div class="title-tools">
+          <button class="btn" type="button" data-action="export">Export CSV</button>
+        </div>
+      </div>
+      <article class="panel">
+        <header><h2>When connections arrive</h2><span class="meta">Last 7 days, your local time</span></header>
+        <div class="heat" id="heatmap"></div>
+      </article>
+      <article class="panel">
+        <form class="filters" id="conn-filters" role="search">
+          <label class="search"><span class="sr-only">Source IP</span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+            <input class="input mono" name="ip" placeholder="Source IP…" autocomplete="off" spellcheck="false" translate="no">
+          </label>
+          <label><span class="sr-only">Service</span>
+            <select class="input" name="service">
+              <option value="">All services</option>
+              <option value="ssh">SSH honeypot</option><option value="ftp">FTP honeypot</option>
+              <option value="mysql">MySQL honeypot</option><option value="http">HTTP honeypot</option>
+              <option value="stealth">Stealth</option><option value="passthrough">Passthrough</option>
+            </select>
+          </label>
+          <label><span class="sr-only">Country code</span><input class="input" name="country" placeholder="Country, e.g. NL…" maxlength="2" autocomplete="off" spellcheck="false" style="width:150px"></label>
+          <div class="choice" role="group" aria-label="Outcome" data-filter-group="action">
+            <button type="button" data-value="" aria-pressed="true">All</button>
+            <button type="button" data-value="honeypot" aria-pressed="false">Honeypot</button>
+            <button type="button" data-value="dropped" aria-pressed="false">Dropped</button>
+            <button type="button" data-value="forwarded" aria-pressed="false">Forwarded</button>
+          </div>
+          <span class="spacer"></span>
+          <span class="stamp" id="conn-count"></span>
+        </form>
+        <div class="table-wrap scroll" style="margin-top:12px"><table>
+          <thead><tr><th>Time</th><th>Source</th><th class="n">Src port</th><th>Country</th><th>Service</th><th class="n">Port</th><th>Details</th><th class="n">Outcome</th></tr></thead>
+          <tbody id="conn-body"></tbody>
+        </table></div>
+        <footer class="filters">
+          <span class="stamp" id="page-info"></span><span class="spacer"></span>
+          <button class="btn small" type="button" data-action="page-prev">Newer</button>
+          <button class="btn small" type="button" data-action="page-next">Older</button>
+        </footer>
+      </article>
+    </section>
+
+    <!-- ATTACKERS: who is the biggest threat, and who is already banned? -->
+    <section class="screen" id="screen-attackers" data-screen="attackers" hidden>
+      <div class="title-row">
+        <div>
+          <p class="brandline" translate="no"><b>SkyGuard</b> · <span data-host>this server</span></p>
+          <h1>Attackers and bans</h1>
+          <p class="sub" id="att-sub">Threat scores add up from honeypot hits, failed logins, scans and rate limits.</p>
+        </div>
+        <div class="title-tools"><button class="btn primary" type="button" data-action="ban-dialog">Ban an IP</button></div>
+      </div>
+      <div class="grid">
+        <article class="panel span-7">
+          <header><h2>Highest threat scores</h2><span class="meta" id="threshold-meta"></span></header>
+          <ol class="rank" id="attackers"></ol>
+        </article>
+        <div class="span-5 stack">
+          <article class="panel">
+            <header><h2>Active bans</h2><span class="meta" id="ban-count"></span></header>
+            <div class="table-wrap"><table>
+              <thead><tr><th>IP</th><th>Reason</th><th class="n">Lifts</th><th></th></tr></thead>
+              <tbody id="bans"></tbody>
+            </table></div>
+          </article>
+          <article class="panel grow">
+            <header><h2>Why they were banned</h2><span class="meta" id="reason-meta"></span></header>
+            <ol class="rank" id="ban-reasons"></ol>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- CREDENTIALS: what are they trying? -->
+    <section class="screen" id="screen-credentials" data-screen="credentials" hidden>
+      <div class="title-row">
+        <div>
+          <p class="brandline" translate="no"><b>SkyGuard</b> · <span data-host>this server</span></p>
+          <h1>Captured credentials</h1>
+          <p class="sub" id="cred-sub">Logins tried against the honeypots. MySQL sends only a hash, so only its usernames are known.</p>
+        </div>
+        <div class="title-tools">
+          <div class="choice" role="group" aria-label="Time range" data-range-group>
+            <button type="button" data-range="24h" aria-pressed="true">24 hours</button>
+            <button type="button" data-range="7d" aria-pressed="false">7 days</button>
+            <button type="button" data-range="30d" aria-pressed="false">30 days</button>
+          </div>
+        </div>
+      </div>
+      <div class="grid">
+        <article class="panel span-4"><header><h2>Most tried usernames</h2></header><ol class="rank" id="top-users"></ol></article>
+        <article class="panel span-4"><header><h2>Most tried passwords</h2></header><ol class="rank" id="top-passwords"></ol></article>
+        <article class="panel span-4"><header><h2>Attempts per honeypot</h2></header><ol class="rank" id="cred-services"></ol>
+          <div class="chart-block"><h3 id="cred-chart-title">Logins tried per hour</h3><div class="chart" id="cred-chart"></div></div></article>
+        <article class="panel span-12">
+          <header><h2>Pairs tried most often</h2><span class="meta">All time</span></header>
+          <div class="table-wrap scroll"><table>
+            <thead><tr><th>Honeypot</th><th>Username</th><th>Password</th><th class="n">Tries</th><th class="n">Last tried</th></tr></thead>
+            <tbody id="pairs"></tbody>
+          </table></div>
+        </article>
+      </div>
+    </section>
+
+    <!-- SERVICES: which traps are open right now? -->
+    <section class="screen" id="screen-services" data-screen="services" hidden>
+      <div class="title-row">
+        <div>
+          <p class="brandline" translate="no"><b>SkyGuard</b> · <span data-host>this server</span></p>
+          <h1>Honeypots and services</h1>
+          <p class="sub" id="svc-sub">Switch a honeypot on or off. The change applies at once and survives restarts.</p>
+        </div>
+      </div>
+      <article class="panel">
+        <header><h2>Honeypots</h2><span class="meta">Events and logins in the last 24 hours</span></header>
+        <div id="honeypots"></div>
+      </article>
+      <article class="panel">
+        <header><h2>Managed in the config file</h2><span class="meta">Switching these from here could cut your own SSH session</span></header>
+        <div id="managed"></div>
+      </article>
+    </section>
+
+    <!-- SETTINGS -->
+    <section class="screen" id="screen-settings" data-screen="settings" hidden>
+      <div class="title-row">
+        <div>
+          <p class="brandline" translate="no"><b>SkyGuard</b> · <span data-host>this server</span></p>
+          <h1>Auto-ban and firewall</h1>
+          <p class="sub">Changes apply at once. Editing <code>analysis.auto_ban</code> in the config file and restarting takes precedence.</p>
+        </div>
+      </div>
+      <div>
+        <div class="setting">
+          <div><h2>Automatic bans</h2><p>An IP is banned when its threat score reaches the threshold. Whitelisted addresses are never banned.</p></div>
+          <form class="panel" id="settings-form">
+            <label class="switch-row"><span><b>Ban automatically</b><br><span class="muted" id="set-state">—</span></span><input class="switch" type="checkbox" name="auto_ban_enabled" id="set-enabled"></label>
+            <div class="field"><span>Score threshold</span>
+              <div class="stepper"><button type="button" data-step="-10" aria-label="Lower by 10">−</button><input name="score_threshold" id="set-threshold" type="number" min="1" inputmode="numeric" autocomplete="off" aria-label="Score threshold"><button type="button" data-step="10" aria-label="Raise by 10">+</button></div>
+              <span class="hint" id="threshold-hint">A failed login adds 15 points, a honeypot connection 10.</span>
+            </div>
+            <div class="field"><span>Ban length</span>
+              <div class="choice" role="group" aria-label="Ban length" data-duration-group>
+                <button type="button" data-duration="1h" aria-pressed="false">1 hour</button>
+                <button type="button" data-duration="1d" aria-pressed="false">1 day</button>
+                <button type="button" data-duration="7d" aria-pressed="false">7 days</button>
+                <button type="button" data-duration="30d" aria-pressed="false">30 days</button>
+                <button type="button" data-duration="0" aria-pressed="false">Permanent</button>
+              </div>
+              <input type="hidden" name="ban_duration" id="set-duration">
+            </div>
+            <div class="form-actions"><button class="btn primary" type="submit" id="set-submit">Save changes</button><span class="stamp" id="set-msg" role="status"></span></div>
+          </form>
+        </div>
+        <div class="setting">
+          <div><h2>Firewall</h2><p id="fw-desc">The rules SkyGuard keeps in its own SKYGUARD chain.</p></div>
+          <div class="panel"><div class="switch-row"><b>Backend</b><span class="pill" id="fw-method">—</span></div><pre class="rules" id="fw-rules">Loading…</pre></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- Ban an IP -->
+<dialog class="modal" id="ban-dialog" aria-labelledby="ban-title">
+  <form method="dialog" id="ban-form">
+    <h2 id="ban-title">Ban an IP</h2>
+    <label class="field"><span>IP address</span><input class="input mono" name="ip" required placeholder="203.0.113.5 or 2001:db8::5…" autocomplete="off" spellcheck="false" translate="no"></label>
+    <div class="field"><span>For how long</span>
+      <div class="choice" role="group" aria-label="Ban length" data-ban-duration>
+        <button type="button" data-duration="1h" aria-pressed="false">1 hour</button>
+        <button type="button" data-duration="1d" aria-pressed="true">1 day</button>
+        <button type="button" data-duration="7d" aria-pressed="false">7 days</button>
+        <button type="button" data-duration="0" aria-pressed="false">Permanent</button>
       </div>
     </div>
+    <label class="field"><span>Reason <span class="muted">(optional)</span></span><input class="input" name="reason" maxlength="200" placeholder="manual…" autocomplete="off"></label>
+    <p class="stamp" id="ban-error" role="alert"></p>
+    <div class="dialog-actions"><button class="btn" type="button" data-action="close-dialog">Cancel</button><button class="btn primary" type="submit" id="ban-submit">Ban</button></div>
+  </form>
+</dialog>
 
-    <div class="content">
-      <div class="err-banner" id="err-banner"></div>
+<!-- Confirm -->
+<dialog class="modal" id="confirm-dialog" aria-labelledby="confirm-title">
+  <form method="dialog">
+    <h2 id="confirm-title">Are you sure?</h2>
+    <p id="confirm-text"></p>
+    <div class="dialog-actions"><button class="btn" value="cancel">Cancel</button><button class="btn primary" value="ok" id="confirm-ok">Confirm</button></div>
+  </form>
+</dialog>
 
-      <!-- OVERVIEW -->
-      <section id="page-overview" class="tab-panel active">
-        <div class="stats-grid">
-          <div class="stat-card c-blue"><div class="stat-label">Total Connections</div><div class="stat-val" id="s-total">-</div></div>
-          <div class="stat-card c-orange"><div class="stat-label">Honeypot Hits</div><div class="stat-val" id="s-honeypot">-</div></div>
-          <div class="stat-card c-green"><div class="stat-label">Forwarded</div><div class="stat-val" id="s-forwarded">-</div></div>
-          <div class="stat-card c-red"><div class="stat-label">Dropped</div><div class="stat-val" id="s-dropped">-</div></div>
-          <div class="stat-card c-yellow"><div class="stat-label">Today (UTC)</div><div class="stat-val" id="s-today">-</div></div>
-          <div class="stat-card c-purple"><div class="stat-label">Active Bans</div><div class="stat-val" id="s-bans">-</div><div class="stat-sub" id="s-bans-today"></div></div>
-          <div class="stat-card c-yellow"><div class="stat-label">Credentials</div><div class="stat-val" id="s-creds">-</div></div>
-          <div class="stat-card c-blue"><div class="stat-label">Unique IPs</div><div class="stat-val" id="s-ips">-</div><div class="stat-sub" id="s-countries"></div></div>
-        </div>
-
-        <div class="chart-container">
-          <div class="chart-header">
-            <span class="chart-title">Connection Activity — last 24h (local time)</span>
-            <div class="chart-legend">
-              <div class="legend-item"><div class="legend-dot" style="background:var(--accent)"></div>Total</div>
-              <div class="legend-item"><div class="legend-dot" style="background:var(--orange)"></div>Honeypot</div>
-              <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div>Dropped</div>
-              <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div>Forwarded</div>
-            </div>
-          </div>
-          <svg id="timeline-svg" role="img" aria-label="Connections per hour"></svg>
-        </div>
-
-        <div class="section">
-          <div class="section-hdr"><span class="section-title">Recent Connections</span><span class="section-meta" id="conn-count"></span></div>
-          <div class="tbl-wrap tbl-scroll">
-            <table>
-              <thead><tr><th>Time</th><th>Source IP</th><th>Country</th><th>Port</th><th>Service</th><th>Action</th><th>Details</th></tr></thead>
-              <tbody id="conn-body"></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <!-- CONNECTION LOGS -->
-      <section id="page-logs" class="tab-panel">
-        <form class="filter-bar" id="search-form">
-          <div class="filter-group"><span class="filter-label">Source IP</span><input class="filter-input" name="ip" placeholder="e.g. 1.2.3.4"></div>
-          <div class="filter-group"><span class="filter-label">Country</span><input class="filter-input" name="country" placeholder="e.g. CN" maxlength="2" style="width:80px"></div>
-          <div class="filter-group"><span class="filter-label">Service</span>
-            <select class="filter-input" name="service">
-              <option value="">All</option>
-              <option value="ssh">ssh (honeypot)</option><option value="ftp">ftp (honeypot)</option>
-              <option value="mysql">mysql (honeypot)</option><option value="http">http (honeypot)</option>
-              <option value="stealth">stealth</option><option value="passthrough">passthrough</option>
-            </select>
-          </div>
-          <div class="filter-group"><span class="filter-label">Action</span>
-            <select class="filter-input" name="action">
-              <option value="">All</option><option>honeypot</option><option>forwarded</option><option>dropped</option>
-            </select>
-          </div>
-          <div class="filter-group"><span class="filter-label">Since (local time)</span><input class="filter-input" name="since" type="datetime-local"></div>
-          <div class="filter-group"><span class="filter-label">Until (local time)</span><input class="filter-input" name="until" type="datetime-local"></div>
-          <div class="filter-group"><span class="filter-label">Page size</span><input class="filter-input" name="limit" type="number" value="200" min="1" max="10000" style="width:90px"></div>
-          <div class="filter-actions">
-            <button class="btn btn-primary" type="submit">&#128269; Search</button>
-            <button class="btn btn-ghost" type="button" data-action="clear-search">Clear</button>
-            <button class="btn btn-export" type="button" data-action="export" title="Download CSV">&#8659; CSV</button>
-          </div>
-        </form>
-        <div class="section">
-          <div class="section-hdr"><span class="section-title">Results</span><span class="section-meta" id="search-count"></span></div>
-          <div class="tbl-wrap tbl-scroll" style="max-height:560px">
-            <table>
-              <thead><tr><th>Time</th><th>Source IP</th><th>Src Port</th><th>Dst Port</th><th>Country</th><th>City</th><th>Service</th><th>Action</th><th>Details</th></tr></thead>
-              <tbody id="search-body"><tr><td colspan="9" class="empty">Run a search above</td></tr></tbody>
-            </table>
-          </div>
-          <div class="pager">
-            <button class="btn btn-ghost btn-sm" data-action="page-prev">&#8592; Newer</button>
-            <span id="page-info"></span>
-            <button class="btn btn-ghost btn-sm" data-action="page-next">Older &#8594;</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- THREATS -->
-      <section id="page-threats" class="tab-panel">
-        <div class="section">
-          <div class="section-hdr"><span class="section-title">Top Attackers by Threat Score</span><span class="section-meta">Scores reset when a ban expires or is lifted</span></div>
-          <div class="tbl-wrap tbl-scroll" style="max-height:620px">
-            <table>
-              <thead><tr><th>IP</th><th>Country</th><th>Score</th><th>Events</th><th>Honeypot</th><th>Credentials</th><th>Ports</th><th>Last Seen</th><th></th></tr></thead>
-              <tbody id="attackers-body"></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <!-- CREDENTIALS -->
-      <section id="page-creds" class="tab-panel">
-        <div class="section">
-          <div class="section-hdr"><span class="section-title">Top Credential Attempts</span><span class="section-meta">SSH / FTP / HTTP passwords are captured; MySQL only reveals the username</span></div>
-          <div class="tbl-wrap tbl-scroll" style="max-height:620px">
-            <table>
-              <thead><tr><th>Service</th><th>Username</th><th>Password</th><th>Count</th><th>Last Seen</th></tr></thead>
-              <tbody id="creds-body"></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <!-- BANS -->
-      <section id="page-bans" class="tab-panel">
-        <form class="panel" id="ban-form">
-          <div class="panel-title">&#43; Manual Ban</div>
-          <div class="form-row">
-            <div class="form-group"><span class="form-label">IP Address</span><input class="form-input" name="ip" id="ban-ip" placeholder="1.2.3.4 or 2001:db8::1" required></div>
-            <div class="form-group"><span class="form-label">Duration</span><input class="form-input" name="duration" placeholder="24h, 7d (blank = 24h)" style="width:160px"></div>
-            <div class="form-group"><span class="form-label">Reason</span><input class="form-input" name="reason" placeholder="manual" maxlength="200" style="width:180px"></div>
-            <div class="form-group" style="justify-content:flex-end;padding-bottom:.1rem"><label class="checkbox-row"><input type="checkbox" name="permanent" value="1"> Permanent</label></div>
-            <div class="form-group" style="justify-content:flex-end"><button class="btn btn-primary" type="submit">Ban IP</button></div>
-          </div>
-          <div class="form-msg" id="ban-msg"></div>
-          <div class="hint">Whitelisted and loopback addresses cannot be banned. Unbanning also resets the IP's threat score.</div>
-        </form>
-        <div class="section">
-          <div class="section-hdr"><span class="section-title">Active Bans</span><span class="section-meta" id="ban-count"></span></div>
-          <div class="tbl-wrap tbl-scroll">
-            <table>
-              <thead><tr><th>IP</th><th>Reason</th><th>Banned At</th><th>Expires</th><th>Type</th><th></th></tr></thead>
-              <tbody id="banned-body"></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <!-- FIREWALL -->
-      <section id="page-firewall" class="tab-panel">
-        <div class="section">
-          <div class="section-hdr"><span class="section-title">Firewall Backend: <span id="fw-method" class="tag tag-blue">-</span></span></div>
-          <pre id="fw-rules">Loading...</pre>
-        </div>
-      </section>
-
-      <!-- SETTINGS -->
-      <section id="page-settings" class="tab-panel">
-        <form class="panel" id="settings-form">
-          <div class="panel-title">&#9881; Auto-Ban Settings</div>
-          <div class="form-row">
-            <div class="form-group" style="justify-content:flex-end;padding-bottom:.1rem"><label class="checkbox-row"><input type="checkbox" name="auto_ban_enabled" id="set-enabled"> Enabled</label></div>
-            <div class="form-group"><span class="form-label">Score Threshold</span><input class="form-input" name="score_threshold" id="set-threshold" type="number" min="1" style="width:110px"></div>
-            <div class="form-group"><span class="form-label">Ban Duration</span><input class="form-input" name="ban_duration" id="set-duration" placeholder="e.g. 1h, 24h, 7d, 0" style="width:150px"></div>
-            <div class="form-group" style="justify-content:flex-end"><button class="btn btn-primary" type="submit">Save</button></div>
-          </div>
-          <div class="form-msg" id="set-msg"></div>
-          <div class="hint">Changes apply immediately and survive restarts. Editing <code>analysis.auto_ban</code> in the config file and restarting overrides values set here. A duration of <code>0</code> means permanent.</div>
-        </form>
-      </section>
-    </div>
+<!-- One IP, in detail -->
+<dialog class="sheet" id="ip-sheet" aria-labelledby="ip-title">
+  <div class="sheet-body">
+    <div class="sheet-head"><h2 id="ip-title">—</h2><span id="ip-tags"></span><button class="icon-btn" type="button" data-action="close-dialog" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+    <dl class="facts" id="ip-facts"></dl>
+    <div class="form-actions" id="ip-actions"></div>
+    <div><h3>Activity by day</h3><div class="chart" id="ip-chart" style="min-height:120px"></div></div>
+    <div><h3>Credentials tried</h3><div class="table-wrap"><table><thead><tr><th>Time</th><th>Honeypot</th><th>Username</th><th>Password</th></tr></thead><tbody id="ip-creds"></tbody></table></div></div>
+    <div><h3>Latest connections</h3><div class="table-wrap"><table><thead><tr><th>Time</th><th>Service</th><th class="n">Port</th><th>Details</th><th class="n">Outcome</th></tr></thead><tbody id="ip-conns"></tbody></table></div></div>
   </div>
-</div>
+</dialog>
 
-<!-- IP detail modal -->
-<div class="modal-bg" id="ip-modal" data-action="close-modal">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="ip-title">
-    <div class="modal-hdr">
-      <h2 id="ip-title" class="mono">-</h2>
-      <span id="ip-tags"></span>
-      <div style="margin-left:auto;display:flex;gap:.5rem" id="ip-actions"></div>
-      <button class="btn btn-ghost btn-sm" data-action="close-modal">&#10005;</button>
-    </div>
-    <div class="kv" id="ip-kv"></div>
-    <div class="section">
-      <div class="section-hdr"><span class="section-title">Credentials</span></div>
-      <div class="tbl-wrap tbl-scroll" style="max-height:220px"><table>
-        <thead><tr><th>Time</th><th>Service</th><th>Username</th><th>Password</th></tr></thead>
-        <tbody id="ip-creds"></tbody>
-      </table></div>
-    </div>
-    <div class="section">
-      <div class="section-hdr"><span class="section-title">Connections (latest 100)</span></div>
-      <div class="tbl-wrap tbl-scroll" style="max-height:300px"><table>
-        <thead><tr><th>Time</th><th>Port</th><th>Service</th><th>Action</th><th>Details</th></tr></thead>
-        <tbody id="ip-conns"></tbody>
-      </table></div>
-    </div>
-  </div>
-</div>
-
-<div id="toast"></div>
-<script src="/app.js"></script>
+<div id="toasts" aria-live="polite"></div>
+<script src="/assets/charts.js"></script>
+<script src="/assets/app.js"></script>
 </body>
 </html>

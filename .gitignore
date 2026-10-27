@@ -6,3 +6,4 @@
 *.db-wal
 *.mmdb
 ssh_honeypot_*_key
+/.taste-skill/

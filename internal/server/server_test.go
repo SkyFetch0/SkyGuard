@@ -44,7 +44,7 @@ func startServer(t *testing.T) (*Server, *storage.DB, map[string]int) {
 		}
 	}()
 
-	ports := map[string]int{"ftp": freePort(t), "stealth": freePort(t), "dash": freePort(t)}
+	ports := map[string]int{"ftp": freePort(t), "stealth": freePort(t), "dash": freePort(t), "mysql": freePort(t)}
 	dir := t.TempDir()
 	yaml := fmt.Sprintf(`
 general: {data_dir: %q}
@@ -52,11 +52,12 @@ stealth_services:
   - {name: ssh, listen_port: %d, real_target: %q, protocol_signature: "SSH-2.0-", timeout: 2s}
 honeypot_services:
   - {name: ftp, port: %d, type: ftp, max_auth_attempts: 1}
+  - {name: mysql, port: %d, type: mysql, enabled: false}
 analysis:
   auto_ban: {enabled: true, score_threshold: 20, ban_duration: 1h, method: none,
              scoring: {honeypot_connection: 10, failed_credential: 15}}
 dashboard: {enabled: true, listen: "127.0.0.1:%d", auth: {username: admin, password: "long enough pw"}}
-`, dir, ports["stealth"], backend.Addr().String(), ports["ftp"], ports["dash"])
+`, dir, ports["stealth"], backend.Addr().String(), ports["ftp"], ports["mysql"], ports["dash"])
 	cfg, err := config.Parse([]byte(yaml))
 	if err != nil {
 		t.Fatal(err)
@@ -183,5 +184,55 @@ func TestBanPolicy(t *testing.T) {
 	}
 	if s, _ := db.GetScore("198.51.100.4"); s != 0 {
 		t.Errorf("score after expiry = %d", s)
+	}
+}
+
+func TestServiceSwitchAtRuntime(t *testing.T) {
+	srv, db, ports := startServer(t)
+	mysqlAddr := fmt.Sprintf("127.0.0.1:%d", ports["mysql"])
+	dial := func() error {
+		c, err := net.DialTimeout("tcp", mysqlAddr, time.Second)
+		if err == nil {
+			c.Close()
+		}
+		return err
+	}
+	if dial() == nil {
+		t.Fatal("disabled honeypot is listening")
+	}
+	if err := srv.SetServiceEnabled("mysql", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := dial(); err != nil {
+		t.Fatalf("enabled honeypot not reachable: %v", err)
+	}
+	if err := srv.SetServiceEnabled("ssh", false); err == nil {
+		t.Error("stealth service must not be switchable")
+	}
+	var st []string
+	for _, s := range srv.Services() {
+		st = append(st, fmt.Sprintf("%s:%v", s.Name, s.Running))
+	}
+	if strings.Join(st, ",") != "ftp:true,mysql:true,ssh:true" {
+		t.Errorf("services = %v", st)
+	}
+	if err := srv.SetServiceEnabled("mysql", false); err != nil {
+		t.Fatal(err)
+	}
+	if dial() == nil {
+		t.Error("switched-off honeypot still listening")
+	}
+	if err := srv.SetServiceEnabled("mysql", true); err != nil {
+		t.Fatal(err)
+	}
+	_ = srv.Stop()
+
+	// The choice survives a restart (same database, same config).
+	if on, ok, err := db.ServiceOverride("mysql", false); err != nil || !ok || !on {
+		t.Fatalf("override not stored: %v %v %v", on, ok, err)
+	}
+	// An edit of that service in the config file wins over the stored choice.
+	if _, ok, _ := db.ServiceOverride("mysql", true); ok {
+		t.Error("override should be dropped once the config changes the service")
 	}
 }

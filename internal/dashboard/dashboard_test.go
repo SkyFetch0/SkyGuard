@@ -1,6 +1,8 @@
 package dashboard
 
 import (
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,6 +21,7 @@ import (
 type fakeBans struct {
 	db     *storage.DB
 	banned []string
+	ftpOn  bool
 }
 
 func (f *fakeBans) BanIP(ip, reason string, d time.Duration, perm bool) error {
@@ -27,6 +30,19 @@ func (f *fakeBans) BanIP(ip, reason string, d time.Duration, perm bool) error {
 }
 func (f *fakeBans) UnbanIP(ip string) error      { return f.db.UnbanIP(ip) }
 func (f *fakeBans) IsWhitelisted(ip string) bool { return ip == "127.0.0.1" || ip == "10.0.0.1" }
+func (f *fakeBans) Services() []ServiceStatus {
+	return []ServiceStatus{
+		{Name: "fake-ftp", Kind: "honeypot", Type: "ftp", Port: 21, Enabled: f.ftpOn, Running: f.ftpOn, Toggleable: true},
+		{Name: "ssh", Kind: "stealth", Type: "stealth", Port: 9911, Enabled: true, Running: true},
+	}
+}
+func (f *fakeBans) SetServiceEnabled(name string, on bool) error {
+	if name != "fake-ftp" {
+		return errors.New("only honeypots can be switched")
+	}
+	f.ftpOn = on
+	return nil
+}
 
 func newTestDashboard(t *testing.T) (http.Handler, *fakeBans) {
 	t.Helper()
@@ -77,16 +93,19 @@ func TestHealthzAndAuth(t *testing.T) {
 		t.Errorf("/api/stats without auth = %d", rec.Code)
 	}
 	rec := do(h, "GET", "/", nil, true, nil)
-	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `<script src="/app.js">`) {
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `<script src="/assets/app.js">`) {
 		t.Errorf("index = %d", rec.Code)
 	}
 	if csp := rec.Header().Get("Content-Security-Policy"); strings.Contains(csp, "script-src 'self' 'unsafe-inline'") {
 		t.Errorf("CSP still allows inline scripts: %s", csp)
 	}
-	if rec := do(h, "GET", "/app.js", nil, true, nil); rec.Code != 200 {
-		t.Errorf("/app.js = %d", rec.Code)
+	for _, p := range []string{"/assets/app.js", "/assets/charts.js", "/assets/app.css", "/assets/fonts/public-sans-latin-wght-normal.woff2"} {
+		if rec := do(h, "GET", p, nil, true, nil); rec.Code != 200 {
+			t.Errorf("%s = %d", p, rec.Code)
+		}
 	}
-	for _, p := range []string{"/api/stats", "/api/connections", "/api/banned", "/api/attackers", "/api/credentials", "/api/timeline", "/api/settings", "/api/firewall"} {
+	for _, p := range []string{"/api/stats", "/api/connections", "/api/banned", "/api/attackers", "/api/credentials", "/api/timeline",
+		"/api/settings", "/api/firewall", "/api/summary?range=7d", "/api/series?range=30d", "/api/credentials/breakdown", "/api/services"} {
 		rec := do(h, "GET", p, nil, true, nil)
 		if rec.Code != 200 || strings.TrimSpace(rec.Body.String()) == "null" {
 			t.Errorf("%s = %d %q", p, rec.Code, rec.Body.String())
@@ -176,5 +195,73 @@ func TestRefuseUnsafeExposure(t *testing.T) {
 	d.cfg.Listen = "127.0.0.1:9090"
 	if err := d.checkExposure(); err != nil {
 		t.Errorf("loopback should only warn: %v", err)
+	}
+}
+
+func TestSummaryAndSeries(t *testing.T) {
+	h, bans := newTestDashboard(t)
+	db := bans.db
+	now := time.Now().UTC()
+	_ = db.LogConnection(&storage.Connection{Timestamp: now.Add(-2 * time.Hour), SourceIP: "203.0.113.5", DestPort: 22, ServiceType: "ssh", Action: storage.ActionHoneypot})
+	_ = db.LogConnection(&storage.Connection{Timestamp: now.Add(-1 * time.Hour), SourceIP: "203.0.113.5", DestPort: 9911, ServiceType: "stealth", Action: storage.ActionDropped, Data: "stealth: signature mismatch"})
+	_ = db.LogConnection(&storage.Connection{Timestamp: now.Add(-30 * time.Hour), SourceIP: "198.51.100.1", DestPort: 21, ServiceType: "ftp", Action: storage.ActionHoneypot})
+	_ = db.LogCredential(&storage.Credential{Timestamp: now.Add(-2 * time.Hour), SourceIP: "203.0.113.5", Port: 22, Username: "root", Password: "toor", Service: "ssh"})
+
+	var sum struct {
+		Current, Previous storage.Summary
+		Outcomes          []storage.Outcome
+		TopSources        []storage.SourceCount `json:"top_sources"`
+		Services          []storage.KeyCount
+	}
+	rec := do(h, "GET", "/api/summary?range=24h", nil, true, nil)
+	if err := json.Unmarshal(rec.Body.Bytes(), &sum); err != nil {
+		t.Fatal(err, rec.Body.String())
+	}
+	if sum.Current.Connections != 2 || sum.Previous.Connections != 1 || sum.Current.Credentials != 1 {
+		t.Errorf("summary periods wrong: %+v / %+v", sum.Current, sum.Previous)
+	}
+	got := map[string]int64{}
+	for _, o := range sum.Outcomes {
+		got[o.Key] = o.Count
+	}
+	if got["honeypot"] != 1 || got["stealth_probe"] != 1 || len(sum.Outcomes) != len(storage.OutcomeKeys) {
+		t.Errorf("outcomes = %v", got)
+	}
+	if len(sum.TopSources) != 1 || sum.TopSources[0].IP != "203.0.113.5" || sum.TopSources[0].Count != 2 {
+		t.Errorf("top sources = %+v", sum.TopSources)
+	}
+
+	var series struct{ Buckets []storage.TimelineBucket }
+	rec = do(h, "GET", "/api/series?range=7d", nil, true, nil)
+	_ = json.Unmarshal(rec.Body.Bytes(), &series)
+	var total, creds int64
+	for _, b := range series.Buckets {
+		total += b.Total
+		creds += b.Credentials
+	}
+	if len(series.Buckets) != 7*24 || total != 3 || creds != 1 {
+		t.Errorf("7d series: %d buckets, %d connections, %d credentials", len(series.Buckets), total, creds)
+	}
+	rec = do(h, "GET", "/api/series?range=30d", nil, true, nil)
+	_ = json.Unmarshal(rec.Body.Bytes(), &series)
+	if len(series.Buckets) != 30 {
+		t.Errorf("30d series has %d buckets", len(series.Buckets))
+	}
+}
+
+func TestServiceSwitch(t *testing.T) {
+	h, bans := newTestDashboard(t)
+	hdr := map[string]string{"X-SkyGuard-Request": "1"}
+	if rec := do(h, "POST", "/api/services", url.Values{"name": {"fake-ftp"}, "enabled": {"1"}}, true, nil); rec.Code != http.StatusForbidden {
+		t.Errorf("switch without CSRF header = %d", rec.Code)
+	}
+	if rec := do(h, "POST", "/api/services", url.Values{"name": {"fake-ftp"}, "enabled": {"1"}}, true, hdr); rec.Code != 200 || !bans.ftpOn {
+		t.Errorf("switch on = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := do(h, "POST", "/api/services", url.Values{"name": {"ssh"}, "enabled": {"0"}}, true, hdr); rec.Code != http.StatusConflict {
+		t.Errorf("switching a stealth service must be refused, got %d", rec.Code)
+	}
+	if rec := do(h, "POST", "/api/services", url.Values{"name": {"fake-ftp"}}, true, hdr); rec.Code != http.StatusBadRequest {
+		t.Errorf("missing enabled = %d", rec.Code)
 	}
 }

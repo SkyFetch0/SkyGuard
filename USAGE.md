@@ -861,6 +861,21 @@ curl -u admin:PASSWORD -H "$H" -d score_threshold=80 http://127.0.0.1:9090/api/s
 
 Whitelisted and loopback addresses cannot be banned (`400`).
 
+#### Charts and services
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/info` | `host`, `version`, `firewall_method`, `auto_ban_enabled`, `score_threshold` |
+| `GET /api/summary?range=24h\|7d\|30d` | `current` and `previous` period counters, `outcomes` (where connections ended: `honeypot`, `forwarded`, `banned`, `blacklist`, `rate_limited`, `port_scan`, `stealth_probe`, `dropped_other`), `top_sources` (with ban state), `services`, `countrys`, `ports` |
+| `GET /api/series?range=…[&ip=…][&port=…]` | `buckets`: per hour (24h, 7d) or per day (30d), with `total`, `honeypot_hits`, `dropped`, `forwarded`, `credentials`; empty buckets are zero |
+| `GET /api/credentials/breakdown?range=…` | `usernames`, `passwords`, `services` |
+| `GET /api/services` | every configured service: `kind`, `type`, `port`, `enabled`, `running`, `toggleable`, `error`, `hits_24h`, `credentials_24h`, `hourly` |
+| `POST /api/services` | `name`, `enabled` — switches a **honeypot** on or off at runtime (stealth and passthrough are config-managed and refused with `409`) |
+
+A honeypot switched from the dashboard stays that way across restarts. When
+you later change that honeypot's `enabled` value in the config file, the file
+wins again.
+
 #### `GET /healthz`
 
 Unauthenticated, returns `ok`. Used by the Docker health check

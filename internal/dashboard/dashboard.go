@@ -7,6 +7,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -20,7 +21,7 @@ import (
 	"github.com/skyguard/skyguard/internal/storage"
 )
 
-//go:embed static/index.html static/app.js
+//go:embed static
 var staticFiles embed.FS
 
 // BanManager applies and lifts bans consistently (database, firewall, score
@@ -31,20 +32,42 @@ type BanManager interface {
 	IsWhitelisted(ip string) bool
 }
 
+// ServiceStatus describes one configured listener for the services screen.
+type ServiceStatus struct {
+	Name          string `json:"name"`
+	Kind          string `json:"kind"` // honeypot, stealth, passthrough
+	Type          string `json:"type"` // ssh, ftp, mysql, http for honeypots
+	Port          int    `json:"port"`
+	Target        string `json:"target,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	ConfigEnabled bool   `json:"config_enabled"`
+	Running       bool   `json:"running"`
+	Toggleable    bool   `json:"toggleable"`
+	Active        int    `json:"active_connections"`
+	Error         string `json:"error,omitempty"`
+}
+
+// Controller is what the dashboard needs from the running server.
+type Controller interface {
+	BanManager
+	Services() []ServiceStatus
+	SetServiceEnabled(name string, enabled bool) error
+}
+
 // Dashboard serves a lightweight HTTP management interface.
 type Dashboard struct {
 	cfg      config.DashboardConfig
 	db       *storage.DB
 	fw       firewall.Firewall
 	settings *storage.Settings
-	bans     BanManager
+	bans     Controller
 	logger   *slog.Logger
 	server   *http.Server
 }
 
 // New creates a Dashboard instance. Call Start to begin serving.
-func New(cfg config.DashboardConfig, db *storage.DB, fw firewall.Firewall, settings *storage.Settings, bans BanManager, logger *slog.Logger) *Dashboard {
-	return &Dashboard{cfg: cfg, db: db, fw: fw, settings: settings, bans: bans, logger: logger}
+func New(cfg config.DashboardConfig, db *storage.DB, fw firewall.Firewall, settings *storage.Settings, ctl Controller, logger *slog.Logger) *Dashboard {
+	return &Dashboard{cfg: cfg, db: db, fw: fw, settings: settings, bans: ctl, logger: logger}
 }
 
 // Start launches the HTTP server in a background goroutine. It returns an
@@ -125,8 +148,15 @@ func (d *Dashboard) Stop() error {
 func (d *Dashboard) routes() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /{$}", d.handleStatic("static/index.html", "text/html; charset=utf-8"))
-	api.HandleFunc("GET /app.js", d.handleStatic("static/app.js", "text/javascript; charset=utf-8"))
+	assets, _ := fs.Sub(staticFiles, "static/assets")
+	api.Handle("GET /assets/", http.StripPrefix("/assets/", http.FileServerFS(assets)))
 	api.HandleFunc("GET /api/stats", d.handleStats)
+	api.HandleFunc("GET /api/info", d.handleInfo)
+	api.HandleFunc("GET /api/summary", d.handleSummary)
+	api.HandleFunc("GET /api/series", d.handleSeries)
+	api.HandleFunc("GET /api/credentials/breakdown", d.handleCredentialBreakdown)
+	api.HandleFunc("GET /api/services", d.handleServices)
+	api.HandleFunc("POST /api/services", d.csrf(d.handleSetService))
 	api.HandleFunc("GET /api/timeline", d.handleTimeline)
 	api.HandleFunc("GET /api/connections", d.handleConnections)
 	api.HandleFunc("GET /api/search", d.handleConnections) // backward-compatible alias
@@ -170,7 +200,7 @@ func (d *Dashboard) handleStatic(name, contentType string) http.HandlerFunc {
 }
 
 // securityHeaders adds defensive HTTP headers. All JavaScript lives in
-// /app.js, so scripts are restricted to 'self' (no inline script execution).
+// /assets, so scripts are restricted to 'self' (no inline script execution).
 func securityHeaders(next http.Handler) http.Handler {
 	const csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
 		"img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"

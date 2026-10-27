@@ -148,3 +148,29 @@ func boolToStr(b bool) string {
 	}
 	return "0"
 }
+
+// Service overrides: a honeypot switched on or off from the dashboard. The
+// value remembers the config file's setting at the time of the switch; when
+// the operator later edits that service in the YAML, the file wins again
+// (the same precedence as the auto-ban settings).
+func serviceKey(name string) string { return "service_enabled:" + name }
+
+// ServiceOverride returns the dashboard's choice for a service, if one is
+// stored and the config file has not changed that service since.
+func (d *DB) ServiceOverride(name string, cfgEnabled bool) (enabled, ok bool, err error) {
+	v, found, err := d.getSetting(serviceKey(name))
+	if err != nil || !found {
+		return false, false, err
+	}
+	var on, cfg int
+	if _, err := fmt.Sscanf(v, "%d;cfg=%d", &on, &cfg); err != nil || (cfg == 1) != cfgEnabled {
+		_, err := d.db.Exec(`DELETE FROM settings WHERE key = ?`, serviceKey(name))
+		return false, false, err
+	}
+	return on == 1, true, nil
+}
+
+// SetServiceOverride stores the dashboard's choice for a service.
+func (d *DB) SetServiceOverride(name string, enabled, cfgEnabled bool) error {
+	return d.setSetting(serviceKey(name), fmt.Sprintf("%d;cfg=%d", boolToInt(enabled), boolToInt(cfgEnabled)))
+}

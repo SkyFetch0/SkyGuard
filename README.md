@@ -252,7 +252,17 @@ ssh -L 9090:127.0.0.1:9090 user@your-server
 # → http://localhost:9090
 ```
 
-**Panels:** overview (stats + 24 h chart) · searchable connection log with CSV export · top attackers · captured credentials · bans (manual ban/unban) · firewall rules · auto-ban settings · per-IP detail view. Works on mobile.
+**Screens** (dark "data terminal" design, every figure in IBM Plex Mono so digits line up; fonts are embedded, nothing is loaded from the internet):
+
+- **Overview** — the busiest source and whether it is banned, KPIs that switch the main chart (connections, honeypot hits, logins tried, dropped) over 24 h / 7 d / 30 d with the change against the previous period, a *decision flow* showing where every connection ended (trapped, let through, or dropped by ban, blacklist, rate limit, port scan, stealth probe), busiest sources with a one-click ban, targeted services and countries (or ports without GeoIP), latest events.
+- **Connections** — a day × hour heatmap of the last 7 days in your local time, filters (IP, service, country, outcome) kept in the URL, paging, CSV export.
+- **Attackers and bans** — threat scores against the auto-ban threshold, active bans with confirmed unban, ban reasons, a ban dialog (1 h / 1 day / 7 days / permanent).
+- **Captured credentials** — most tried usernames and passwords, attempts per honeypot and over time, the most frequent pairs.
+- **Honeypots and services** — switch each honeypot on or off at runtime (the listener opens or closes at once; the choice survives restarts until you change that honeypot in the config file), with 24-hour activity per service. Stealth and passthrough services are shown read-only: turning them off from a panel you usually reach through them could cut your own session.
+- **Auto-ban and firewall** — switch, threshold stepper, ban length, and the SKYGUARD chain's current rules.
+- **IP detail** — a side sheet with score, daily activity, credentials and connections for any address.
+
+Works on phones (bottom navigation) and with the keyboard; screen state lives in the URL hash, so every view can be bookmarked.
 
 All endpoints except `/healthz` require HTTP Basic Auth (`dashboard.auth`).
 Failed logins are throttled per client IP. JSON fields are `snake_case`.
@@ -261,7 +271,13 @@ State-changing `POST` endpoints require the header `X-SkyGuard-Request: 1` (CSRF
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/healthz` | Unauthenticated liveness probe (Docker health check) |
-| `GET` | `/api/stats` | Totals, today, unique IPs/countries, credentials, active bans |
+| `GET` | `/api/info` | Host name, version, firewall backend, auto-ban state |
+| `GET` | `/api/stats` | All-time totals, today, unique IPs/countries, credentials, active bans |
+| `GET` | `/api/summary?range=24h\|7d\|30d` | This and the previous period, decision-flow outcomes, top sources, services, countries, ports |
+| `GET` | `/api/series?range=…&ip=…&port=…` | Hourly (24 h, 7 d) or daily (30 d) counts incl. credentials, optionally for one IP or port |
+| `GET` | `/api/credentials/breakdown?range=…` | Most tried usernames, passwords and attempts per honeypot |
+| `GET` | `/api/services` | Every configured service with its state and 24 h activity |
+| `POST` | `/api/services` | `name`, `enabled` — switch a honeypot at runtime |
 | `GET` | `/api/timeline?hours=N` | Per-hour counts (gaps filled with zeros) |
 | `GET` | `/api/connections` | Connection log; filters `ip`, `country`, `service`, `action`, `since`, `until` (RFC3339), `limit`, `offset` |
 | `GET` | `/api/export` | Same filters, CSV download (formula-injection safe) |

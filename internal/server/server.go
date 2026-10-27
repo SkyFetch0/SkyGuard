@@ -70,13 +70,16 @@ type Server struct {
 	whitelist *netutil.IPSet
 	blacklist *netutil.IPSet
 
-	mu        sync.Mutex
-	listeners []net.Listener
-	conns     map[net.Conn]struct{}
-	stopping  bool
+	eventLogger *honeypot.EventLogger
+
+	mu       sync.Mutex
+	services []*svcRuntime
+	conns    map[net.Conn]struct{}
+	stopping bool
 
 	wg     sync.WaitGroup
 	sem    chan struct{}
+	ctx    context.Context
 	cancel context.CancelFunc
 }
 
@@ -175,53 +178,29 @@ func (s *Server) Start(ctx context.Context) error {
 		s.maybeAutoBan(sess.IP, score, "failed_credential")
 	})
 
-	// Build every handler first so a bad config cannot leave half the
-	// listeners open.
-	var services []service
-	for _, svc := range s.cfg.Stealth {
-		if !svc.IsEnabled() {
-			s.logger.Info("stealth service disabled, skipping", "name", svc.Name)
-			continue
-		}
-		services = append(services, service{
-			kind: kindStealth, name: svc.Name, port: svc.ListenPort,
-			stealth: stealth.NewHandler(svc, s.proxy, s.logger.With("service", svc.Name)),
-		})
-	}
-	for _, svc := range s.cfg.Honeypots {
-		if !svc.IsEnabled() {
-			s.logger.Info("honeypot service disabled, skipping", "name", svc.Name)
-			continue
-		}
-		h, err := honeypot.NewHandler(svc, eventLogger, s.cfg.General.DataDir)
-		if err != nil {
-			return fmt.Errorf("honeypot %q: %w", svc.Name, err)
-		}
-		services = append(services, service{kind: kindHoneypot, name: svc.Name, port: svc.Port, honeypot: h})
-	}
-	for _, svc := range s.cfg.Passthrough {
-		if !svc.IsEnabled() {
-			s.logger.Info("passthrough service disabled, skipping", "name", svc.Name)
-			continue
-		}
-		services = append(services, service{kind: kindPassthrough, name: svc.Name, port: svc.ListenPort, target: svc.RealTarget})
-	}
+	s.eventLogger = eventLogger
+	s.ctx = ctx
 
-	for _, svc := range services {
-		// ":port" listens on both IPv4 and IPv6 (the old "0.0.0.0:port" never
-		// saw IPv6 attackers at all).
-		addr := fmt.Sprintf(":%d", svc.port)
-		ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
-		if err != nil {
-			return fmt.Errorf("%s %q: listen %s: %w%s", svc.kind, svc.name, addr, err, listenHint(err, svc.port))
-		}
-		s.addListener(ln)
-		s.logger.Info("listener started", "kind", svc.kind, "name", svc.name, "addr", addr)
-
-		svc := svc
-		s.wg.Add(1)
-		go s.acceptLoop(ln, func(conn net.Conn) { s.handleConnection(conn, svc) })
+	if err := s.buildServices(); err != nil {
+		return err
 	}
+	s.mu.Lock()
+	for _, rt := range s.services {
+		if !rt.enabled {
+			s.logger.Info("service disabled, skipping", "kind", rt.kind, "name", rt.name)
+			continue
+		}
+		if err := s.startListenerLocked(ctx, rt); err != nil {
+			if rt.cfgEnabled {
+				s.mu.Unlock()
+				return err
+			}
+			// Switched on from the dashboard only: report it there instead
+			// of refusing to start the whole server.
+			s.logger.Error("honeypot enabled from the dashboard could not start", "name", rt.name, "error", err)
+		}
+	}
+	s.mu.Unlock()
 
 	// Re-apply bans that are still active: firewall rules do not survive a
 	// reboot (or a container restart without persistence), the database does.
@@ -258,10 +237,12 @@ func listenHint(err error, port int) string {
 func (s *Server) Stop() error {
 	s.mu.Lock()
 	s.stopping = true
-	for _, ln := range s.listeners {
-		ln.Close()
+	for _, rt := range s.services {
+		if rt.ln != nil {
+			rt.ln.Close()
+			rt.ln = nil
+		}
 	}
-	s.listeners = nil
 	for c := range s.conns {
 		c.Close()
 	}
@@ -283,27 +264,25 @@ func (s *Server) Stop() error {
 	return dashErr
 }
 
-func (s *Server) addListener(ln net.Listener) {
-	s.mu.Lock()
-	s.listeners = append(s.listeners, ln)
-	s.mu.Unlock()
-}
-
 // track registers conn for forced close on shutdown; it returns false when
 // the server is already stopping.
-func (s *Server) track(conn net.Conn) bool {
+func (s *Server) track(conn net.Conn, rt *svcRuntime) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopping {
 		return false
 	}
 	s.conns[conn] = struct{}{}
+	if rt.conns != nil {
+		rt.conns[conn] = struct{}{}
+	}
 	return true
 }
 
-func (s *Server) untrack(conn net.Conn) {
+func (s *Server) untrack(conn net.Conn, rt *svcRuntime) {
 	s.mu.Lock()
 	delete(s.conns, conn)
+	delete(rt.conns, conn)
 	s.mu.Unlock()
 }
 
@@ -406,7 +385,7 @@ func (s *Server) syncBans() {
 
 // acceptLoop accepts new TCP connections and dispatches each to handler in its
 // own goroutine. It exits when the listener is closed.
-func (s *Server) acceptLoop(ln net.Listener, handler func(net.Conn)) {
+func (s *Server) acceptLoop(rt *svcRuntime, ln net.Listener, handler func(net.Conn)) {
 	defer s.wg.Done()
 
 	backoff := 5 * time.Millisecond
@@ -435,7 +414,7 @@ func (s *Server) acceptLoop(ln net.Listener, handler func(net.Conn)) {
 			conn.Close()
 			continue
 		}
-		if !s.track(conn) {
+		if !s.track(conn, rt) {
 			<-s.sem
 			conn.Close()
 			return
@@ -445,7 +424,7 @@ func (s *Server) acceptLoop(ln net.Listener, handler func(net.Conn)) {
 		go func(c net.Conn) {
 			defer s.wg.Done()
 			defer func() { <-s.sem }()
-			defer s.untrack(c)
+			defer s.untrack(c, rt)
 			defer c.Close()
 			defer func() {
 				if r := recover(); r != nil {

@@ -136,6 +136,7 @@ type TimelineBucket struct {
 	HoneypotHits int64  `json:"honeypot_hits"`
 	Dropped      int64  `json:"dropped"`
 	Forwarded    int64  `json:"forwarded"`
+	Credentials  int64  `json:"credentials"`
 }
 
 // GetTimeline returns per-hour connection counts for the last n hours. Hours
