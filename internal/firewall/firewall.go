@@ -31,6 +31,9 @@ type Firewall interface {
 type Options struct {
 	// IPTablesBackend is "auto", "legacy" or "nft".
 	IPTablesBackend string
+	// NoForward keeps the ban chain out of FORWARD: bans then cover the
+	// host itself and Docker's published ports only.
+	NoForward bool
 }
 
 // New returns the Firewall implementation for method ("iptables", "ufw",
@@ -58,7 +61,7 @@ func New(method string, opts Options, logger *slog.Logger) (Firewall, error) {
 		logger.Warn("firewall: ufw is not usable, falling back to iptables", "reason", err)
 		fallthrough
 	case "iptables":
-		return newIPTables(opts.IPTablesBackend, logger, execRunner)
+		return newIPTables(opts.IPTablesBackend, !opts.NoForward, logger, execRunner)
 	default:
 		return nil, fmt.Errorf("unknown firewall method %q (supported: iptables, ufw, none)", method)
 	}

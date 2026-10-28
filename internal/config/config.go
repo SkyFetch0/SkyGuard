@@ -145,9 +145,16 @@ type AutoBanConfig struct {
 	Method         string        `yaml:"method"`
 	// IPTablesBackend selects the iptables flavour: "auto" (default) picks
 	// whichever of iptables-legacy / iptables-nft the host already uses.
-	IPTablesBackend string        `yaml:"iptables_backend"`
-	Scoring         ScoringConfig `yaml:"scoring"`
+	IPTablesBackend string `yaml:"iptables_backend"`
+	// CoverForwarded hooks the ban chain into FORWARD as well, so a ban also
+	// stops traffic the host passes on: extra IPs routed to Incus instances
+	// or VMs, other DNAT, a LAN behind this host. Default true.
+	CoverForwarded *bool         `yaml:"cover_forwarded"`
+	Scoring        ScoringConfig `yaml:"scoring"`
 }
+
+// BansCoverForwarded reports auto_ban.cover_forwarded (default true).
+func (a AutoBanConfig) BansCoverForwarded() bool { return a.CoverForwarded == nil || *a.CoverForwarded }
 
 type ScoringConfig struct {
 	HoneypotConnection int `yaml:"honeypot_connection"`

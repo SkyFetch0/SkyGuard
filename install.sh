@@ -989,6 +989,9 @@ fi
 # itself; we only make sure the jump exists early so bans win over ACCEPTs.
 iptables -N SKYGUARD 2>/dev/null || true
 iptables -C INPUT -j SKYGUARD 2>/dev/null || iptables -I INPUT 1 -j SKYGUARD
+# Traffic the host passes on (extra IPs routed to Incus instances or VMs,
+# DNAT) crosses FORWARD, often behind a "-d <IP> -j ACCEPT": bans go first there.
+iptables -C FORWARD -j SKYGUARD 2>/dev/null || iptables -I FORWARD 1 -j SKYGUARD
 # Ports Docker publishes are reached through FORWARD, not INPUT: hook the
 # same chain into DOCKER-USER so a ban covers the containers too.
 if iptables -nL DOCKER-USER &>/dev/null; then

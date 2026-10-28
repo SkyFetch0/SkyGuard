@@ -246,6 +246,7 @@ timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/<STEALTH_PORT>; printf "SSH-2.0-ag
 iptables -S SKYGUARD                                                       # → -N SKYGUARD
 iptables -S INPUT | grep -c SKYGUARD                                       # → 1
 iptables -S DOCKER-USER 2>/dev/null | grep SKYGUARD                        # → -A DOCKER-USER -j SKYGUARD (when Docker runs)
+iptables -S FORWARD | head -3                                              # → -A FORWARD -j SKYGUARD near the top
 curl -fsS -u '<DASH_USER>:<DASH_PASS>' http://127.0.0.1:9090/api/info      # → JSON with "host", "firewall_method"
 ```
 
@@ -322,9 +323,9 @@ SkyGuard <commit> is running (healthy) on <hostname>.
 
 ```bash
 cd /opt/skyguard && docker compose down
-iptables -D INPUT -j SKYGUARD; iptables -D DOCKER-USER -j SKYGUARD 2>/dev/null; iptables -F SKYGUARD; iptables -X SKYGUARD
+iptables -D INPUT -j SKYGUARD; iptables -D FORWARD -j SKYGUARD; iptables -D DOCKER-USER -j SKYGUARD 2>/dev/null; iptables -F SKYGUARD; iptables -X SKYGUARD
 # port access rules (the Ports screen), if any were made:
-iptables -D INPUT -j SKYGUARD-PORTS; iptables -D DOCKER-USER -j SKYGUARD-PORTS-FWD 2>/dev/null
+iptables -D INPUT -j SKYGUARD-PORTS; iptables -D FORWARD -j SKYGUARD-PORTS-FWD
 iptables -F SKYGUARD-PORTS; iptables -X SKYGUARD-PORTS; iptables -F SKYGUARD-PORTS-FWD; iptables -X SKYGUARD-PORTS-FWD
 # if you blocked 22 in step 9:
 iptables -D INPUT ! -i lo -p tcp --dport 22 -j DROP

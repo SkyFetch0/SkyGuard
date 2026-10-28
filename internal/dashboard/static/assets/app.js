@@ -464,16 +464,41 @@
   }
 
   // ── ports and access ────────────────────────────────────────────────────
-  const pt = { data: null, scope: 'public', edit: null, timer: 0 };
+  const pt = { data: null, scope: 'public', addr: '', edit: null, timer: 0 };
   const SCOPE_WORDS = { public: 'Internet', private: 'Internal networks', local: 'This server only' };
   const RISK_WORDS = { database: 'Database', admin: 'Admin interface', remote: 'Remote login', files: 'File sharing' };
   const protoOf = (r) => (r.proto === 'both' ? 'tcp+udp' : r.proto || 'tcp');
   function ruleRange(r) { const [a, b] = String(r.ports).split('-').map(Number); return [a, b || a]; }
+  const addrList = () => (pt.data && pt.data.addresses) || [];
+  const addrOf = (ip) => addrList().find((a) => a.ip === ip);
+  // whether ip (an address, or a network written by hand) takes in addr
+  function ipCovers(ip, addr) {
+    if (!ip.includes('/')) return ip === addr;
+    const [net, bits] = ip.split('/');
+    if (net.includes(':') || addr.includes(':')) return net.includes(':') === addr.includes(':'); // IPv6 networks: assume so
+    const n = (x) => x.split('.').reduce((a, o) => a * 256 + Number(o), 0), m = 2 ** (32 - Number(bits));
+    return Math.floor(n(net) / m) === Math.floor(n(addr) / m);
+  }
+  // whether a listener takes connections on a server address
+  function listenerOn(l, ip) {
+    if (l.address) return l.address === ip;
+    const a = addrOf(ip);
+    if (!a || a.kind !== 'host') return false;
+    return l.addrs.some((x) => x === ip || x === '::' || (x === '0.0.0.0' && !ip.includes(':')));
+  }
+  // whether a rule covers a listener: an address rule its addresses, a server-wide rule the
+  // host's own ports and the forwarded addresses that take the server-wide rules
+  function appliesTo(r, l) {
+    const as = r.addresses || [];
+    if (!as.length) return !l.address || !!(addrOf(l.address) || {}).follow;
+    if (l.address) return as.some((ip) => ipCovers(ip, l.address));
+    return addrList().some((a) => a.kind === 'host' && as.some((ip) => ipCovers(ip, a.ip)) && listenerOn(l, a.ip)) || !addrList().length;
+  }
   function rulesFor(l) {
     return ((pt.data && pt.data.rules) || []).filter((r) => {
       const [lo, hi] = ruleRange(r);
-      return r.enabled && (r.proto === 'both' || r.proto === l.proto) && l.port >= lo && l.port <= hi;
-    });
+      return r.enabled && (r.proto === 'both' || r.proto === l.proto) && l.port >= lo && l.port <= hi && appliesTo(r, l);
+    }).sort((a, b) => ((b.addresses || []).length ? 1 : 0) - ((a.addresses || []).length ? 1 : 0)); // address rules come first, as in the firewall
   }
   const srcWord = (s) => (s === 'private' ? 'internal networks' : s);
   function ruleSummary(r) {
@@ -502,8 +527,12 @@
     if (!un.hidden) un.textContent = `Rules can't be enforced here: ${d.reason}. They are shown, but changes are refused.`;
     $('#rule-new').disabled = d.available === false;
     renderTrial();
+    renderAddresses();
 
-    const shown = pt.scope === 'public' ? pub : ls;
+    let shown = pt.scope === 'public' ? pub : ls;
+    if (pt.addr) shown = shown.filter((l) => listenerOn(l, pt.addr));
+    const fa = pt.addr && addrOf(pt.addr);
+    $('#pt-ports-title').innerHTML = fa ? `Open ports on <span class="mono">${esc(pt.addr)}</span> <button class="card-link" type="button" data-action="addr-filter" data-ip="">All addresses</button>` : 'Open ports';
     $('#pt-listeners').innerHTML = shown.length ? shown.map((l) => {
       const rs = rulesFor(l), r = rs[0];
       const risk = l.risk && l.scope === 'public' && !r && l.kind !== 'skyguard' && l.risk !== 'remote'
@@ -514,7 +543,7 @@
         : '<span class="muted">Everyone</span>';
       const ruleBtn = l.scope === 'local' ? '' : r
         ? `<button class="btn small" type="button" data-action="rule-edit" data-id="${esc(r.id)}">Edit rule</button>`
-        : `<button class="btn small" type="button" data-action="rule-for" data-port="${l.port}" data-proto="${esc(l.proto)}" ${d.available === false ? 'disabled' : ''}>Restrict…</button>`;
+        : `<button class="btn small" type="button" data-action="rule-for" data-port="${l.port}" data-proto="${esc(l.proto)}" data-address="${esc(l.address || '')}" ${d.available === false ? 'disabled' : ''}>Restrict…</button>`;
       // a managed container's port can be closed where it is published
       const closable = d.containers_managed && l.container_id && (l.kind === 'docker' || l.kind === 'incus');
       const local = l.addrs.length && l.addrs.every((x) => x === '127.0.0.1');
@@ -523,7 +552,7 @@
       return `<tr><td class="n pt-port"><span class="num">${l.port}</span><span class="muted">/${esc(l.proto)}</span></td>
         <td><span class="pt-svc">${esc(l.service || '—')}</span>${risk}</td>
         <td class="pt-who">${who}</td>
-        <td class="pt-addr" title="${esc(l.addrs.join(', '))}">${esc(SCOPE_WORDS[l.scope])}${addrDetail(l.addrs) ? ` <span class="muted mono">${esc(addrDetail(l.addrs))}</span>` : ''}</td>
+        <td class="pt-addr" title="${esc(l.addrs.join(', '))}">${esc(SCOPE_WORDS[l.scope])}${l.address ? ` <span class="muted mono">${esc(l.address)}</span>` : addrDetail(l.addrs) ? ` <span class="muted mono">${esc(addrDetail(l.addrs))}</span>` : ''}</td>
         <td class="pt-access">${access}</td><td class="n pt-act">${btn}</td></tr>`;
     }).join('') : emptyRow(6, pt.scope === 'public' ? 'Nothing on this server takes connections from outside.' : 'No listening ports were found.');
 
@@ -533,7 +562,7 @@
       return `<div class="rule${r.enabled ? '' : ' off'}">
         <input class="switch" type="checkbox" role="switch" data-action="rule-toggle" data-id="${esc(r.id)}" ${r.enabled ? 'checked' : ''} ${d.available === false ? 'disabled' : ''} aria-label="Rule for port ${esc(r.ports)} in force">
         <div><h3><span><span class="num">${esc(r.ports)}</span><span class="muted">/${esc(protoOf(r))}</span></span>${r.name ? `<span>${esc(r.name)}</span>` : ''}${r.protected ? `<span class="pill" title="A change here needs confirming: this port is ${esc(r.protected)}"><span class="dot"></span>Protected: ${esc(r.protected.replace(/^the /, ''))}</span>` : ''}</h3>
-          <div class="what">${r.mode === 'deny' ? 'Everyone except' : 'Only'} ${srcs}</div></div>
+          <div class="what">${r.mode === 'deny' ? 'Everyone except' : 'Only'} ${srcs}${(r.addresses || []).length ? ` <span class="muted">on</span> ${r.addresses.map((a) => `<span class="chip mono">${esc(a)}</span>`).join('')}` : ''}</div></div>
         <div class="fig"><span class="num">${num(r.dropped)}</span><span class="lbl">dropped</span></div>
         <button class="btn small" type="button" data-action="rule-edit" data-id="${esc(r.id)}" ${d.available === false ? 'disabled' : ''}>Edit</button></div>`;
     }).join('') : '<div class="empty">No rules yet: every open port takes connections from anyone. Use Restrict… on a port above, or New rule.</div>';
@@ -559,7 +588,12 @@
   function openRule(r, preset) {
     const f = $('#rule-form'), d = pt.data;
     pt.edit = r ? r.id : null;
-    const v = r || Object.assign({ ports: '', name: '', proto: 'tcp', mode: 'allow', sources: ['private'], enabled: true }, preset);
+    const v = r || Object.assign({ ports: '', name: '', proto: 'tcp', mode: 'allow', sources: ['private'], enabled: true, addresses: [] }, preset);
+    const picked = v.addresses || [], known = addrList();
+    pressOnly($('#rule-where'), picked.length ? 'some' : 'all', 'where');
+    $('#rule-addrs').hidden = !picked.length;
+    $('#rule-addrs').innerHTML = known.filter((a) => a.public || a.kind !== 'host' || picked.includes(a.ip)).map((a) => `<label class="check"><input type="checkbox" name="addr" value="${esc(a.ip)}" ${picked.includes(a.ip) ? 'checked' : ''}> <span class="mono">${esc(a.ip)}</span> <span class="muted">${esc(addrWhat(a, true))}</span></label>`).join('')
+      + `<label class="field grow-field"><span class="sr-only">Other addresses</span><input class="input mono" name="addr_other" value="${esc(picked.filter((x) => !known.some((a) => a.ip === x)).join(', '))}" placeholder="other addresses or networks…" autocomplete="off" spellcheck="false"></label>`;
     $('#rule-title').textContent = r ? `Rule for port ${r.ports}` : 'New rule';
     f.elements.ports.value = v.ports; f.elements.name.value = v.name || '';
     f.elements.sources.value = (v.sources || []).join('\n'); f.elements.enabled.checked = v.enabled !== false;
@@ -577,12 +611,18 @@
     const f = $('#rule-form'), d = pt.data;
     const mode = $('#rule-mode [aria-pressed="true"]').dataset.mode, proto = $('#rule-proto [aria-pressed="true"]').dataset.proto;
     $('#rule-src-label').textContent = mode === 'allow' ? 'Sources allowed in' : 'Sources kept out';
+    const some = $('#rule-where [aria-pressed="true"]').dataset.where === 'some', fwd = addrList().filter((a) => a.kind !== 'host');
+    const follow = fwd.filter((a) => a.follow).map((a) => a.ip), own = fwd.filter((a) => !a.follow).map((a) => a.ip);
+    $('#rule-where-hint').textContent = some ? 'Rules for chosen addresses come first: a source they let in skips the server-wide rules there.'
+      : `The server's own addresses and every port it publishes${follow.length ? `, and ${follow.join(', ')}` : ''}.${own.length ? ` Not ${own.join(', ')}: ${own.length === 1 ? 'it keeps' : 'they keep'} to ${own.length === 1 ? 'its' : 'their'} own rules (switch that under Addresses).` : ''}`;
     const [lo, hi] = ruleRange({ ports: f.elements.ports.value.trim().replace(/\s/g, '') });
-    const hit = lo ? (d.listeners || []).filter((l) => l.port >= lo && l.port <= hi && (proto === 'both' || l.proto === proto)) : [];
+    const draft = { addresses: some ? pickedAddrs() : [] };
+    const hit = lo ? (d.listeners || []).filter((l) => l.port >= lo && l.port <= hi && (proto === 'both' || l.proto === proto) && appliesTo(draft, l)) : [];
     $('#rule-port-hint').textContent = !lo ? '' : hit.length
-      ? hit.slice(0, 3).map((l) => `${l.port}: ${l.service || l.process || 'unknown'}${l.owner ? ` (${l.owner})` : ''}`).join(' · ') + (hit.length > 3 ? ` and ${hit.length - 3} more` : '')
+      ? hit.slice(0, 3).map((l) => `${l.port}: ${l.service || l.process || 'unknown'}${l.owner ? ` (${l.owner})` : ''}${l.address ? ` on ${l.address}` : ''}`).join(' · ') + (hit.length > 3 ? ` and ${hit.length - 3} more` : '')
       : 'Nothing listens there right now; the rule still applies once something does.';
-    const prot = (d.protected || []).find((p) => p.port >= lo && p.port <= hi && proto !== 'udp');
+    const onHost = !some || draft.addresses.some((ip) => addrList().some((a) => a.kind === 'host' && ipCovers(ip, a.ip))) || !addrList().length;
+    const prot = onHost && (d.protected || []).find((p) => p.port >= lo && p.port <= hi && proto !== 'udp');
     const always = `This server itself${(d.always_allowed || []).length > 2 ? ' and the whitelist' : ''} always ${mode === 'allow' ? 'gets in' : 'stays allowed unless listed'}.`;
     $('#rule-note').innerHTML = prot
       ? `<b>Port ${prot.port} is ${esc(prot.why)}.</b> A change here is undone after two minutes unless you keep it, so a mistake can't lock you out for good. ${esc(always)}`
@@ -597,10 +637,59 @@
       proto: $('#rule-proto [aria-pressed="true"]').dataset.proto,
       mode: $('#rule-mode [aria-pressed="true"]').dataset.mode,
       sources: f.elements.sources.value.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean),
+      addresses: $('#rule-where [aria-pressed="true"]').dataset.where === 'some' ? pickedAddrs() : [],
       enabled: f.elements.enabled.checked,
     };
   }
-  const bareRule = ({ id, name, ports, proto, mode, sources, enabled, note }) => ({ id, name, ports, proto, mode, sources: sources || [], enabled, note });
+  function pickedAddrs() {
+    const f = $('#rule-form');
+    return [...$$('input[name="addr"]:checked', f).map((x) => x.value), ...(f.elements.addr_other ? f.elements.addr_other.value.split(/[\s,]+/).filter(Boolean) : [])];
+  }
+  const bareRule = ({ id, name, ports, proto, mode, sources, addresses, enabled, note }) => ({ id, name, ports, proto, mode, sources: sources || [], addresses: addresses || [], enabled, note });
+
+  // the server's addresses: its own, and the ones it passes on
+  function addrWhat(a, short) {
+    if (a.kind === 'host') return a.public ? 'this server' : 'this server, internal';
+    const who = a.owner ? `${a.owner}${short ? '' : ` (${a.owner_kind})`}` : a.owner_kind === 'vm' ? 'a virtual machine' : 'another machine';
+    return a.kind === 'routed' ? `routed to ${who}` : `forwarded to ${a.owner || a.target}`;
+  }
+  function renderAddresses() {
+    const d = pt.data, as = addrList(), ls = d.listeners || [], bans = d.bans || {};
+    const fwd = as.filter((a) => a.kind !== 'host');
+    $('#pt-addr-panel').hidden = as.filter((a) => a.public).length < 2 && !fwd.length;
+    if ($('#pt-addr-panel').hidden) return;
+    $('#pt-addr-meta').textContent = fwd.length ? `${num(fwd.length)} passed on to ${fwd.length === 1 ? 'an instance or machine' : 'instances or machines'} behind this server` : '';
+    const banWord = (a) => {
+      if (bans.method === 'none' || bans.method === 'log') return '<span class="muted">Only logged</span>';
+      if (a.kind === 'host') return 'Covered';
+      if (bans.method === 'ufw') return '<span class="neg-text">Not covered: ufw sees only this server</span>';
+      if (bans.forward_covered) return 'Covered';
+      return bans.forward_enabled ? '<span class="neg-text">Not covered yet: restart SkyGuard</span>' : '<span class="neg-text">Not covered (cover_forwarded is off)</span>';
+    };
+    // the container bridges' gateways are the host's too, but nothing to decide about
+    const inner = as.filter((a) => a.kind === 'host' && !a.public);
+    $('#pt-addrs').innerHTML = as.filter((a) => a.public || a.kind !== 'host').map((a) => {
+      const n = ls.filter((l) => listenerOn(l, a.ip)).length;
+      const what = a.kind === 'host' ? `This server${a.public ? '' : ' <span class="muted">· internal</span>'}`
+        : `${a.kind === 'routed' ? 'Routed to' : 'Forwarded to'} ${a.owner ? `${esc(a.owner)} <span class="chip">${esc(a.owner_kind)}</span>` : esc(a.kind === 'routed' ? (a.owner_kind === 'vm' ? 'a virtual machine' : 'another machine') : a.target)}`
+          + `<span class="muted detail">${a.kind === 'routed' ? `via ${esc(a.device)}` : `to ${esc(a.target)}`}${a.hidden ? ' · its ports are its own: SkyGuard cannot list them, rules still apply' : ''}</span>`;
+      const follow = a.kind === 'host' ? '<span class="muted">Always</span>'
+        : `<label class="follow"><input class="switch" type="checkbox" role="switch" data-action="addr-follow" data-ip="${esc(a.ip)}" ${a.follow ? 'checked' : ''} ${d.available === false ? 'disabled' : ''}> <span>${a.follow ? 'Apply here too' : 'Own rules only'}</span></label>`;
+      return `<tr><td class="pt-a"><button class="ip-link mono" type="button" data-action="addr-filter" data-ip="${esc(a.ip)}" translate="no" title="Show its ports">${esc(a.ip)}</button></td>
+        <td class="pt-what">${what}</td><td class="n num pt-n"><span class="lbl-phone">Ports </span>${a.hidden && !n ? '—' : num(n)}</td><td><span class="lbl-phone">Bans: </span>${banWord(a)}</td><td>${follow}</td>
+        <td class="n pt-act"><button class="btn small" type="button" data-action="rule-addr" data-ip="${esc(a.ip)}" ${d.available === false ? 'disabled' : ''}>Rule for it…</button></td></tr>`;
+    }).join('') + (inner.length ? `<tr><td colspan="6" class="muted pt-inner">And ${num(inner.length)} internal ${inner.length === 1 ? 'address' : 'addresses'} of this server (container bridges, LAN): ${esc(inner.slice(0, 6).map((a) => a.ip).join(', '))}${inner.length > 6 ? '…' : ''}. Server-wide rules cover them.</td></tr>` : '');
+  }
+  async function setFollow(input) {
+    const ip = input.dataset.ip, on = input.checked;
+    input.disabled = true;
+    try {
+      await post('/api/ports/address', { ip, follow: on ? '1' : '0' });
+      toast(on ? `The server-wide rules now apply to ${ip} too` : `${ip} keeps to its own rules`);
+    } catch (e) { input.checked = !on; toast(e.message, false); }
+    input.disabled = false;
+    loadPorts();
+  }
   async function saveRules(rules, done) {
     const res = await post('/api/ports', { rules: JSON.stringify(rules.map(bareRule)) });
     toast(res.trial ? `${done}. Port ${res.ports.join(', ')} is protected: keep the change within two minutes` : done);
@@ -1628,8 +1717,14 @@ Tunnel:  ${tunnel}`],
     if (cf) { ct.only = cf.dataset.ctfilter; applyCtView(); renderBay(); renderMap(); return; }
     const ps = t.closest('[data-ptscope]');
     if (ps) { pt.scope = ps.dataset.ptscope; pressOnly(ps.parentElement, pt.scope, 'ptscope'); renderPorts(); return; }
-    const rp = t.closest('[data-proto], [data-mode]');
-    if (rp && rp.closest('#rule-form')) { pressOnly(rp.parentElement, rp.dataset.proto || rp.dataset.mode, rp.dataset.proto ? 'proto' : 'mode'); ruleHints(); return; }
+    const rp = t.closest('[data-proto], [data-mode], [data-where]');
+    if (rp && rp.closest('#rule-form')) {
+      const k = rp.dataset.proto ? 'proto' : rp.dataset.mode ? 'mode' : 'where';
+      pressOnly(rp.parentElement, rp.dataset[k], k);
+      if (k === 'where') $('#rule-addrs').hidden = rp.dataset.where !== 'some';
+      ruleHints();
+      return;
+    }
     const restart = t.closest('[data-restart]');
     if (restart) { pressOnly(restart.parentElement, restart.dataset.restart, 'restart'); return; }
     const range = t.closest('[data-range]');
@@ -1717,11 +1812,13 @@ Tunnel:  ${tunnel}`],
         break;
       case 'rule-edit': openRule((pt.data.rules || []).find((r) => r.id === a.dataset.id)); break;
       case 'rule-for': {
-        const l = (pt.data.listeners || []).find((x) => x.port === Number(a.dataset.port) && x.proto === a.dataset.proto);
-        openRule(null, { ports: a.dataset.port, proto: a.dataset.proto, name: l ? (l.owner && !l.owner.includes(':') ? l.owner : l.service || '') : '' });
+        const l = (pt.data.listeners || []).find((x) => x.port === Number(a.dataset.port) && x.proto === a.dataset.proto && (x.address || '') === (a.dataset.address || ''));
+        openRule(null, { ports: a.dataset.port, proto: a.dataset.proto, name: l ? (l.owner && !l.owner.includes(':') ? l.owner : l.service || '') : '', addresses: a.dataset.address ? [a.dataset.address] : [] });
         break;
       }
       case 'rule-delete': deleteRule(); break;
+      case 'rule-addr': { const ad = addrOf(a.dataset.ip); openRule(null, { addresses: [a.dataset.ip], name: ad && ad.owner ? ad.owner : '' }); break; }
+      case 'addr-filter': pt.addr = pt.addr === a.dataset.ip ? '' : a.dataset.ip; if (pt.addr) { pt.scope = 'all'; pressOnly($('#pt-scope'), 'all', 'ptscope'); } renderPorts(); break;
       case 'rules-confirm': trialAction('confirm'); break;
       case 'rules-revert': trialAction('revert'); break;
       case 'src-add': {
@@ -1741,6 +1838,8 @@ Tunnel:  ${tunnel}`],
   document.addEventListener('change', (ev) => {
     if (ev.target.matches('[data-action="toggle-service"]')) toggleService(ev.target);
     if (ev.target.matches('[data-action="rule-toggle"]')) toggleRule(ev.target);
+    if (ev.target.matches('[data-action="addr-follow"]')) setFollow(ev.target);
+    if (ev.target.closest('#rule-addrs')) ruleHints();
     if (ev.target.matches('[data-action="engine-switch"]')) switchEngine(ev.target.dataset.engine, ev.target.checked, ev.target);
     if (ev.target.id === 'mcp-enabled') saveMCP('enabled', ev.target.checked);
     if (ev.target.id === 'mcp-actions') saveMCP('allow_actions', ev.target.checked);

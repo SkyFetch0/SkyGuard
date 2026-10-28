@@ -150,3 +150,27 @@ func TestIPTablesBansCoverDockerPublishedPorts(t *testing.T) {
 		}
 	}
 }
+
+func TestIPTablesBansCoverForwardedTraffic(t *testing.T) {
+	fw, f := newFake()
+	fw.forward = true
+	if err := fw.Ban("203.0.113.7"); err != nil {
+		t.Fatal(err)
+	}
+	if f.rules["iptables FORWARD -j SKYGUARD"] != 1 {
+		t.Errorf("FORWARD jump: %v", f.rules)
+	}
+	if on, covered := fw.CoversForward(); !on || !covered {
+		t.Errorf("CoversForward = %v %v", on, covered)
+	}
+	// a reload that dropped the jump: it comes back, the chain was still there
+	f.rules["iptables FORWARD -j SKYGUARD"] = 0
+	if recreated, err := fw.EnsureHooks(); err != nil || recreated || f.rules["iptables FORWARD -j SKYGUARD"] != 1 {
+		t.Errorf("EnsureHooks: %v %v %v", recreated, err, f.rules)
+	}
+	fw2, f2 := newFake()
+	_ = fw2.Ban("203.0.113.8")
+	if f2.rules["iptables FORWARD -j SKYGUARD"] != 0 {
+		t.Error("hooked into FORWARD with cover_forwarded off")
+	}
+}

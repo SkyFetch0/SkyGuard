@@ -699,3 +699,26 @@ code { font-family: var(--mono); font-size: 12px; } /* taste-skill-ignore: data-
 .diff ins { color: var(--positive); text-decoration: none; }
 .copy-line { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .copy-line code { font-family: var(--mono); font-size: var(--fs-small); padding: 4px 8px; border-radius: 4px; background: var(--ground); }
+
+/* the server's addresses */
+.pt-addrs td { height: auto; padding-top: 10px; padding-bottom: 10px; vertical-align: top; }
+.pt-addrs .detail { display: block; font-size: var(--fs-small); white-space: normal; }
+.pt-what { white-space: normal; min-width: 220px; }
+.pt-inner { white-space: normal; font-size: var(--fs-small); }
+.pt-what .chip { margin-left: 4px; }
+.pt-addrs .follow { display: inline-flex; align-items: center; gap: 10px; white-space: nowrap; cursor: pointer; }
+.addr-picks { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; margin-top: 8px; }
+.addr-picks .grow-field { flex: 1 1 220px; }
+#pt-ports-title .card-link { margin-left: 8px; font-size: var(--fs-small); font-weight: 400; }
+.lbl-phone { display: none; }
+@media (max-width: 760px) {
+  .pt-addrs thead { display: none; }
+  .pt-addrs tbody tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; padding: 12px 0; border-bottom: 1px solid var(--rule); }
+  .pt-addrs tbody tr:last-child { border-bottom: 0; }
+  .pt-addrs td { height: auto; padding: 0; border: 0; text-align: left; white-space: normal; min-width: 0; }
+  .pt-addrs td.pt-a { grid-column: 1; grid-row: 1; }
+  .pt-addrs td.pt-act { grid-column: 2; grid-row: 1; }
+  .pt-addrs td:not(.pt-a):not(.pt-act) { grid-column: 1 / -1; }
+  .pt-addrs td.pt-n { color: var(--muted); }
+  .lbl-phone { display: inline; color: var(--muted); }
+}

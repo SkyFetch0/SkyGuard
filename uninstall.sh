@@ -118,11 +118,13 @@ else
     for bin in iptables ip6tables iptables-legacy ip6tables-legacy iptables-nft ip6tables-nft; do
         command -v "$bin" &>/dev/null || continue
         while "$bin" -w 5 -D INPUT -j SKYGUARD 2>/dev/null; do :; done
+        while "$bin" -w 5 -D FORWARD -j SKYGUARD 2>/dev/null; do :; done
         while "$bin" -w 5 -D DOCKER-USER -j SKYGUARD 2>/dev/null; do :; done
         "$bin" -w 5 -F SKYGUARD 2>/dev/null || true
         "$bin" -w 5 -X SKYGUARD 2>/dev/null || true
         # Port erişim kuralları (Ports ekranı): portlar herkese yeniden açılır.
         while "$bin" -w 5 -D INPUT -j SKYGUARD-PORTS 2>/dev/null; do :; done
+        while "$bin" -w 5 -D FORWARD -j SKYGUARD-PORTS-FWD 2>/dev/null; do :; done
         while "$bin" -w 5 -D DOCKER-USER -j SKYGUARD-PORTS-FWD 2>/dev/null; do :; done
         for ch in SKYGUARD-PORTS SKYGUARD-PORTS-FWD; do
             "$bin" -w 5 -F "$ch" 2>/dev/null || true

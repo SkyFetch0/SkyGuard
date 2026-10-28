@@ -21,12 +21,15 @@ import (
 
 type nopGuard struct{ applied []firewall.PortRule }
 
-func (g *nopGuard) Apply(r []firewall.PortRule, _ []string) error  { g.applied = r; return nil }
-func (g *nopGuard) Ensure(r []firewall.PortRule, _ []string) error { return nil }
-func (g *nopGuard) Remove()                                        { g.applied = nil }
-func (g *nopGuard) Dropped() map[string]uint64                     { return map[string]uint64{} }
-func (g *nopGuard) IPv6() bool                                     { return false }
-func (g *nopGuard) NATPorts() []firewall.NATPort                   { return nil }
+func (g *nopGuard) Apply(r []firewall.PortRule, _ []string, _ firewall.Scope) error {
+	g.applied = r
+	return nil
+}
+func (g *nopGuard) Ensure(r []firewall.PortRule, _ []string, _ firewall.Scope) error { return nil }
+func (g *nopGuard) Remove()                                                          { g.applied = nil }
+func (g *nopGuard) Dropped() map[string]uint64                                       { return map[string]uint64{} }
+func (g *nopGuard) IPv6() bool                                                       { return false }
+func (g *nopGuard) NATPorts() []firewall.NATPort                                     { return nil }
 
 func TestPortRulesAPI(t *testing.T) {
 	db, err := storage.New(filepath.Join(t.TempDir(), "t.db"))

@@ -100,3 +100,14 @@ func TestContainersNeedAnAuthenticatedDashboard(t *testing.T) {
 		t.Errorf("defaults %+v", cfg.Containers)
 	}
 }
+
+func TestCoverForwardedDefaultsOn(t *testing.T) {
+	cfg, err := Parse([]byte("general:\n  data_dir: /tmp/sg\n"))
+	if err != nil || !cfg.Analysis.AutoBan.BansCoverForwarded() {
+		t.Fatalf("default: %v %v", cfg.Analysis.AutoBan.BansCoverForwarded(), err)
+	}
+	cfg, err = Parse([]byte("analysis:\n  auto_ban:\n    cover_forwarded: false\n"))
+	if err != nil || cfg.Analysis.AutoBan.BansCoverForwarded() {
+		t.Errorf("explicit false: %v %v", cfg.Analysis.AutoBan.BansCoverForwarded(), err)
+	}
+}

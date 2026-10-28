@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/skyguard/skyguard/internal/firewall"
 	"github.com/skyguard/skyguard/internal/portrules"
@@ -23,7 +25,63 @@ func (s *Server) portRules() *portrules.Manager {
 	}
 	m := portrules.New(guard, reason, s.db, s.cfg.Whitelist.IPs, logger)
 	m.Protected = s.protectedPorts
+	m.Addresses = s.portAddresses
 	return m
+}
+
+// addrCache keeps the last address scan for a few seconds: a dashboard
+// refresh asks for it several times.
+type addrCache struct {
+	mu   sync.Mutex
+	at   time.Time
+	list []portrules.Address
+	dnat []portrules.DNAT
+}
+
+// portAddresses lists the server's addresses: its own, those routed to an
+// instance or a VM, and DNAT-ed ones.
+func (s *Server) portAddresses() []portrules.Address {
+	addrs, _ := s.scanAddresses()
+	return addrs
+}
+
+func (s *Server) scanAddresses() ([]portrules.Address, []portrules.DNAT) {
+	c := &s.addrs
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if time.Since(c.at) < 5*time.Second {
+		return c.list, c.dnat
+	}
+	var dnat []portrules.DNAT
+	if s.portGuard != nil {
+		for _, r := range s.portGuard.DNATRules() {
+			dnat = append(dnat, portrules.DNAT{Dest: r.Dest, Proto: r.Proto, Port: r.Port, To: r.To})
+		}
+	}
+	nss := portrules.Namespaces("/proc")
+	// Docker namespaces are named by container ID; the engine knows the name.
+	names := map[string]string{}
+	if s.ctr != nil && s.ctr.Enabled("docker") {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		for _, ct := range s.ctr.Snapshot(ctx).Containers {
+			if ct.Engine == "docker" {
+				names[ct.ID] = ct.Name
+			}
+		}
+		cancel()
+	}
+	for i := range nss {
+		if nss[i].Kind == "docker" {
+			if n := names[nss[i].Name]; n != "" {
+				nss[i].Name = n
+			} else if len(nss[i].Name) > 12 {
+				nss[i].Name = nss[i].Name[:12]
+			}
+		}
+	}
+	c.list = portrules.Discover(portrules.LocalAddrs("/proc/net"), portrules.HostRoutes("/proc/net"), nss, dnat)
+	c.dnat, c.at = dnat, time.Now()
+	return c.list, c.dnat
 }
 
 // protectedPorts are the ways back in: SSH (22 and wherever sshd listens),
@@ -89,5 +147,8 @@ func (s *Server) PortListeners(ctx context.Context) []portrules.Listener {
 			}
 		}
 	}
-	return portrules.Listeners(portrules.ReadSockets("/proc/net"), portrules.SocketOwners("/proc"), nat, claims)
+	owners := portrules.SocketOwners("/proc")
+	addrs, dnat := s.scanAddresses()
+	out := portrules.Listeners(portrules.ReadSockets("/proc/net"), owners, nat, claims)
+	return append(out, portrules.ForwardedListeners("/proc", addrs, owners, dnat)...)
 }

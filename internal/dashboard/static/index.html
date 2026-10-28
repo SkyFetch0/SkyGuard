@@ -255,9 +255,13 @@
         <div class="form-actions"><button class="btn" type="button" data-action="rules-revert">Undo now</button><button class="btn primary" type="button" data-action="rules-confirm">Keep these rules</button></div>
       </div>
       <p class="cover bad" id="pt-unavailable" hidden></p>
+      <article class="panel" id="pt-addr-panel" hidden>
+        <header><h2>Addresses</h2><span class="meta" id="pt-addr-meta"></span></header>
+        <div class="table-wrap"><table class="pt-addrs"><thead><tr><th>Address</th><th>What it is</th><th class="n">Ports</th><th>Bans</th><th>Server-wide rules</th><th></th></tr></thead><tbody id="pt-addrs"></tbody></table></div>
+      </article>
       <article class="panel">
         <header>
-          <h2>Open ports</h2>
+          <h2 id="pt-ports-title">Open ports</h2>
           <div class="choice" role="group" aria-label="Which ports" id="pt-scope">
             <button type="button" data-ptscope="public" aria-pressed="true">Reachable from outside</button>
             <button type="button" data-ptscope="all" aria-pressed="false">All</button>
@@ -510,6 +514,13 @@
       <div class="field"><span>Who may connect</span><div class="choice" role="group" aria-label="Rule kind" id="rule-mode">
         <button type="button" data-mode="allow" aria-pressed="true">Only these sources</button><button type="button" data-mode="deny" aria-pressed="false">Everyone except these</button>
       </div></div>
+      <div class="field env-field"><span>Applies to</span>
+        <div class="choice" role="group" aria-label="Which addresses" id="rule-where">
+          <button type="button" data-where="all" aria-pressed="true">Everywhere server-wide rules apply</button><button type="button" data-where="some" aria-pressed="false">Only these addresses</button>
+        </div>
+        <div class="addr-picks" id="rule-addrs" hidden></div>
+        <span class="hint" id="rule-where-hint"></span>
+      </div>
       <label class="field env-field"><span id="rule-src-label">Sources allowed in</span><textarea class="input mono" name="sources" rows="4" spellcheck="false" autocomplete="off" placeholder="203.0.113.5&#10;198.51.100.0/24&#10;2001:db8::/32…"></textarea>
         <span class="hint">One address or network per line. <b>private</b> stands for every internal range: containers, the LAN, VPNs.</span></label>
     </div>

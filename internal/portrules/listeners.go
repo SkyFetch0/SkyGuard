@@ -24,6 +24,7 @@ type Listener struct {
 	Owner   string   `json:"owner,omitempty"`        // container or SkyGuard service behind it
 	Kind    string   `json:"kind,omitempty"`         // docker, incus, skyguard or host
 	ID      string   `json:"container_id,omitempty"` // the container's ID, when the engine is managed
+	Address string   `json:"address,omitempty"`      // a forwarded address this port is on; "" for the host's own
 	Service string   `json:"service,omitempty"`      // what usually runs on this port
 	Risk    string   `json:"risk,omitempty"`         // database, admin, remote or files: worth closing to the internet
 }

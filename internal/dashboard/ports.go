@@ -21,6 +21,7 @@ func (d *Dashboard) portRoutes(api *http.ServeMux) {
 	api.HandleFunc("POST /api/ports", d.csrf(d.handleSetPorts))
 	api.HandleFunc("POST /api/ports/confirm", d.csrf(d.handleConfirmPorts))
 	api.HandleFunc("POST /api/ports/revert", d.csrf(d.handleRevertPorts))
+	api.HandleFunc("POST /api/ports/address", d.csrf(d.handlePortAddress))
 }
 
 func (d *Dashboard) listeners(ctx context.Context) []portrules.Listener {
@@ -43,7 +44,9 @@ func (d *Dashboard) handlePorts(w http.ResponseWriter, r *http.Request) {
 		// container ports can be closed at the source: published on
 		// loopback only, or not at all
 		ContainersManaged bool `json:"containers_managed"`
-	}{d.ports.View(), d.listeners(r.Context()), netutil.HostIP(r.RemoteAddr), d.ctr != nil && d.ctr.AnyEnabled() && !d.ctr.ReadOnly()})
+		// whether a ban reaches forwarded addresses too
+		Bans map[string]any `json:"bans"`
+	}{d.ports.View(), d.listeners(r.Context()), netutil.HostIP(r.RemoteAddr), d.ctr != nil && d.ctr.AnyEnabled() && !d.ctr.ReadOnly(), d.banCoverage()})
 }
 
 // handleSetPorts replaces the rule set with the JSON list in "rules".
@@ -68,6 +71,22 @@ func (d *Dashboard) handleSetPorts(w http.ResponseWriter, r *http.Request) {
 	}
 	d.logger.Info("port access rules changed via dashboard", "remote", netutil.HostIP(r.RemoteAddr), "rules", len(rules), "trial", res.Trial)
 	writeJSON(w, http.StatusOK, res)
+}
+
+// handlePortAddress takes ip and follow: whether the server-wide rules also
+// cover a forwarded address.
+func (d *Dashboard) handlePortAddress(w http.ResponseWriter, r *http.Request) {
+	if d.ports == nil {
+		writeError(w, http.StatusNotFound, "port rules are not set up")
+		return
+	}
+	ip, follow := r.FormValue("ip"), r.FormValue("follow") == "1"
+	if err := d.ports.SetFollow(ip, follow); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	d.logger.Info("forwarded address changed via dashboard", "remote", netutil.HostIP(r.RemoteAddr), "ip", ip, "server_rules", follow)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (d *Dashboard) handleConfirmPorts(w http.ResponseWriter, r *http.Request) {

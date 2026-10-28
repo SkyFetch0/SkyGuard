@@ -19,14 +19,15 @@ type IPTablesFirewall struct {
 	run     runner
 	v4, v6  string // binaries; v6 is "" when IPv6 is unavailable
 	backend string // "legacy", "nft" or "default"
+	forward bool   // the ban chain is also hooked into FORWARD
 
 	// mu serialises invocations. iptables also takes the xtables lock (-w),
 	// but serialising here keeps check-then-insert sequences atomic.
 	mu sync.Mutex
 }
 
-func newIPTables(backend string, logger *slog.Logger, run runner) (*IPTablesFirewall, error) {
-	f := &IPTablesFirewall{logger: logger, run: run}
+func newIPTables(backend string, forward bool, logger *slog.Logger, run runner) (*IPTablesFirewall, error) {
+	f := &IPTablesFirewall{logger: logger, run: run, forward: forward}
 	f.v4, f.v6, f.backend = selectBinaries(backend, run)
 	if f.v4 == "" {
 		return nil, fmt.Errorf("iptables binary not found (install the iptables package)")
@@ -40,7 +41,7 @@ func newIPTables(backend string, logger *slog.Logger, run runner) (*IPTablesFire
 			f.v6 = ""
 		}
 	}
-	logger.Info("iptables firewall ready", "backend", f.backend, "iptables", f.v4, "ip6tables", f.v6, "chain", Chain)
+	logger.Info("iptables firewall ready", "backend", f.backend, "iptables", f.v4, "ip6tables", f.v6, "chain", Chain, "covers_forwarded", f.forward)
 	return f, nil
 }
 
@@ -133,8 +134,66 @@ func (f *IPTablesFirewall) ensureChain(bin string) error {
 			return fmt.Errorf("%s -I INPUT -j %s: %w (%s)", bin, Chain, err, strings.TrimSpace(string(out)))
 		}
 	}
+	f.hookForward(bin)
 	f.hookDockerUser(bin)
 	return nil
+}
+
+// hookForward makes bans cover what the host passes on rather than
+// receives: an extra IP routed to an Incus instance or a VM, other DNAT, a
+// network behind this host. That traffic crosses FORWARD, and the host's own
+// rules there (often "-d <that IP> -j ACCEPT") come before DOCKER-USER, so the
+// jump goes to the very top. The chain holds only "-s <banned> -j DROP", so
+// nothing else that passes is touched.
+func (f *IPTablesFirewall) hookForward(bin string) {
+	if !f.forward {
+		return
+	}
+	ok, err := f.exists(bin, "FORWARD", "-j", Chain)
+	if err != nil || ok {
+		return
+	}
+	if out, err := f.ipt(bin, "-I", "FORWARD", "1", "-j", Chain); err != nil {
+		f.logger.Warn("could not hook bans into FORWARD; banned IPs can still reach addresses this host forwards to",
+			"binary", bin, "error", err, "output", strings.TrimSpace(string(out)))
+		return
+	}
+	f.logger.Info("bans now also cover traffic this host forwards (routed IPs, VMs, DNAT)", "binary", bin)
+}
+
+// EnsureHooks puts the ban chain and its jumps back if something removed
+// them (a firewall reload, iptables-restore of a saved rule file). It
+// reports whether the chain itself had to be created again: its bans are
+// then gone and must be re-applied.
+func (f *IPTablesFirewall) EnsureHooks() (recreated bool, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, bin := range []string{f.v4, f.v6} {
+		if bin == "" {
+			continue
+		}
+		if _, err := f.ipt(bin, "-S", Chain); err != nil {
+			recreated = true
+		}
+		if err := f.ensureChain(bin); err != nil {
+			return recreated, err
+		}
+	}
+	if recreated {
+		f.logger.Warn("the SKYGUARD chain was missing from the firewall and has been created again")
+	}
+	return recreated, nil
+}
+
+// CoversForward reports whether bans also stop forwarded traffic.
+func (f *IPTablesFirewall) CoversForward() (enabled, covered bool) {
+	if !f.forward {
+		return false, false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ok, err := f.exists(f.v4, "FORWARD", "-j", Chain)
+	return true, err == nil && ok
 }
 
 // DockerChain is where Docker leaves room for the operator's own rules.
@@ -191,6 +250,7 @@ func (f *IPTablesFirewall) Ban(ip string) error {
 	if ok {
 		return nil
 	}
+	f.hookForward(bin)
 	f.hookDockerUser(bin)
 	if out, err := f.ipt(bin, "-I", Chain, "1", "-s", canon, "-j", "DROP"); err != nil {
 		return fmt.Errorf("%s ban %s: %w (%s)", bin, canon, err, strings.TrimSpace(string(out)))

@@ -73,6 +73,10 @@ func (d *Dashboard) banCoverage() map[string]any {
 		docker, covered := c.CoversDocker()
 		out["docker_chain"], out["docker_covered"] = docker, covered
 	}
+	if c, ok := d.fw.(interface{ CoversForward() (bool, bool) }); ok {
+		on, covered := c.CoversForward()
+		out["forward_enabled"], out["forward_covered"] = on, covered
+	}
 	return out
 }
 

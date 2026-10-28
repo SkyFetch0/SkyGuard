@@ -13,24 +13,29 @@ import (
 
 type fakeGuard struct {
 	applied [][]firewall.PortRule
+	scopes  []firewall.Scope
 	removed int
 	fail    bool
 	ensured int
 }
 
-func (g *fakeGuard) Apply(r []firewall.PortRule, _ []string) error {
+func (g *fakeGuard) Apply(r []firewall.PortRule, _ []string, sc firewall.Scope) error {
 	if g.fail {
 		g.fail = false
 		return errors.New("iptables-restore: line 3 failed")
 	}
 	g.applied = append(g.applied, r)
+	g.scopes = append(g.scopes, sc)
 	return nil
 }
-func (g *fakeGuard) Ensure(r []firewall.PortRule, x []string) error { g.ensured++; return nil }
-func (g *fakeGuard) Remove()                                        { g.removed++ }
-func (g *fakeGuard) Dropped() map[string]uint64                     { return map[string]uint64{"db": 7} }
-func (g *fakeGuard) IPv6() bool                                     { return true }
-func (g *fakeGuard) NATPorts() []firewall.NATPort                   { return nil }
+func (g *fakeGuard) Ensure(r []firewall.PortRule, x []string, _ firewall.Scope) error {
+	g.ensured++
+	return nil
+}
+func (g *fakeGuard) Remove()                      { g.removed++ }
+func (g *fakeGuard) Dropped() map[string]uint64   { return map[string]uint64{"db": 7} }
+func (g *fakeGuard) IPv6() bool                   { return true }
+func (g *fakeGuard) NATPorts() []firewall.NATPort { return nil }
 
 func (g *fakeGuard) last() []firewall.PortRule {
 	if len(g.applied) == 0 {
@@ -222,5 +227,63 @@ func TestListeners(t *testing.T) {
 	}
 	if got[22].Process != "sshd" || got[22].Kind != "host" || got[53].Scope != "private" || got[3306].Scope != "local" || got[3306].Process != "node" || got[3306].Risk != "database" {
 		t.Errorf("listeners %+v", got)
+	}
+}
+
+func TestForwardedAddresses(t *testing.T) {
+	m, g, st := newTest(t)
+	addrs := []Address{{IP: "157.90.0.108", Kind: "host", Public: true}, {IP: "157.90.0.79", Kind: "routed", Public: true, Owner: "ezelvps", OwnerKind: "incus"}}
+	m.Addresses = func() []Address { return addrs }
+	m.trialFor = time.Hour
+
+	// a rule for the routed address only cannot lock anyone out of the host
+	vm := rule("vmssh", "22", "allow", "203.0.113.5")
+	vm.Addresses = []string{"157.90.0.79"}
+	if res, err := m.Set([]firewall.PortRule{vm, rule("db", "3306", "allow", "private")}); err != nil || res.Trial {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if sc := g.scopes[len(g.scopes)-1]; len(sc.NoFollow) != 1 || sc.NoFollow[0] != "157.90.0.79" || len(sc.Follow) != 0 {
+		t.Errorf("scope %+v", sc)
+	}
+	if v := m.View(); v.Rules[0].Protected != "" || len(v.Addresses) != 2 || v.Addresses[1].Follow {
+		t.Errorf("view %+v", v)
+	}
+	// ... but one that names the host's address can
+	both := rule("ssh2", "22", "allow", "203.0.113.5")
+	both.Addresses = []string{"157.90.0.0/24"}
+	if res, _ := m.Set([]firewall.PortRule{both}); !res.Trial {
+		t.Error("a rule covering the host's address skipped the trial")
+	}
+	_ = m.Revert()
+
+	// the server-wide rules on the VM's address too, kept across a restart
+	if err := m.SetFollow("157.90.0.79", true); err != nil {
+		t.Fatal(err)
+	}
+	if sc := g.scopes[len(g.scopes)-1]; len(sc.Follow) != 1 || len(sc.NoFollow) != 0 {
+		t.Errorf("scope after follow %+v", sc)
+	}
+	if !strings.Contains(st.js, `"addresses":[{"ip":"157.90.0.79","follow":true}]`) {
+		t.Errorf("stored %s", st.js)
+	}
+	m2 := New(g, "", st, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m2.Addresses = m.Addresses
+	if err := m2.Start(); err != nil || !m2.View().Addresses[1].Follow || len(g.scopes[len(g.scopes)-1].Follow) != 1 {
+		t.Fatalf("restart: %v %+v", err, g.scopes[len(g.scopes)-1])
+	}
+	if err := m.SetFollow("157.90.0.108", true); err == nil {
+		t.Error("the host's own address accepted a follow switch")
+	}
+
+	// a new forwarded address shows up: the rules are applied again with it
+	n := len(g.applied)
+	addrs = append(addrs, Address{IP: "157.90.0.80", Kind: "dnat", Public: true})
+	m.Maintain()
+	if len(g.applied) != n+1 || strings.Join(g.scopes[len(g.scopes)-1].NoFollow, ",") != "157.90.0.80" {
+		t.Errorf("maintain after a new address: %d applies, scope %+v", len(g.applied)-n, g.scopes[len(g.scopes)-1])
+	}
+	m.Maintain() // nothing changed: only checked
+	if len(g.applied) != n+1 || g.ensured == 0 {
+		t.Errorf("maintain without changes re-applied: %d", len(g.applied)-n)
 	}
 }

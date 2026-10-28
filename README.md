@@ -153,7 +153,7 @@ The wizard asks, in order: whether to whitelist the public IP it detects for you
 
 1. installs Docker if missing and the packages it needs (`curl`, `iptables`, `sqlite3`, `iproute2`, and `iptables-persistent` or `iptables-services` so rules survive a reboot);
 2. copies the project to `/opt/skyguard` and writes `/etc/skyguard/skyguard.yaml` (mode 600);
-3. snapshots your iptables rules (for `uninstall.sh --restore-iptables`), creates the `SKYGUARD` chain, hooks it into `INPUT` and `DOCKER-USER`, and opens exactly the ports you chose (recorded in `/etc/skyguard/firewall.state`);
+3. snapshots your iptables rules (for `uninstall.sh --restore-iptables`), creates the `SKYGUARD` chain, hooks it into `INPUT`, `FORWARD` and `DOCKER-USER`, and opens exactly the ports you chose (recorded in `/etc/skyguard/firewall.state`);
 4. writes `/opt/skyguard/docker-compose.yml`, builds the image, validates the config with `skyguard -check-config`, starts the container and waits until it is healthy;
 5. dials the stealth port itself and, only if your sshd answers through it, offers to block direct access to port 22;
 6. installs `skyguard.service` (starts the compose project at boot), log rotation and a daily database backup.
@@ -205,7 +205,7 @@ Then install the unit from [USAGE.md › Running as a systemd Service](USAGE.md#
 | Listeners | `docker logs skyguard 2>&1 \| grep "listener started"` | one line per enabled service |
 | Stealth port reaches sshd | `timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9911; printf "SSH-2.0-check\r\n" >&3; head -c 8 <&3'` | `SSH-2.0-` |
 | Stealth login | from a second terminal: `ssh -p 9911 you@server` | a normal login |
-| Firewall | `sudo iptables -S SKYGUARD; sudo iptables -S DOCKER-USER` | the chain exists; `-A DOCKER-USER -j SKYGUARD` when Docker runs |
+| Firewall | `sudo iptables -S SKYGUARD; sudo iptables -S FORWARD \| head -3` | the chain exists; `-A FORWARD -j SKYGUARD` near the top |
 | Dashboard | `ssh -L 9090:127.0.0.1:9090 you@server -p 9911`, then open http://localhost:9090 | the login prompt, then the overview |
 
 ### Turn on container management
@@ -318,6 +318,7 @@ analysis:
 | `analysis.auto_ban` | `ban_duration` | `24h` | `"1h"` · `"24h"` · `"7d"` · `"0s"` = permanent |
 | `analysis.auto_ban` | `method` | `none` | `iptables` (recommended, also in Docker) · `ufw` (bare metal only) · `none` |
 | `analysis.auto_ban` | `iptables_backend` | `auto` | `auto` · `legacy` · `nft` |
+| `analysis.auto_ban` | `cover_forwarded` | `true` | bans also stop traffic the host forwards: routed IPs, VMs, DNAT |
 | `whitelist` / `blacklist` | `ips` | `[]` | Single IPs or CIDR ranges |
 | `analysis.rate_limit` | `max_per_minute` | `20` | Connections per IP per minute |
 | `dashboard` | `listen` | `127.0.0.1:9090` | Non-loopback binds require a strong password |
@@ -381,11 +382,13 @@ next `docker compose up`, so change those there too; the sheet says so.
 
 **Bans cover container ports.** Traffic to a port Docker publishes is DNAT-ed
 and crosses `FORWARD`, never `INPUT`, so a ban in `INPUT` alone let a banned IP
-keep reaching every container. SkyGuard now also jumps to its `SKYGUARD` chain
-from the top of `DOCKER-USER` (checked again on every ban, since Docker may
-start later); `uninstall.sh` removes the jump. Incus proxy devices accept on
-the host and are covered through `INPUT`. With `method: ufw` Docker's ports
-are not covered (ufw never sees forwarded traffic); use `iptables`.
+keep reaching every container. SkyGuard also jumps to its `SKYGUARD` chain
+from the top of `FORWARD` (which covers everything the host passes on, see
+[Several addresses on one server](#several-addresses-on-one-server)) and from
+the top of `DOCKER-USER`; the jumps are checked every minute and
+`uninstall.sh` removes them. Incus proxy devices accept on the host and are
+covered through `INPUT`. With `method: ufw` Docker's ports are not covered
+(ufw never sees forwarded traffic); use `iptables`.
 
 ### Sharing ports 80/443 with a reverse proxy (Nginx Proxy Manager, Traefik, Caddy)
 
@@ -398,7 +401,7 @@ leaves those listeners off. Pick one of:
 1. **The proxy keeps 80/443 (recommended).** Disable `fake-http` or move it
    to a port nothing real uses (`port: 8081`), and leave the passthrough off.
    The *Host ports* table shows who holds what; bans still protect the proxy
-   through `DOCKER-USER`.
+   through `FORWARD`.
 2. **SkyGuard in front.** Publish the proxy on loopback only
    (`127.0.0.1:8080:80`, `127.0.0.1:8443:443`) and let SkyGuard forward with
    two `passthrough_services` (80 → `127.0.0.1:8080`, 443 →
@@ -434,10 +437,10 @@ range (`9200-9300`), TCP, UDP or both.
 with apt), Incus proxy devices (the default kind; one with `nat=true` is
 forwarded by Incus's own nftables rules and is not covered), and Docker's
 published ports, which never
-pass through INPUT: Docker forwards them, so the rules also sit in
-`DOCKER-USER`, the place Docker keeps for this, and match the port as it is
-published on the host (`-p 27017:27017` → rule for 27017), before Docker
-rewrites it. Containers that talk to each other over a Docker network are
+pass through INPUT: Docker forwards them, so the rules also sit at the top of
+`FORWARD` and match the port as it is published on the host
+(`-p 27017:27017` → rule for 27017), before Docker rewrites it. Addresses the
+server passes on to an instance or a VM are covered there too (next section). Containers that talk to each other over a Docker network are
 not affected, and neither are a container's own outbound connections. Both
 IPv4 and IPv6 are covered (a `[::]:27017` listener is reached over IPv6 too).
 
@@ -451,8 +454,9 @@ every minute: if a `firewalld` reload or an `iptables -F` removed them, they
 are put back.
 
 Under the hood: two chains, `SKYGUARD-PORTS` (jumped to from `INPUT`) and
-`SKYGUARD-PORTS-FWD` (from `DOCKER-USER`), right after the ban chain, so a
-ban still wins and a rule comes before the host's own ACCEPT rules. Each
+`SKYGUARD-PORTS-FWD` (from `FORWARD`), right after the ban chain, so a ban
+still wins and a rule comes before the host's own ACCEPT rules (Docker's
+included). Each
 rule's DROP carries the comment `sg:<id>`, which is where the *dropped*
 counters come from:
 
@@ -467,6 +471,45 @@ refuses changes. SkyGuard in Docker needs `network_mode: host` and
 `NET_ADMIN`, which the shipped compose file already has; it then sees the
 host's ports but not the programs behind them (those are named when SkyGuard
 runs natively, or for containers once container management is on).
+
+### Several addresses on one server
+
+A server rented with extra IPs often hands some of them on: Incus gives an
+instance its own public IP with a `routed` NIC (the host gets a route
+`157.90.0.79 dev veth…` and the instance answers on it), a VM gets one through
+a tap device, or a hand-written `iptables -t nat … -j DNAT` sends an address
+somewhere. Traffic to such an address never reaches the host's `INPUT`: it
+crosses `FORWARD`, often accepted at the very top by a saved rule like
+`-A FORWARD -d 157.90.0.79/32 -j ACCEPT`.
+
+SkyGuard finds these addresses itself (the host's routing table, the nat
+table, and the network namespaces of containers and instances) and lists them
+on the Ports screen under **Addresses**, each with what is behind it, how many
+ports listen there (read inside the instance's namespace; a VM's ports are its
+own and are not listed), and whether bans reach it.
+
+- **Bans cover them.** The ban chain sits at the top of `FORWARD`, before such
+  ACCEPT rules, so a banned IP is cut off from every address the server
+  forwards too (`analysis.auto_ban.cover_forwarded`, on by default). The
+  honeypots and the port-scan detection see only the host's own addresses: an
+  instance's traffic is not scored.
+- **The same rules there, or its own.** Each forwarded address has a switch,
+  *Server-wide rules*: *Own rules only* (the default, so nothing changes for an
+  instance until you decide) or *Apply here too*, which puts every rule without
+  addresses in front of that address as well.
+- **Rules for one address.** *Applies to → Only these addresses* limits a rule
+  to chosen addresses, the host's or forwarded ones (*Restrict…* on an
+  instance's port and *Rule for it…* on an address fill it in). Address rules
+  come first: a source they let in skips the server-wide rules there, so
+  `3306 on 157.90.0.79: only 198.51.100.20` holds even if a server-wide rule
+  says otherwise. A rule names the address the client connects to; traffic
+  DNAT-ed from another address counts for that other address. A rule only for
+  forwarded addresses cannot lock you out of the host, so it needs no trial.
+
+```bash
+sudo iptables -S FORWARD | head -4          # SKYGUARD, SKYGUARD-PORTS-FWD, then the host's own rules
+sudo iptables -S SKYGUARD-PORTS-FWD | grep 157.90.0.79
+```
 
 ### Locking down a busy server
 
@@ -609,7 +652,7 @@ ssh -L 9090:127.0.0.1:9090 user@your-server
 - **Captured credentials** — most tried usernames and passwords, attempts per honeypot and over time, the most frequent pairs.
 - **Honeypots and services** — switch each honeypot on or off at runtime (the listener opens or closes at once; the choice survives restarts until you change that honeypot in the config file), with 24-hour activity per service. Stealth and passthrough services are shown read-only: turning them off from a panel you usually reach through them could cut your own session.
 - **Containers** (opt-in, see [Containers](#containers-docker-and-incus)) — a *network map* in the manner of a network simulator: networks are switches, containers are devices, memberships are cables. Select a container and pull a cable from its plug: drop it on a switch to join that network, or on another container to give the two a network in common (join one of the other's, or a new one for the pair); clicking *Connect…* and then the target works too. Click a cable to unplug it. Built to stay readable with a hundred containers: a force layout that keeps each Compose project together on a soft outline, numbered replicas (`queue-worker-1…40`) folded into one stacked device until you expand them, labels that give way to each other as you zoom out, search that dims everything else and brings the first match into view, a minimap, focus on a node's own cables when selected, and dragged positions remembered per browser. A *Table* view keeps the patch bay for precise work. *New container* pulls an image (Docker) or downloads one from images.linuxcontainers.org (Incus) and starts it with ports, network, environment, restart policy and limits. The side sheet starts, stops, restarts, pauses and removes; edits ports, restart policy and memory/CPU limits; shows the last 200 log lines; and for Incus takes, rolls back and deletes snapshots. A host-port table names whoever holds each port (SkyGuard listeners included) and flags conflicts; *Open to the internet* lists every container port bound on all addresses and whether a ban stops traffic there.
-- **Ports and access** — every port that takes connections on the host, who is behind it (program, container, SkyGuard service) and whether the internet can reach it, with databases and admin panels that anyone can reach flagged; *Close…* to publish a container's port on this server only or not at all (the compose file included), the access rules with their drop counters, a rule editor, and the trial banner that undoes a change to SSH or the dashboard unless you keep it. See [Port access rules](#port-access-rules).
+- **Ports and access** — the server's addresses (its own, and those it passes on to Incus instances, VMs or DNAT) with whether bans reach them and a switch for the server-wide rules; every port that takes connections on the host and behind those addresses, who is behind it (program, container, SkyGuard service) and whether the internet can reach it, with databases and admin panels that anyone can reach flagged; *Close…* to publish a container's port on this server only or not at all (the compose file included), the access rules with their drop counters, a rule editor, and the trial banner that undoes a change to SSH or the dashboard unless you keep it. See [Port access rules](#port-access-rules).
 - **Auto-ban and firewall** — switch, threshold stepper, ban length, and the SKYGUARD chain's current rules.
 - **IP detail** — a side sheet with score, daily activity, credentials and connections for any address.
 
@@ -640,9 +683,10 @@ State-changing `POST` endpoints require the header `X-SkyGuard-Request: 1` (CSRF
 | `GET`/`POST` | `/api/settings` | Auto-ban settings (partial updates) |
 | `POST` | `/api/ban` | `ip`, `duration` (`24h`, `7d`, `0` = permanent), `permanent`, `reason` — whitelisted IPs are refused |
 | `POST` | `/api/unban` | `ip` — also resets the IP's score |
-| `GET` | `/api/ports` | Listening ports (`listeners`), the access rules with `dropped` counts, `protected` ports, a running trial (`unsaved`, `trial_deadline`), `always_allowed`, `client_ip` |
-| `POST` | `/api/ports` | `rules` — the whole rule list as JSON (`id`, `name`, `ports` `27017` or `9200-9300`, `proto` `tcp`/`udp`/`both`, `mode` `allow`/`deny`, `sources`, `enabled`); returns `trial` and its `deadline` when a protected port changed |
+| `GET` | `/api/ports` | Listening ports (`listeners`; an instance's carry `address`), the server's `addresses` (`kind` host, routed or dnat, `owner`, `follow`), the access rules with `dropped` counts, `protected` ports, a running trial (`unsaved`, `trial_deadline`), `always_allowed`, `client_ip`, ban coverage (`bans`) |
+| `POST` | `/api/ports` | `rules` — the whole rule list as JSON (`id`, `name`, `ports` `27017` or `9200-9300`, `proto` `tcp`/`udp`/`both`, `mode` `allow`/`deny`, `sources`, `addresses` (empty: server-wide), `enabled`); returns `trial` and its `deadline` when a protected port changed |
 | `POST` | `/api/ports/confirm` | Keep the rules of a running trial |
+| `POST` | `/api/ports/address` | `ip`, `follow` — whether the server-wide rules also cover a forwarded address |
 | `POST` | `/api/ports/revert` | End a running trial now and bring the saved rules back |
 | `GET` | `/api/containers` | `enabled`, engines and their state, containers, networks, `host_ports` (every claimant per port, conflicts first), `ban_coverage` |
 | `GET` | `/api/containers/port-plan?engine=&id=&host_port=&proto=&action=` | What a port action would do: the ports afterwards, who reaches it by name, and the `compose` edit (`file`, `line`, `before`, `after`, `ok`, `reason`, `manual`) |
@@ -685,7 +729,7 @@ SkyGuard/
 │   ├── honeypot/            # SSH (x/crypto/ssh) · FTP · MySQL · HTTP
 │   ├── proxy/               # bidirectional TCP proxy
 │   ├── analysis/            # GeoIP · rate limiter · scorer · port-scan detector
-│   ├── firewall/            # iptables / ip6tables (SKYGUARD chain, DOCKER-USER hook) · ufw · none
+│   ├── firewall/            # iptables / ip6tables (SKYGUARD chain in INPUT, FORWARD, DOCKER-USER; port rule chains) · ufw · none
 │   ├── containers/          # Docker Engine API and Incus REST API clients, the container manager
 │   ├── storage/             # SQLite (pure Go): connections, credentials, bans, scores, settings
 │   ├── netutil/             # IP normalisation, IP/CIDR sets

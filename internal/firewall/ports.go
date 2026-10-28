@@ -26,12 +26,14 @@ import (
 //   - SKYGUARD-PORTS, jumped to from INPUT right after the ban chain, sees
 //     traffic to programs on the host (and to Docker ports over IPv6, which
 //     docker-proxy serves).
-//   - SKYGUARD-PORTS-FWD, jumped to from DOCKER-USER right after the ban
-//     chain, sees traffic Docker DNAT-ed to a container. After DNAT the
-//     destination port is the container's, so it matches the port the client
-//     asked for (conntrack's original destination port), and only connections
-//     that were DNAT-ed, so a container's own outbound traffic to the same
-//     port elsewhere is never touched.
+//   - SKYGUARD-PORTS-FWD, jumped to from FORWARD right after the ban chain
+//     (so before the host's own "-d <IP> -j ACCEPT" rules and Docker's), sees
+//     what the host passes on: ports Docker (or anyone) DNAT-ed to a
+//     container, matched by the port the client asked for (conntrack's
+//     original destination port) and only for DNAT-ed connections, so a
+//     container's own outbound traffic is never touched; and addresses
+//     routed through the host (an extra IP given to an Incus instance or a
+//     VM), matched by destination address and port.
 //
 // An "only these" rule drops new connections only: a session that was open
 // before the rule (the operator's SSH, say) keeps working. Loopback always
@@ -49,8 +51,11 @@ type PortRule struct {
 	Ports   string   `json:"ports"`   // "27017" or a range "9200-9300"
 	Mode    string   `json:"mode"`    // allow: only Sources get in; deny: Sources are kept out
 	Sources []string `json:"sources"` // IPs, CIDRs, or "private"
-	Enabled bool     `json:"enabled"`
-	Note    string   `json:"note,omitempty"`
+	// Addresses limits the rule to these addresses of the server (its own,
+	// or ones it forwards); empty means the server-wide rule.
+	Addresses []string `json:"addresses,omitempty"`
+	Enabled   bool     `json:"enabled"`
+	Note      string   `json:"note,omitempty"`
 }
 
 // PrivateKeyword stands for the private and container address ranges.
@@ -136,6 +141,29 @@ func (r *PortRule) Validate() error {
 		return fmt.Errorf("at most 256 sources per rule")
 	}
 	r.Sources = out
+	seen = map[string]bool{}
+	var addrs []string
+	for _, a := range r.Addresses {
+		if a = strings.TrimSpace(a); a == "" {
+			continue
+		}
+		p, err := parsePrefix(a)
+		if err != nil {
+			return fmt.Errorf("address %w", err)
+		}
+		a = p.String()
+		if p.Bits() == p.Addr().BitLen() {
+			a = p.Addr().String()
+		}
+		if !seen[a] {
+			seen[a] = true
+			addrs = append(addrs, a)
+		}
+	}
+	if len(addrs) > 64 {
+		return fmt.Errorf("at most 64 addresses per rule")
+	}
+	r.Addresses = addrs
 	return nil
 }
 
@@ -174,21 +202,60 @@ func sourcesFor(srcs []string, v6 bool) []string {
 	return out
 }
 
+// Scope says which forwarded addresses take the server-wide rules (those
+// without addresses of their own). A forwarded address is one this host
+// passes on rather than owns: an extra IP routed to an Incus instance or a
+// VM, or DNAT-ed somewhere by hand.
+type Scope struct {
+	Follow   []string // forwarded addresses the server-wide rules also cover
+	NoFollow []string // forwarded addresses they leave alone
+}
+
+// target is one place a rule is matched: a chain and the match for it.
+type target struct {
+	chain, match string
+	ct           bool // match already loads conntrack with --ctdir ORIGINAL
+}
+
 // Compile turns rules into the two chains' contents for one family, in
 // iptables-restore syntax. extraAllow (the global whitelist) passes every
 // "only these" rule as well.
-func Compile(rules []PortRule, extraAllow []string, v6 bool) string {
+//
+// Rules for chosen addresses come first, then the server-wide ones: when an
+// address rule lets a source in (RETURN), the server-wide rules no longer
+// apply to that connection, so an address rule overrides them. Server-wide
+// rules cover the host's own addresses, every port Docker (or anything)
+// DNAT-s except to a NoFollow address, and the Follow addresses.
+func Compile(rules []PortRule, extraAllow []string, v6 bool, sc Scope) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "*filter\n:%s - [0:0]\n:%s - [0:0]\n", PortsChain, PortsFwdChain)
 	fmt.Fprintf(&b, "-A %s -i lo -j RETURN\n", PortsChain)
 	extra := sourcesFor(extraAllow, v6)
-	for _, r := range rules {
-		if !r.Enabled {
-			continue
+	follow, noFollow := addrsFor(sc.Follow, v6), addrsFor(sc.NoFollow, v6)
+	emit := func(r PortRule, targets []target) {
+		tag := fmt.Sprintf(`-m comment --comment "sg:%s"`, r.ID)
+		srcs := sourcesFor(r.Sources, v6)
+		for _, t := range targets {
+			if r.Mode == "allow" {
+				for _, s := range append(append([]string{}, srcs...), extra...) {
+					fmt.Fprintf(&b, "-A %s -s %s %s -j RETURN\n", t.chain, s, t.match)
+				}
+				fmt.Fprintf(&b, "-A %s %s -m conntrack --ctstate NEW %s -j DROP\n", t.chain, t.match, tag)
+				continue
+			}
+			ct := " -m conntrack --ctdir ORIGINAL"
+			if t.ct {
+				ct = ""
+			}
+			for _, s := range srcs {
+				fmt.Fprintf(&b, "-A %s -s %s %s%s %s -j DROP\n", t.chain, s, t.match, ct, tag)
+			}
 		}
+	}
+	targetsOf := func(r PortRule, addrs []string, general bool) []target {
 		lo, hi, err := PortRange(r.Ports)
 		if err != nil {
-			continue
+			return nil
 		}
 		port := strconv.Itoa(lo)
 		if hi != lo {
@@ -198,28 +265,69 @@ func Compile(rules []PortRule, extraAllow []string, v6 bool) string {
 		if r.Proto == "both" {
 			protos = []string{"tcp", "udp"}
 		}
-		tag := fmt.Sprintf(`-m comment --comment "sg:%s"`, r.ID)
-		srcs := sourcesFor(r.Sources, v6)
+		var out []target
 		for _, p := range protos {
 			in := fmt.Sprintf("-p %s -m %s --dport %s", p, p, port)
-			fwd := fmt.Sprintf("-p %s -m conntrack --ctstate DNAT --ctorigdstport %s --ctdir ORIGINAL", p, port)
-			if r.Mode == "allow" {
-				for _, s := range append(append([]string{}, srcs...), extra...) {
-					fmt.Fprintf(&b, "-A %s -s %s %s -j RETURN\n", PortsChain, s, in)
-					fmt.Fprintf(&b, "-A %s -s %s %s -j RETURN\n", PortsFwdChain, s, fwd)
+			dnat := func(dst string) string {
+				return fmt.Sprintf("-p %s -m conntrack --ctstate DNAT%s --ctorigdstport %s --ctdir ORIGINAL", p, dst, port)
+			}
+			// routed, not DNAT-ed: after DNAT the destination is the target,
+			// and a rule is about the address the client asked for
+			routed := func(a string) string {
+				return fmt.Sprintf("-d %s -p %s -m %s --dport %s -m conntrack ! --ctstate DNAT", a, p, p, port)
+			}
+			if general {
+				out = append(out, target{PortsChain, in, false}, target{PortsFwdChain, dnat(""), true})
+				for _, a := range follow {
+					out = append(out, target{PortsFwdChain, routed(a), false})
 				}
-				fmt.Fprintf(&b, "-A %s %s -m conntrack --ctstate NEW %s -j DROP\n", PortsChain, in, tag)
-				fmt.Fprintf(&b, "-A %s %s -m conntrack --ctstate NEW %s -j DROP\n", PortsFwdChain, fwd, tag)
 				continue
 			}
-			for _, s := range srcs {
-				fmt.Fprintf(&b, "-A %s -s %s %s -m conntrack --ctdir ORIGINAL %s -j DROP\n", PortsChain, s, in, tag)
-				fmt.Fprintf(&b, "-A %s -s %s %s %s -j DROP\n", PortsFwdChain, s, fwd, tag)
+			for _, a := range addrs {
+				out = append(out,
+					target{PortsChain, "-d " + a + " " + in, false},
+					target{PortsFwdChain, dnat(" --ctorigdst " + a), true},
+					target{PortsFwdChain, routed(a), false})
 			}
+		}
+		return out
+	}
+	for _, r := range rules {
+		if !r.Enabled || len(r.Addresses) == 0 {
+			continue
+		}
+		if addrs := addrsFor(r.Addresses, v6); len(addrs) > 0 {
+			emit(r, targetsOf(r, addrs, false))
+		}
+	}
+	// past the address rules: what goes to an address that keeps to its own
+	// rules leaves the chain before the server-wide ones
+	for _, a := range noFollow {
+		fmt.Fprintf(&b, "-A %s -m conntrack --ctstate DNAT --ctorigdst %s -j RETURN\n", PortsFwdChain, a)
+	}
+	for _, r := range rules {
+		if r.Enabled && len(r.Addresses) == 0 {
+			emit(r, targetsOf(r, nil, true))
 		}
 	}
 	b.WriteString("COMMIT\n")
 	return b.String()
+}
+
+// addrsFor keeps the addresses (or networks) of one family, canonical.
+func addrsFor(list []string, v6 bool) []string {
+	var out []string
+	for _, a := range list {
+		p, err := parsePrefix(a)
+		if err == nil && p.Addr().Is6() == v6 {
+			if p.Bits() == p.Addr().BitLen() {
+				out = append(out, p.Addr().String())
+			} else {
+				out = append(out, p.String())
+			}
+		}
+	}
+	return out
 }
 
 // PortGuard applies port rules with iptables (and ip6tables).
@@ -267,7 +375,7 @@ func (g *PortGuard) IPv6() bool { return g.v6 != "" }
 
 // Apply replaces every port rule in one step per address family and makes
 // sure the chains are hooked in.
-func (g *PortGuard) Apply(rules []PortRule, extraAllow []string) error {
+func (g *PortGuard) Apply(rules []PortRule, extraAllow []string, sc Scope) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, fam := range []struct {
@@ -277,16 +385,20 @@ func (g *PortGuard) Apply(rules []PortRule, extraAllow []string) error {
 		if fam.bin == "" {
 			continue
 		}
-		if out, err := g.restore(fam.bin, []byte(Compile(rules, extraAllow, fam.v6))); err != nil {
+		if out, err := g.restore(fam.bin, []byte(Compile(rules, extraAllow, fam.v6, sc))); err != nil {
 			return fmt.Errorf("%s-restore: %w (%s)", fam.bin, err, strings.TrimSpace(string(out)))
 		}
 		if err := g.hook(fam.bin, "INPUT", PortsChain); err != nil {
 			return err
 		}
-		// DOCKER-USER exists only while Docker runs; checked again on every apply.
-		if _, err := g.ipt(fam.bin, "-S", DockerChain); err == nil {
-			if err := g.hook(fam.bin, DockerChain, PortsFwdChain); err != nil {
-				g.logger.Warn("port rules: could not hook into DOCKER-USER; Docker's ports are not covered", "error", err)
+		if err := g.hook(fam.bin, "FORWARD", PortsFwdChain); err != nil {
+			return err
+		}
+		// Earlier builds hooked it into DOCKER-USER, behind the host's own
+		// FORWARD rules; that hook is no longer needed.
+		for i := 0; i < 4; i++ {
+			if _, err := g.ipt(fam.bin, "-D", DockerChain, "-j", PortsFwdChain); err != nil {
+				break
 			}
 		}
 	}
@@ -296,7 +408,7 @@ func (g *PortGuard) Apply(rules []PortRule, extraAllow []string) error {
 // Ensure puts the rules back if something removed them (a firewall reload,
 // "iptables -F", Docker re-creating its chains) and otherwise only checks the
 // hooks, so the drop counters keep counting.
-func (g *PortGuard) Ensure(rules []PortRule, extraAllow []string) error {
+func (g *PortGuard) Ensure(rules []PortRule, extraAllow []string, sc Scope) error {
 	g.mu.Lock()
 	intact := true
 	for _, bin := range []string{g.v4, g.v6} {
@@ -307,16 +419,11 @@ func (g *PortGuard) Ensure(rules []PortRule, extraAllow []string) error {
 			intact = false
 			continue
 		}
-		for _, h := range [][2]string{{"INPUT", PortsChain}, {DockerChain, PortsFwdChain}} {
-			if h[0] == DockerChain {
-				if _, err := g.ipt(bin, "-S", DockerChain); err != nil {
-					continue
-				}
-				if _, err := g.ipt(bin, "-S", PortsFwdChain); err != nil {
-					intact = false
-					continue
-				}
-			}
+		if _, err := g.ipt(bin, "-S", PortsFwdChain); err != nil {
+			intact = false
+			continue
+		}
+		for _, h := range [][2]string{{"INPUT", PortsChain}, {"FORWARD", PortsFwdChain}} {
 			if err := g.hook(bin, h[0], h[1]); err != nil {
 				g.mu.Unlock()
 				return err
@@ -328,7 +435,7 @@ func (g *PortGuard) Ensure(rules []PortRule, extraAllow []string) error {
 		return nil
 	}
 	g.logger.Warn("port rules were missing from the firewall and have been put back")
-	return g.Apply(rules, extraAllow)
+	return g.Apply(rules, extraAllow, sc)
 }
 
 // NATPort is a port Docker publishes through its nat table. With Docker's
@@ -373,6 +480,59 @@ func parseNAT(raw []byte) []NATPort {
 	return out
 }
 
+// DNATRule is a nat-table rule that sends one destination address
+// somewhere else: how a hand-made setup forwards an extra IP.
+type DNATRule struct {
+	Dest  string // without the /32 or /128
+	Proto string // "" for every protocol
+	Port  int    // 0 for every port
+	To    string // the --to-destination value
+}
+
+var (
+	dnatDestRE = regexp.MustCompile(`(?:^| )-d (\S+?)(?:/(?:32|128))?(?: |$)`)
+	dnatToRE   = regexp.MustCompile(`-j DNAT --to-destination (\S+)`)
+	dnatProtRE = regexp.MustCompile(`(?:^| )-p (tcp|udp)(?: |$)`)
+	dnatPortRE = regexp.MustCompile(`--dport (\d+)(?: |$)`)
+)
+
+// DNATRules lists the nat table's DNAT rules that name one destination
+// address, in both families.
+func (g *PortGuard) DNATRules() []DNATRule {
+	var out []DNATRule
+	for _, bin := range []string{g.v4, g.v6} {
+		if bin == "" {
+			continue
+		}
+		raw, err := g.ipt(bin, "-t", "nat", "-S")
+		if err != nil {
+			continue
+		}
+		out = append(out, parseDNAT(raw)...)
+	}
+	return out
+}
+
+func parseDNAT(raw []byte) []DNATRule {
+	var out []DNATRule
+	for _, line := range strings.Split(string(raw), "\n") {
+		to := dnatToRE.FindStringSubmatch(line)
+		dst := dnatDestRE.FindStringSubmatch(line)
+		if to == nil || dst == nil || strings.Contains(dst[1], "/") || strings.HasPrefix(line, "-A DOCKER ") {
+			continue // a network, not one address; Docker's own are its published ports
+		}
+		r := DNATRule{Dest: dst[1], To: to[1]}
+		if m := dnatProtRE.FindStringSubmatch(line); m != nil {
+			r.Proto = m[1]
+		}
+		if m := dnatPortRE.FindStringSubmatch(line); m != nil {
+			r.Port, _ = strconv.Atoi(m[1])
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
 func (g *PortGuard) ipt(bin string, args ...string) ([]byte, error) {
 	return g.run(bin, append([]string{"-w", "5"}, args...)...)
 }
@@ -412,7 +572,7 @@ func (g *PortGuard) Remove() {
 		if bin == "" {
 			continue
 		}
-		for _, p := range [][2]string{{"INPUT", PortsChain}, {DockerChain, PortsFwdChain}} {
+		for _, p := range [][2]string{{"INPUT", PortsChain}, {"FORWARD", PortsFwdChain}, {DockerChain, PortsFwdChain}} {
 			_, _ = g.ipt(bin, "-D", p[0], "-j", p[1])
 			_, _ = g.ipt(bin, "-F", p[1])
 			_, _ = g.ipt(bin, "-X", p[1])

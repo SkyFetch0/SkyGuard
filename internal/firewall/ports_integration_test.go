@@ -104,7 +104,7 @@ func TestPortGuardOnTheKernel(t *testing.T) {
 		{ID: "web", Ports: "18600", Proto: "tcp", Mode: "allow", Sources: []string{"203.0.113.5"}, Enabled: true},
 		{ID: "host", Ports: "18601", Proto: "tcp", Mode: "allow", Sources: []string{"203.0.113.5"}, Enabled: true},
 	}
-	if err := g.Apply(rules, nil); err != nil {
+	if err := g.Apply(rules, nil, Scope{}); err != nil {
 		t.Fatal(err)
 	}
 	check("docker port, outsider, allow-list", reach("outside", "http://198.51.100.1:18600/"), false)
@@ -128,7 +128,7 @@ func TestPortGuardOnTheKernel(t *testing.T) {
 	// Let the outsider in: same rules, one more source.
 	rules[0].Sources = append(rules[0].Sources, "198.51.100.10")
 	rules[1].Sources = append(rules[1].Sources, "198.51.100.0/24", "2001:db8:1::/64")
-	if err := g.Apply(rules, nil); err != nil {
+	if err := g.Apply(rules, nil, Scope{}); err != nil {
 		t.Fatal(err)
 	}
 	check("docker port, outsider now listed", reach("outside", "http://198.51.100.1:18600/"), true)
@@ -138,22 +138,25 @@ func TestPortGuardOnTheKernel(t *testing.T) {
 	}
 
 	// Everyone except the outsider.
-	if err := g.Apply([]PortRule{{ID: "web", Ports: "18600", Proto: "tcp", Mode: "deny", Sources: []string{"198.51.100.10"}, Enabled: true}}, nil); err != nil {
+	if err := g.Apply([]PortRule{{ID: "web", Ports: "18600", Proto: "tcp", Mode: "deny", Sources: []string{"198.51.100.10"}, Enabled: true}}, nil, Scope{}); err != nil {
 		t.Fatal(err)
 	}
 	check("docker port, outsider on the deny list", reach("outside", "http://198.51.100.1:18600/"), false)
 	check("host port, no rule any more", reach("outside", "http://198.51.100.1:18601/"), true)
 
 	// No rules: everything open again, and the hooks stay single.
-	if err := g.Apply(nil, nil); err != nil {
+	if err := g.Apply(nil, nil, Scope{}); err != nil {
 		t.Fatal(err)
 	}
 	check("docker port, rules cleared", reach("outside", "http://198.51.100.1:18600/"), true)
 	if n, _ := sh(`iptables -S INPUT | grep -c "j SKYGUARD-PORTS$"`); n != "1" {
 		t.Errorf("INPUT hook count %s", n)
 	}
-	if n, _ := sh(`iptables -S DOCKER-USER | grep -c "j SKYGUARD-PORTS-FWD$"`); n != "1" {
-		t.Errorf("DOCKER-USER hook count %s", n)
+	if n, _ := sh(`iptables -S FORWARD | grep -c "j SKYGUARD-PORTS-FWD$"`); n != "1" {
+		t.Errorf("FORWARD hook count %s", n)
+	}
+	if n, _ := sh(`iptables -S DOCKER-USER | grep -c "j SKYGUARD-PORTS-FWD$"`); n != "0" {
+		t.Errorf("the old DOCKER-USER hook is still there: %s", n)
 	}
 }
 

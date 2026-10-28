@@ -94,6 +94,10 @@ analysis:
     # falls back to iptables when ufw is inactive or in a container) | "none"
     method: "iptables"
     iptables_backend: "auto" # auto | legacy | nft — auto matches the host
+    # Bans also stop traffic this host passes on: extra IPs routed to Incus
+    # instances or VMs, hand-made DNAT, a network behind it. Turn off only if
+    # this host routes for others who must reach banned addresses.
+    cover_forwarded: true
 
     # Points added to an IP's threat score on each event
     scoring:

@@ -73,6 +73,7 @@ type Server struct {
 	blacklist *netutil.IPSet
 	ports     *portrules.Manager
 	portGuard *firewall.PortGuard // nil without a usable iptables
+	addrs     addrCache
 	ctr       *containers.Manager // nil without the dashboard
 
 	eventLogger *honeypot.EventLogger
@@ -97,7 +98,7 @@ func New(cfg *config.Config, db *storage.DB, logger *slog.Logger) (*Server, erro
 	}
 
 	fw, err := firewall.New(cfg.Analysis.AutoBan.Method,
-		firewall.Options{IPTablesBackend: cfg.Analysis.AutoBan.IPTablesBackend}, logger)
+		firewall.Options{IPTablesBackend: cfg.Analysis.AutoBan.IPTablesBackend, NoForward: !cfg.Analysis.AutoBan.BansCoverForwarded()}, logger)
 	if err != nil {
 		geoip.Close()
 		return nil, fmt.Errorf("firewall: %w", err)
@@ -319,10 +320,29 @@ func (s *Server) maintenanceLoop(ctx context.Context) {
 			return
 		case <-banTicker.C:
 			s.releaseExpiredBans()
+			s.ensureBanHooks()
 			s.ports.Maintain()
 		case <-retentionTicker.C:
 			s.enforceRetention()
 		}
+	}
+}
+
+// ensureBanHooks puts the ban chain back into INPUT, FORWARD and
+// DOCKER-USER after something removed it, and the bans with it if the chain
+// itself was gone (a saved rule file loaded with iptables-restore).
+func (s *Server) ensureBanHooks() {
+	h, ok := s.firewall.(interface{ EnsureHooks() (bool, error) })
+	if !ok {
+		return
+	}
+	recreated, err := h.EnsureHooks()
+	if err != nil {
+		s.logger.Error("checking the ban chain", "error", err)
+		return
+	}
+	if recreated {
+		s.syncBans()
 	}
 }
 
