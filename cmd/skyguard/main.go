@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -17,10 +18,15 @@ import (
 	"github.com/skyguard/skyguard/internal/dashboard"
 	"github.com/skyguard/skyguard/internal/server"
 	"github.com/skyguard/skyguard/internal/storage"
+	"github.com/skyguard/skyguard/internal/update"
 )
 
-// Version is injected at build time via -ldflags "-X main.Version=x.y.z".
-var Version = "dev"
+// Injected at build time: -ldflags "-X main.Version=x.y.z -X main.Commit=… -X main.BuildDate=…".
+var (
+	Version   = "dev"
+	Commit    = ""
+	BuildDate = ""
+)
 
 const defaultConfigPath = "/etc/skyguard/skyguard.yaml"
 
@@ -31,11 +37,19 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	mcpStdio := flag.Bool("mcp-stdio", false, "relay MCP over stdin/stdout to the running instance's /mcp endpoint (token from SKYGUARD_MCP_TOKEN or -mcp-token-file)")
 	mcpTokenFile := flag.String("mcp-token-file", "", "file holding the MCP token, for -mcp-stdio")
+	keygen := flag.Bool("update-keygen", false, "make a release signing key pair and print it (the private key goes into the repository's SKYGUARD_SIGNING_KEY secret)")
+	signFile := flag.String("update-sign", "", "sign a release's SHA256SUMS with the key in SKYGUARD_SIGNING_KEY and print the signature")
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println("skyguard", Version)
+		fmt.Println("skyguard", Version, Commit, BuildDate)
 		return
+	}
+	if *keygen {
+		os.Exit(runKeygen())
+	}
+	if *signFile != "" {
+		os.Exit(runSign(*signFile))
 	}
 
 	// An explicit -config flag wins; otherwise SKYGUARD_CONFIG overrides the default.
@@ -56,6 +70,29 @@ func main() {
 	}
 
 	logger := setupLogger("info")
+	build := update.Build{Version: Version, Commit: Commit, Date: BuildDate}
+
+	// The binary the service starts hands over to an update applied from the
+	// dashboard, and takes over again if that one keeps failing. This runs
+	// before the config is validated: a newer release may accept settings
+	// this build does not know.
+	self, _ := os.Executable()
+	if p, err := filepath.EvalSymlinks(self); err == nil {
+		self = p
+	}
+	base, slot := os.Getenv(update.EnvBase), os.Getenv(update.EnvSlot)
+	if base == "" {
+		base = self
+		if !*healthcheck && !*checkOnly {
+			if path := update.Launch(config.DataDirOf(*configPath), self, build, logger); path != "" && path != self {
+				v := filepath.Base(filepath.Dir(path))
+				logger.Info("starting the applied update", "version", v, "installed", Version)
+				if err := update.Exec(path, self, v); err != nil {
+					logger.Error("could not start the applied update; going on with the installed version", "error", err)
+				}
+			}
+		}
+	}
 
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
@@ -73,7 +110,7 @@ func main() {
 
 	logger = setupLogger(cfg.General.LogLevel)
 	dashboard.Version = Version
-	logger.Info("SkyGuard starting", "version", Version, "config", *configPath)
+	logger.Info("SkyGuard starting", "version", Version, "commit", Commit, "config", *configPath, "update", slot != "")
 
 	db, err := storage.New(cfg.Logging.DBPath)
 	if err != nil {
@@ -91,6 +128,25 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	restart := make(chan struct{}, 1)
+	if base != "test" {
+		upd := update.NewManager(update.Options{
+			DataDir: cfg.General.DataDir, ConfigPath: *configPath, Base: base, Build: build, Slot: slot,
+			Source:  &update.GitHub{API: cfg.Update.APIURL, Repo: cfg.Update.Repo, Token: cfg.Update.Token},
+			Channel: cfg.Update.Channel, Check: cfg.Update.Checks(), ExtraKeys: []string{cfg.Update.PublicKey},
+			Backup: db.BackupTo, DBSize: db.Size, Precheck: srv.UpdatePrecheck,
+			Restart: func() {
+				select {
+				case restart <- struct{}{}:
+				default:
+				}
+			},
+			Logger: logger.With("component", "update"),
+		})
+		srv.SetUpdater(upd)
+		go upd.Run(ctx)
+	}
+
 	if err := srv.Start(ctx); err != nil {
 		logger.Error("server failed to start", "error", err)
 		_ = srv.Stop()
@@ -99,12 +155,58 @@ func main() {
 	}
 	logger.Info("SkyGuard running")
 
-	<-ctx.Done()
-	logger.Info("shutting down gracefully...")
+	restarting := false
+	select {
+	case <-ctx.Done():
+		logger.Info("shutting down gracefully...")
+	case <-restart:
+		restarting = true
+		logger.Info("restarting for the update...")
+	}
 	if err := srv.Stop(); err != nil {
 		logger.Error("shutdown error", "error", err)
 	}
+	if restarting {
+		db.Close()
+		// Same process, same PID: systemd and Docker see no restart at all.
+		err := update.Restart(base)
+		logger.Error("could not restart in place; exiting so the service manager restarts SkyGuard", "error", err)
+		os.Exit(75)
+	}
 	logger.Info("shutdown complete")
+}
+
+func runKeygen() int {
+	pub, priv, err := update.GenerateKey()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Println("public key (commit it into internal/update/verify.go TrustedKeys, or set update.public_key):")
+	fmt.Println("  " + pub)
+	fmt.Println("private key (the repository secret SKYGUARD_SIGNING_KEY; keep no other copy online):")
+	fmt.Println("  " + priv)
+	return 0
+}
+
+func runSign(path string) int {
+	key := os.Getenv("SKYGUARD_SIGNING_KEY")
+	if key == "" {
+		fmt.Fprintln(os.Stderr, "SKYGUARD_SIGNING_KEY is not set")
+		return 1
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	sig, err := update.Sign(key, b)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	fmt.Println(sig)
+	return 0
 }
 
 // runHealthcheck returns 0 when the dashboard answers /healthz. With the

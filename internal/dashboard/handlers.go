@@ -569,12 +569,20 @@ var Version = "dev"
 func (d *Dashboard) handleInfo(w http.ResponseWriter, _ *http.Request) {
 	host, _ := os.Hostname()
 	ab := d.settings.AutoBan()
-	writeJSON(w, http.StatusOK, map[string]any{
+	info := map[string]any{
 		"host":             host,
 		"version":          Version,
 		"firewall_method":  d.fw.Method(),
 		"auto_ban_enabled": ab.Enabled,
 		"score_threshold":  ab.ScoreThreshold,
 		"containers":       d.ctr != nil,
-	})
+	}
+	if d.upd != nil {
+		v := d.upd.View()
+		info["update_available"] = v.Available
+		if v.Available {
+			info["update_version"] = v.Latest.Version
+		}
+	}
+	writeJSON(w, http.StatusOK, info)
 }

@@ -1,0 +1,60 @@
+# Publishes a release when a version tag is pushed:
+#   git tag v1.2.0 && git push origin v1.2.0
+# The dashboard's updater downloads skyguard-linux-<arch> from it, checks it
+# against SHA256SUMS and, when the repository has a signing key, against
+# SHA256SUMS.sig. A tag with a hyphen (v1.3.0-rc.1) becomes a pre-release,
+# which only installs where update.channel is prerelease.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go vet ./... && go test ./...
+
+      - name: Build
+        env:
+          UPDATE_PUBKEY: ${{ vars.SKYGUARD_UPDATE_PUBKEY }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags="-s -w -X main.Version=${version} -X main.Commit=${GITHUB_SHA} -X main.BuildDate=${date} -X github.com/skyguard/skyguard/internal/update.BuildKey=${UPDATE_PUBKEY}" \
+              -o "dist/skyguard-linux-${arch}" ./cmd/skyguard
+          done
+          (cd dist && sha256sum skyguard-linux-* > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Sign
+        env:
+          SKYGUARD_SIGNING_KEY: ${{ secrets.SKYGUARD_SIGNING_KEY }}
+        run: |
+          if [ -z "$SKYGUARD_SIGNING_KEY" ]; then
+            echo "::warning::SKYGUARD_SIGNING_KEY is not set: the release is not signed (see README, Updates)"
+            exit 0
+          fi
+          go run ./cmd/skyguard -update-sign dist/SHA256SUMS > dist/SHA256SUMS.sig
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=""
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --title "SkyGuard ${GITHUB_REF_NAME#v}" --generate-notes --verify-tag $pre

@@ -214,11 +214,85 @@ Open **Settings → Container engines** in the dashboard and switch Docker or In
 
 ### Update
 
+**From the dashboard.** *Settings → Version and updates* shows the running
+version, commit and build date, and the newest release on GitHub (checked a
+minute after start and then every 6 hours; *Check now* asks at once). When
+there is a newer one, its release notes are shown with *Update to x.y.z*. One
+click then:
+
+<p align="center"><img src="docs/screenshots/updates.png" alt="Version and updates: the running version, commit, build date and platform, the newest release with its notes and an Update button" width="100%"></p>
+
+
+1. downloads `skyguard-linux-<arch>` from the release, with `SHA256SUMS` and
+   its signature;
+2. checks the checksum and, when SkyGuard knows the project's signing key,
+   the signature; a damaged or foreign binary goes no further;
+3. runs the new binary once with `-version` and `-check-config` on your
+   config: a version that would refuse your settings goes no further;
+4. backs up the database (a consistent copy while it runs) and the config to
+   `<data_dir>/backups/pre-update-<from>-to-<to>-<time>.db|.yaml` (the last
+   three are kept), and checks there is room for it;
+5. restarts in place: same process, so Docker and systemd see no restart.
+   The dashboard and honeypots are away for a few seconds; bans and port rules
+   stay in the firewall throughout.
+
+Nothing in the image or in `/usr/local/bin` is replaced: the new binary is
+kept in `<data_dir>/updates/<version>/`, and the installed binary hands over
+to it at every start. Until the new version has stayed up for 45 seconds,
+every start counts; after three starts that did not stay up, the installed
+binary puts the previous version back by itself and the dashboard says so.
+*Go back* does the same on request. The database is never rolled back
+automatically: a newer version only adds to it, and the copy from before the
+update is in `backups/`.
+
+If the installed binary is replaced later (`docker compose build` from a
+newer checkout, a new package), the newer of the two choices wins: a release
+installed in the image newer than the applied update, or a local build made
+after the update was applied.
+
+**By hand**, as before: the database, the config and the honeypot host keys
+are kept, and dashboard choices survive until you change the same setting in
+the config file.
+
 ```bash
 cd /opt/skyguard && git pull && docker compose build && docker compose up -d
 ```
 
-The database, the config file and the honeypot host keys are kept. Dashboard choices (honeypot switches, auto-ban settings, container engines) survive until you change the same setting in the config file.
+**Native (systemd) installs** restart through the service manager only when a
+new version fails to start, so the unit needs `Restart=on-failure`:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/skyguard -config /etc/skyguard/skyguard.yaml
+Restart=on-failure
+RestartSec=5
+```
+
+#### Publishing a release (for the repository owner)
+
+Pushing a version tag builds the binaries, `SHA256SUMS` and its signature in
+GitHub Actions (`.github/workflows/release.yml`) and publishes the release;
+a tag with a hyphen (`v1.3.0-rc.1`) becomes a pre-release, offered only where
+`update.channel: prerelease`.
+
+```bash
+git tag v1.2.0 && git push origin v1.2.0
+```
+
+Sign releases, once:
+
+1. `go run ./cmd/skyguard -update-keygen` on your own computer prints a key
+   pair.
+2. Repository → *Settings → Secrets and variables → Actions*: the private key
+   as the secret `SKYGUARD_SIGNING_KEY`, the public key as the variable
+   `SKYGUARD_UPDATE_PUBKEY` (compiled into release builds).
+3. Put the public key into `TrustedKeys` in `internal/update/verify.go` (so
+   builds from source trust it too), or into `update.public_key` on servers
+   already running.
+
+A build that trusts a key installs only releases signed with it. Until then
+releases are unsigned and only their checksum is checked; the dashboard says
+which applies.
 
 ### Uninstall
 
@@ -319,6 +393,11 @@ analysis:
 | `analysis.auto_ban` | `method` | `none` | `iptables` (recommended, also in Docker) · `ufw` (bare metal only) · `none` |
 | `analysis.auto_ban` | `iptables_backend` | `auto` | `auto` · `legacy` · `nft` |
 | `analysis.auto_ban` | `cover_forwarded` | `true` | bans also stop traffic the host forwards: routed IPs, VMs, DNAT |
+| `update` | `check` | `true` | look for new releases every 6 hours (installing is always a click) |
+| `update` | `repo` | `SkyFetch0/SkyGuard` | where releases come from (a fork's own) |
+| `update` | `channel` | `stable` | `stable` · `prerelease` |
+| `update` | `public_key` | — | base64 ed25519 key a release must be signed with |
+| `update` | `github_token` | — | for a private repository (or env `SKYGUARD_GITHUB_TOKEN`) |
 | `whitelist` / `blacklist` | `ips` | `[]` | Single IPs or CIDR ranges |
 | `analysis.rate_limit` | `max_per_minute` | `20` | Connections per IP per minute |
 | `dashboard` | `listen` | `127.0.0.1:9090` | Non-loopback binds require a strong password |
@@ -655,7 +734,7 @@ ssh -L 9090:127.0.0.1:9090 user@your-server
 - **Honeypots and services** — switch each honeypot on or off at runtime (the listener opens or closes at once; the choice survives restarts until you change that honeypot in the config file), with 24-hour activity per service. Stealth and passthrough services are shown read-only: turning them off from a panel you usually reach through them could cut your own session.
 - **Containers** (opt-in, see [Containers](#containers-docker-and-incus)) — a *network map* in the manner of a network simulator: networks are switches, containers are devices, memberships are cables. Select a container and pull a cable from its plug: drop it on a switch to join that network, or on another container to give the two a network in common (join one of the other's, or a new one for the pair); clicking *Connect…* and then the target works too. Click a cable to unplug it. Built to stay readable with a hundred containers: a force layout that keeps each Compose project together on a soft outline, numbered replicas (`queue-worker-1…40`) folded into one stacked device until you expand them, labels that give way to each other as you zoom out, search that dims everything else and brings the first match into view, a minimap, focus on a node's own cables when selected, and dragged positions remembered per browser. A *Table* view keeps the patch bay for precise work. *New container* pulls an image (Docker) or downloads one from images.linuxcontainers.org (Incus) and starts it with ports, network, environment, restart policy and limits. The side sheet starts, stops, restarts, pauses and removes; edits ports, restart policy and memory/CPU limits; shows the last 200 log lines; and for Incus takes, rolls back and deletes snapshots. A host-port table names whoever holds each port (SkyGuard listeners included) and flags conflicts; *Open to the internet* lists every container port bound on all addresses and whether a ban stops traffic there.
 - **Ports and access** — the server's addresses (its own, and those it passes on to Incus instances, VMs or DNAT) with whether bans reach them and a switch for the server-wide rules; every port that takes connections on the host and behind those addresses, who is behind it (program, container, SkyGuard service) and whether the internet can reach it, with databases and admin panels that anyone can reach flagged; *Close…* to publish a container's port on this server only or not at all (the compose file included), the access rules with their drop counters, a rule editor, and the trial banner that undoes a change to SSH or the dashboard unless you keep it. See [Port access rules](#port-access-rules).
-- **Auto-ban and firewall** — switch, threshold stepper, ban length, and the SKYGUARD chain's current rules.
+- **Settings** — version and updates (the running build, the newest release with its notes, one-click update with automatic rollback, history), the auto-ban switch, threshold stepper and ban length, container engines, AI assistants, and the SKYGUARD chain's current rules.
 - **IP detail** — a side sheet with score, daily activity, credentials and connections for any address.
 
 Works on phones (bottom navigation) and with the keyboard; screen state lives in the URL hash, so every view can be bookmarked.
@@ -706,6 +785,10 @@ State-changing `POST` endpoints require the header `X-SkyGuard-Request: 1` (CSRF
 | `POST` | `/api/containers/remove` | `engine`, `id` — stop and delete; volumes are kept |
 | `GET` | `/api/containers/logs?engine=&id=&lines=200` | The last lines of stdout/stderr (Docker) or the console log (Incus) |
 | `GET`/`POST` | `/api/containers/snapshots` | Incus: list; `action` = `take` \| `restore` \| `delete`, `name` |
+| `GET` | `/api/update` | Running version (`running`: `version`, `commit`, `date`), the newest release (`latest`, `available`), `status` of an update in progress, `state` (current, previous, `failure`, `history`), `can_rollback`, `backups` |
+| `POST` | `/api/update/check` | Ask GitHub now |
+| `POST` | `/api/update/apply` | `version` — install that release (the newest found); SkyGuard restarts at the end |
+| `POST` | `/api/update/rollback` | Back to the previous version, or the installed one |
 | `GET` | `/api/mcp` | MCP state: `enabled`, `allow_actions`, `token_set`, `token_created`, `tools`, recent `activity` |
 | `POST` | `/api/mcp` | `enabled`, `allow_actions`; switching on the first time returns a new `token` once |
 | `POST` | `/api/mcp/token` | Make a new token (returned once); the old one stops working |
@@ -732,12 +815,15 @@ SkyGuard/
 │   ├── proxy/               # bidirectional TCP proxy
 │   ├── analysis/            # GeoIP · rate limiter · scorer · port-scan detector
 │   ├── firewall/            # iptables / ip6tables (SKYGUARD chain in INPUT, FORWARD, DOCKER-USER; port rule chains) · ufw · none
-│   ├── containers/          # Docker Engine API and Incus REST API clients, the container manager
+│   ├── containers/          # Docker Engine API and Incus REST API clients, the container manager, compose file edits
+│   ├── portrules/           # port access rules: the server's addresses, listeners, trials
+│   ├── update/              # releases from GitHub, verification, staging, the launcher and rollback
 │   ├── storage/             # SQLite (pure Go): connections, credentials, bans, scores, settings
 │   ├── netutil/             # IP normalisation, IP/CIDR sets
 │   └── dashboard/           # HTTP server, REST API, MCP server (mcp.go), embedded UI (static/index.html, assets/*.js, *.css, fonts)
 ├── configs/skyguard.example.yaml
 ├── docs/                    # logo and screenshots
+├── .github/workflows/       # release.yml: builds, checksums and signs a release for a v* tag
 ├── scripts/                 # install-plugin.sh, enable-ssh-honeypot.sh
 ├── install.sh / uninstall.sh
 ├── Dockerfile               # golang:1.27 → debian:trixie-slim

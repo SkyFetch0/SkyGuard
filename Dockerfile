@@ -7,9 +7,10 @@ RUN go mod download
 
 COPY . .
 ARG VERSION=dev
+ARG COMMIT=
 # Pure-Go SQLite driver: no cgo, fully static binary.
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
-    -ldflags="-w -s -X main.Version=${VERSION}" \
+    -ldflags="-w -s -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -o /out/skyguard ./cmd/skyguard
 
 # ── Runtime stage ──────────────────────────────────────────────────────────────

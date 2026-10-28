@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +25,44 @@ type Config struct {
 	Dashboard   DashboardConfig      `yaml:"dashboard"`
 	Containers  ContainersConfig     `yaml:"containers"`
 	Logging     LoggingConfig        `yaml:"logging"`
+	Update      UpdateConfig         `yaml:"update"`
+}
+
+// UpdateConfig is where SkyGuard looks for new releases. It only looks;
+// installing one is always the operator's click in the dashboard.
+type UpdateConfig struct {
+	Check     *bool  `yaml:"check"`        // look for new releases every 6 hours (default true)
+	Repo      string `yaml:"repo"`         // GitHub owner/name (default SkyFetch0/SkyGuard)
+	Channel   string `yaml:"channel"`      // stable (default) or prerelease
+	PublicKey string `yaml:"public_key"`   // base64 ed25519 key that must have signed a release
+	APIURL    string `yaml:"api_url"`      // default https://api.github.com
+	Token     string `yaml:"github_token"` // for a private repository; or env SKYGUARD_GITHUB_TOKEN
+}
+
+var updateRepoRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+
+// Checks reports update.check (default true).
+func (u UpdateConfig) Checks() bool { return u.Check == nil || *u.Check }
+
+// DefaultUpdateRepo is where official releases are published.
+const DefaultUpdateRepo = "SkyFetch0/SkyGuard"
+
+// DataDirOf reads only general.data_dir from a config file, leniently: the
+// launcher needs it before (and whether or not) the rest is valid for this
+// build, since a newer release may accept settings an older one does not.
+func DataDirOf(path string) string {
+	var c struct {
+		General struct {
+			DataDir string `yaml:"data_dir"`
+		} `yaml:"general"`
+	}
+	if b, err := os.ReadFile(path); err == nil {
+		_ = yaml.Unmarshal(b, &c)
+	}
+	if c.General.DataDir == "" {
+		return "/var/lib/skyguard"
+	}
+	return c.General.DataDir
 }
 
 // ContainersConfig lets the dashboard manage the host's Docker containers
@@ -283,6 +322,19 @@ func applyDefaults(cfg *Config, banDurationSet bool) {
 	if cfg.General.LogLevel == "" {
 		cfg.General.LogLevel = "info"
 	}
+	u := &cfg.Update
+	if u.Repo == "" {
+		u.Repo = DefaultUpdateRepo
+	}
+	if u.Channel == "" {
+		u.Channel = "stable"
+	}
+	if u.APIURL == "" {
+		u.APIURL = "https://api.github.com"
+	}
+	if u.Token == "" {
+		u.Token = os.Getenv("SKYGUARD_GITHUB_TOKEN")
+	}
 	if cfg.General.DataDir == "" {
 		cfg.General.DataDir = "/var/lib/skyguard"
 	}
@@ -339,6 +391,12 @@ func applyDefaults(cfg *Config, banDurationSet bool) {
 // surface at runtime (port clashes, bad addresses, unknown types).
 func (c *Config) Validate() error {
 	var errs []error
+	if u := c.Update; u.Repo != "" && !updateRepoRE.MatchString(u.Repo) {
+		errs = append(errs, fmt.Errorf("update.repo %q must be owner/name", u.Repo))
+	}
+	if ch := c.Update.Channel; ch != "" && ch != "stable" && ch != "prerelease" {
+		errs = append(errs, fmt.Errorf("update.channel must be stable or prerelease, not %q", ch))
+	}
 	ports := map[int]string{}
 	claim := func(port int, owner string) {
 		if port < 1 || port > 65535 {

@@ -319,6 +319,14 @@ SkyGuard <commit> is running (healthy) on <hostname>.
 
 ---
 
+## Updates
+
+Do not `git pull` and rebuild on a running server unless the operator asks:
+updates are installed from the dashboard (*Settings → Version and updates*),
+which verifies the release, tests it with the config, backs up the database
+and config, and undoes itself if the new version keeps failing to start.
+To see what runs: `curl -su admin:<password> http://127.0.0.1:9090/api/update`.
+
 ## Undo
 
 ```bash

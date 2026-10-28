@@ -195,3 +195,24 @@ func (t *dbTime) parse(s string) error {
 	}
 	return fmt.Errorf("parsing timestamp %q", s)
 }
+
+// BackupTo writes a consistent copy of the database to path while it is in
+// use (VACUUM INTO), for example before an update.
+func (d *DB) BackupTo(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("%s already exists", path)
+	}
+	_, err := d.db.Exec("VACUUM INTO ?", path)
+	return err
+}
+
+// Size is the database's size on disk in bytes (main file and WAL).
+func (d *DB) Size() int64 {
+	var pages, size int64
+	_ = d.db.QueryRow("PRAGMA page_count").Scan(&pages)
+	_ = d.db.QueryRow("PRAGMA page_size").Scan(&size)
+	return pages * size
+}

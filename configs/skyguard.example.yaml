@@ -165,3 +165,13 @@ logging:
   db_path: "/data/skyguard.db"
   retention_days: 90      # delete records older than N days
   log_first_bytes: 512    # max bytes of attacker-supplied data stored per event
+
+# ─── Updates ──────────────────────────────────────────────────────────────────
+# The dashboard (Settings → Version and updates) shows new releases and
+# installs one when you click: checked, tested with this config, database and
+# config backed up, undone by itself if it keeps failing to start.
+update:
+  check: true                  # look for new releases every 6 hours
+  repo: "SkyFetch0/SkyGuard"   # a fork can point at its own releases
+  channel: "stable"            # stable | prerelease
+  # public_key: ""             # base64 ed25519 key releases must be signed with

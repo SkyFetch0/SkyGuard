@@ -728,8 +728,122 @@
     loadPorts();
   }
 
+  // ── version and updates ─────────────────────────────────────────────────
+  const upd = { data: null, waiting: '' };
+  const PHASES = [['downloading', 'Download'], ['verifying', 'Check checksum and signature'], ['testing', 'Try it with your config'], ['backing-up', 'Back up the database and config'], ['restarting', 'Restart'], ['done', 'Running the new version']];
+  const UPD_RESULT = { applied: 'Installed', running: 'Running fine', 'rolled-back': 'Undone', replaced: 'Replaced by the installed binary' };
+  async function loadUpdate() {
+    try { upd.data = await api('/api/update'); } catch (e) { $('#upd-facts').innerHTML = `<div><dt>Version</dt><dd>${esc(e.message)}</dd></div>`; return; }
+    renderUpdate();
+  }
+  function renderUpdate() {
+    const v = upd.data;
+    if (v.enabled === false) { $('#upd-facts').innerHTML = `<div><dt>Version</dt><dd>${esc(v.running.version)}</dd></div>`; return; }
+    const r = v.running || {};
+    $('#upd-facts').innerHTML = [
+      ['Running', `${r.version}${v.staged ? ' · update' : ''}`],
+      ['Commit', r.commit ? r.commit.slice(0, 10) : '—'],
+      ['Built', r.date ? stamp(r.date) : '—'],
+      ['Platform', `${v.platform.replace(/^skyguard-/, '').replace('-', '/')}${v.in_docker ? ' · Docker' : ''}`],
+    ].map(([k, x]) => `<div><dt>${k}</dt><dd class="${k === 'Running' || k === 'Commit' ? 'mono' : ''}" title="${esc(x)}">${esc(x)}</dd></div>`).join('');
+    $('#upd-check-title').textContent = `Releases of ${v.repo}`;
+    $('#upd-check-state').textContent = v.check_error ? `Last check failed: ${v.check_error}`
+      : v.checked_at ? `Checked ${ago(v.checked_at)}${v.checks ? ', and every 6 hours' : ' (automatic checks are off)'}. Channel: ${v.channel}.`
+      : v.checks ? 'Checked a minute after start, then every 6 hours.' : 'Automatic checks are off (update.check).';
+    const f = v.state && v.state.failure, fail = $('#upd-failure');
+    fail.hidden = !f;
+    if (f) fail.textContent = `The update to ${f.from} was undone ${ago(f.at)}: ${f.reason}. ${f.to === 'installed' ? 'The installed version' : f.to} is running.`;
+
+    const st = v.status || { phase: 'idle' }, busy = !['idle', 'failed'].includes(st.phase);
+    const box = $('#upd-new');
+    if (v.latest && v.available) {
+      const l = v.latest, failed = f && f.from === l.version;
+      box.hidden = false;
+      box.innerHTML = `<div class="upd-head"><div><h3>SkyGuard ${esc(l.version)} is available</h3><span class="muted">${l.published ? `Published ${esc(ago(l.published))}` : ''}${l.prerelease ? ' · pre-release' : ''} · ${l.signed ? 'signed' : v.signed_only ? 'not signed: this build refuses it' : 'not signed: only its checksum is checked'}${failed ? ' · <span class="neg-text">it did not start here last time</span>' : ''}</span></div>
+          <div class="form-actions"><a class="card-link" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer">Release page</a><button class="btn ${failed ? '' : 'primary'}" type="button" data-action="upd-apply" data-version="${esc(l.version)}" ${busy || (v.signed_only && !l.signed) ? 'disabled' : ''}>${failed ? `Try ${esc(l.version)} again` : `Update to ${esc(l.version)}`}</button></div></div>
+        ${l.notes ? `<div class="upd-notes">${esc(l.notes)}</div>` : ''}`;
+    } else if (v.latest) {
+      box.hidden = false;
+      box.innerHTML = `<p class="muted">${esc(r.version)} is the newest release${Compare(r.version, v.latest.version) > 0 ? ` (newer than ${esc(v.latest.version)}, the newest published)` : ''}.</p>`;
+    } else box.hidden = true;
+
+    const steps = $('#upd-steps');
+    steps.hidden = st.phase === 'idle';
+    if (!steps.hidden) {
+      const at = upd.waiting ? 4 : PHASES.findIndex((p) => p[0] === st.phase);
+      steps.innerHTML = PHASES.map(([k, label], i) => {
+        const cls = st.phase === 'failed' ? (i === 0 ? 'bad' : '') : i < at ? 'done' : i === at ? 'now' : '';
+        return `<li class="${cls}">${esc(label)}</li>`;
+      }).join('') + (st.phase === 'failed' ? `<li class="bad err">Stopped: ${esc(st.error)}. Nothing was changed; ${esc(r.version)} keeps running.</li>` : '');
+    }
+    const rb = $('#upd-rollback-row');
+    rb.hidden = !v.can_rollback;
+    if (v.can_rollback) $('#upd-rollback-text').textContent = `Back to ${v.rollback_to}. The database stays as it is; a copy from before the update is in ${(v.backups || []).slice(-1)[0] || 'the backups folder'}.`;
+    const hist = (v.state && v.state.history) || [];
+    $('#upd-history-block').hidden = !hist.length;
+    $('#upd-history').innerHTML = hist.slice().reverse().slice(0, 8).map((e) => `<tr><td title="${esc(stamp(e.at))}">${esc(ago(e.at))}</td><td class="mono">${esc(e.from ? `${e.from} → ${e.to || ''}` : e.to || '')}${e.reason ? ` <span class="muted">· ${esc(e.reason)}</span>` : ''}</td><td class="n">${esc(UPD_RESULT[e.result] || e.result)}</td></tr>`).join('');
+    markUpdate(v.available ? v.latest.version : '');
+  }
+  // the newer of two versions, the same way the server orders them (no pre-release detail)
+  function Compare(a, b) {
+    const p = (x) => String(x).replace(/^v/, '').split(/[.-]/).slice(0, 3).map(Number);
+    const x = p(a), y = p(b);
+    for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0) ? 1 : -1;
+    return 0;
+  }
+  function markUpdate(version) {
+    const a = $('[data-nav="settings"]');
+    if (!a) return;
+    a.classList.toggle('has-dot', !!version);
+    a.dataset.tip = version ? `Settings · SkyGuard ${version} is available` : 'Settings';
+  }
+  async function checkUpdate(btn) {
+    btn.disabled = true; btn.textContent = 'Checking…';
+    try { upd.data = await post('/api/update/check', {}); renderUpdate(); toast(upd.data.available ? `SkyGuard ${upd.data.latest.version} is available` : 'SkyGuard is up to date'); }
+    catch (e) { toast(`Check failed: ${e.message}`, false); loadUpdate(); }
+    btn.disabled = false; btn.textContent = 'Check now';
+  }
+  async function applyUpdate(version) {
+    const v = upd.data;
+    if (!await confirmAction(`Update to SkyGuard ${version}?`, `SkyGuard downloads ${version}, checks it, tries it with your config and backs up the database and config. Then it restarts: the dashboard and the honeypots are away for a few seconds, the firewall rules stay. If ${version} fails to start, ${v.running.version} comes back by itself.`, `Update to ${version}`)) return;
+    try { upd.data = await post('/api/update/apply', { version }); renderUpdate(); }
+    catch (e) { toast(`Not started: ${e.message}`, false); return; }
+    followUpdate(version);
+  }
+  async function rollbackUpdate() {
+    const v = upd.data;
+    if (!await confirmAction(`Go back to ${v.rollback_to}?`, 'SkyGuard restarts with it. The data and the settings stay as they are.', 'Go back')) return;
+    try { await post('/api/update/rollback', {}); } catch (e) { toast(e.message, false); return; }
+    followUpdate('');
+  }
+  // follow the update through the restart: the dashboard is away for a moment
+  async function followUpdate(target) {
+    const started = Date.now();
+    let down = false;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1500));
+      let v = null;
+      try { v = await api('/api/update'); } catch { down = true; upd.waiting = target || 'back'; renderUpdate(); }
+      if (v) {
+        upd.data = v;
+        const ph = v.status && v.status.phase;
+        if (ph === 'failed') { upd.waiting = ''; renderUpdate(); toast(`Update stopped: ${v.status.error}`, false); return; }
+        if (down || (ph === 'idle' && Date.now() - started > 4000)) {
+          upd.waiting = '';
+          const ok = !target || v.running.version === target;
+          toast(ok ? (target ? `SkyGuard ${target} is running` : `SkyGuard ${v.running.version} is running`) : `${target} did not start; ${v.running.version} is running`, ok);
+          setTimeout(() => location.reload(), 1200); // the new version brings its own dashboard
+          return;
+        }
+        renderUpdate();
+      }
+      if (Date.now() - started > 5 * 60 * 1000) { toast('No answer for 5 minutes: check the service on the server', false); return; }
+    }
+  }
+
   // ── settings ────────────────────────────────────────────────────────────
   async function loadSettings() {
+    loadUpdate();
     loadEngineSwitches();
     loadMCP();
     const [s, fw] = await Promise.allSettled([api('/api/settings'), api('/api/firewall')]);
@@ -1639,7 +1753,7 @@ Tunnel:  ${tunnel}`],
     services: { title: 'Honeypots and services', load: loadServices, live: true },
     ports: { title: 'Ports and access', load: loadPorts, live: true },
     containers: { title: 'Containers', load: loadContainers, live: true },
-    settings: { title: 'Auto-ban and firewall', load: loadSettings, live: false },
+    settings: { title: 'Settings', load: loadSettings, live: false },
   };
   let current = 'overview';
   // The screen and its state live in the hash, so a view can be bookmarked, shared and reloaded:
@@ -1827,6 +1941,9 @@ Tunnel:  ${tunnel}`],
         break;
       }
       case 'mcp-token': newMCPToken(); break;
+      case 'upd-check': checkUpdate(a); break;
+      case 'upd-apply': applyUpdate(a.dataset.version); break;
+      case 'upd-rollback': rollbackUpdate(); break;
       case 'copy': copyFrom(a.dataset.copy, a); break;
       case 'port-remove': {
         a.closest('.port-row').remove();
@@ -1894,6 +2011,7 @@ Tunnel:  ${tunnel}`],
   api('/api/info').then((info) => {
     state.info = info;
     if (info.host) $$('[data-host]').forEach((el) => { el.textContent = info.host; });
+    markUpdate(info.update_available ? info.update_version : '');
   }).catch(() => {});
   show(...parseHash());
   // Live screens refresh every 30 seconds while the tab is visible; old values stay until new ones arrive.

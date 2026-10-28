@@ -318,9 +318,18 @@ func (m *mcpService) register() {
 			if d.ctr != nil {
 				engines = d.ctr.Snapshot(context.Background()).Engines
 			}
+			upd := map[string]any{"checked": false}
+			if d.upd != nil {
+				v := d.upd.View()
+				upd = map[string]any{"running": v.Running, "update_available": v.Available, "checked_at": v.CheckedAt}
+				if v.Latest != nil {
+					upd["newest_release"] = v.Latest.Version
+				}
+			}
 			return map[string]any{
 				"host":                host,
 				"version":             Version,
+				"updates":             upd,
 				"time_utc":            time.Now().UTC().Format(time.RFC3339),
 				"firewall":            d.banCoverage(),
 				"auto_ban":            map[string]any{"enabled": ab.Enabled, "score_threshold": ab.ScoreThreshold, "ban_duration": formatDuration(ab.BanDuration)},

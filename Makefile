@@ -1,12 +1,14 @@
 .PHONY: build run check-config config docker-build docker-up docker-down test race vet clean lint
 
 BINARY  = skyguard
-VERSION ?= 1.1.0
+# A release tag on this commit gives the version; otherwise "dev".
+VERSION ?= $(or $(shell git describe --tags --exact-match 2>/dev/null | sed 's/^v//'),dev)
+COMMIT  ?= $(shell git rev-parse HEAD 2>/dev/null)
+DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS  = -w -s -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildDate=$(DATE)
 
 build:
-	CGO_ENABLED=0 go build -trimpath \
-	  -ldflags="-w -s -X main.Version=$(VERSION)" \
-	  -o bin/$(BINARY) ./cmd/skyguard
+	CGO_ENABLED=0 go build -trimpath -ldflags="$(LDFLAGS)" -o bin/$(BINARY) ./cmd/skyguard
 
 run:
 	go run ./cmd/skyguard -config configs/skyguard.example.yaml
@@ -21,7 +23,7 @@ config:
 	@echo "edit configs/skyguard.yaml (whitelist + dashboard password), then: make docker-up"
 
 docker-build:
-	docker build --build-arg VERSION=$(VERSION) -t skyguard:$(VERSION) -t skyguard:latest .
+	docker build --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) -t skyguard:$(VERSION) -t skyguard:latest .
 
 docker-up: config
 	docker compose up -d --build

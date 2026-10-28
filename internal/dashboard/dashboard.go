@@ -21,6 +21,7 @@ import (
 	"github.com/skyguard/skyguard/internal/netutil"
 	"github.com/skyguard/skyguard/internal/portrules"
 	"github.com/skyguard/skyguard/internal/storage"
+	"github.com/skyguard/skyguard/internal/update"
 )
 
 //go:embed static
@@ -65,6 +66,7 @@ type Dashboard struct {
 	bans     Controller
 	ctr      *containers.Manager // nil unless the config enables an engine
 	ports    *portrules.Manager  // nil until the server sets it
+	upd      *update.Manager     // nil until main sets it
 	mcp      *mcpService
 	logger   *slog.Logger
 	server   *http.Server
@@ -181,6 +183,7 @@ func (d *Dashboard) routes() http.Handler {
 	api.HandleFunc("POST /api/unban", d.csrf(d.handleUnban))
 	d.containerRoutes(api)
 	d.portRoutes(api)
+	d.updateRoutes(api)
 	d.mcpRoutes(api)
 
 	var protected http.Handler = api

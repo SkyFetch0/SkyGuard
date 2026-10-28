@@ -348,11 +348,23 @@
       <div class="title-row">
         <div>
           <p class="brandline" translate="no"><b>SkyGuard</b> · <span data-host>this server</span></p>
-          <h1>Auto-ban and firewall</h1>
-          <p class="sub">Changes apply at once. Editing <code>analysis.auto_ban</code> in the config file and restarting takes precedence.</p>
+          <h1>Settings</h1>
+          <p class="sub">Updates, automatic bans, container engines, AI assistants and the firewall. Changes apply at once; editing the config file and restarting takes precedence.</p>
         </div>
       </div>
       <div>
+        <div class="setting" id="update-setting">
+          <div><h2>Version and updates</h2><p>SkyGuard looks for new releases on GitHub. An update is downloaded, checked against its checksum and signature, tried with your config, and the database and config are backed up before it starts. If the new version keeps failing to start, the previous one comes back by itself.</p></div>
+          <div class="panel upd-panel">
+            <dl class="facts" id="upd-facts"></dl>
+            <div class="switch-row"><span><b id="upd-check-title">Releases</b><br><span class="muted" id="upd-check-state">—</span></span><button class="btn small" type="button" data-action="upd-check" id="upd-check">Check now</button></div>
+            <p class="cover bad" id="upd-failure" hidden></p>
+            <div class="upd-new" id="upd-new" hidden></div>
+            <ol class="upd-steps" id="upd-steps" hidden></ol>
+            <div class="switch-row" id="upd-rollback-row" hidden><span><b>Go back</b><br><span class="muted" id="upd-rollback-text"></span></span><button class="btn small" type="button" data-action="upd-rollback" id="upd-rollback">Go back</button></div>
+            <div id="upd-history-block" hidden><h3>History</h3><div class="table-wrap"><table><thead><tr><th>Time</th><th>Change</th><th class="n">Result</th></tr></thead><tbody id="upd-history"></tbody></table></div></div>
+          </div>
+        </div>
         <div class="setting">
           <div><h2>Automatic bans</h2><p>An IP is banned when its threat score reaches the threshold. Whitelisted addresses are never banned.</p></div>
           <form class="panel" id="settings-form">

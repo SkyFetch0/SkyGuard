@@ -10,6 +10,7 @@ import (
 
 	"github.com/skyguard/skyguard/internal/firewall"
 	"github.com/skyguard/skyguard/internal/portrules"
+	"github.com/skyguard/skyguard/internal/update"
 )
 
 // portRules builds the port access rules manager. Without a usable iptables
@@ -151,4 +152,20 @@ func (s *Server) PortListeners(ctx context.Context) []portrules.Listener {
 	addrs, dnat := s.scanAddresses()
 	out := portrules.Listeners(portrules.ReadSockets("/proc/net"), owners, nat, claims)
 	return append(out, portrules.ForwardedListeners("/proc", addrs, owners, dnat)...)
+}
+
+// SetUpdater gives the dashboard the update manager.
+func (s *Server) SetUpdater(u *update.Manager) {
+	if s.dash != nil {
+		s.dash.SetUpdater(u)
+	}
+}
+
+// UpdatePrecheck refuses an update (or a rollback) while a restart would
+// lose something: unconfirmed port rules would be undone by it.
+func (s *Server) UpdatePrecheck() error {
+	if s.ports != nil && s.ports.View().Unsaved {
+		return fmt.Errorf("port rules are waiting to be kept or undone on the Ports screen; settle that first")
+	}
+	return nil
 }
