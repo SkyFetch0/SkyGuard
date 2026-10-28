@@ -23,7 +23,7 @@
 ![Honeypots](https://img.shields.io/badge/Honeypots-SSH%20%7C%20FTP%20%7C%20MySQL%20%7C%20HTTP-6C3483?logo=security&logoColor=white)
 ![CGO](https://img.shields.io/badge/CGO-disabled%20(pure%20Go)-00ADD8?logo=go&logoColor=white)
 
-**[Install](#installation)** · **[Screenshots](#screenshots)** · **[Configuration](#configuration)** · **[Containers](#containers-docker-and-incus)** · **[API](#dashboard--rest-api)** · **[Operations guide](USAGE.md)** · **[Install guide for AI agents](LLM_INSTALL.md)**
+**[Install](#installation)** · **[Screenshots](#screenshots)** · **[Configuration](#configuration)** · **[Containers](#containers-docker-and-incus)** · **[AI assistants (MCP)](#ai-assistants-mcp)** · **[API](#dashboard--rest-api)** · **[Operations guide](USAGE.md)** · **[Install guide for AI agents](LLM_INSTALL.md)**
 
 </div>
 
@@ -113,6 +113,7 @@ Passthrough services only apply steps 1–4 (real users must not be rate-limited
 | 🛡️ **DoS guard** | Semaphore caps concurrent connections at 4 096 |
 | 📦 **Storage** | Single-file SQLite, WAL mode, auto-purge old records |
 | 🌐 **Dashboard** | Browser UI with live polling + JSON REST API |
+| 🤖 **MCP** | A built-in Model Context Protocol server: Claude, ChatGPT, Cursor or any MCP client can read attacks, bans, credentials and containers, and act when you allow it |
 | 🧩 **Containers** | Opt-in Docker and Incus management, switched on from the panel: a network map to wire containers together, create / start / stop / pause / remove, published ports, restart policy, limits, logs, Incus snapshots |
 | 🐳 **Docker** | Multi-stage image (`golang:1.27` → `debian:trixie-slim` with iptables-legacy + iptables-nft), built-in health check |
 | ⚙️ **Config** | Single YAML file; hot-toggleable services (`enabled: false`) |
@@ -407,6 +408,58 @@ leaves those listeners off. Pick one of:
 SkyGuard's listeners bind every address (`:80`), so the proxy cannot keep
 `127.0.0.1:80` either: in option 2 it moves to other ports.
 
+## AI assistants (MCP)
+
+SkyGuard has a built-in [Model Context Protocol](https://modelcontextprotocol.io) server, so an AI assistant can answer "who attacked me last night?", "is anything on port 80 besides the reverse proxy?" or "ban the address that keeps trying root" from SkyGuard's own data. It is built on the official Go SDK and served at `/mcp` on the dashboard's address as stateless Streamable HTTP.
+
+<p align="center"><img src="docs/screenshots/mcp-settings.png" alt="Settings: the switch that lets AI assistants connect, the switch for action tools, the token, a ready-to-copy Claude Code command, the tool list and the most recent calls" width="100%"></p>
+
+**Turn it on:** Settings → *AI assistants (MCP)* → *Let AI assistants connect*. SkyGuard makes a token and shows it once; copy it. The panel then offers ready-to-paste setups with the token filled in:
+
+- **Claude Code** (open the tunnel, then add the server once):
+  ```bash
+  ssh -N -L 9090:127.0.0.1:9090 -p 9911 you@your-server
+  claude mcp add --transport http skyguard http://127.0.0.1:9090/mcp --header "Authorization: Bearer <token>"
+  ```
+- **Claude Desktop** and other stdio-only clients, through `mcp-remote` and the same tunnel:
+  ```json
+  {"mcpServers": {"skyguard": {"command": "npx", "args": ["-y", "mcp-remote", "http://127.0.0.1:9090/mcp", "--header", "Authorization:${SKYGUARD_AUTH}"],
+    "env": {"SKYGUARD_AUTH": "Bearer <token>"}}}}
+  ```
+- **Over SSH, no tunnel:** the client starts SkyGuard's own stdio bridge on the server (`skyguard -mcp-stdio`):
+  ```json
+  {"mcpServers": {"skyguard": {"command": "ssh", "args": ["-p", "9911", "you@your-server",
+    "docker", "exec", "-i", "-e", "SKYGUARD_MCP_TOKEN=<token>", "skyguard", "skyguard", "-mcp-stdio"]}}}
+  ```
+- **Anything else** that speaks Streamable HTTP: URL `http://127.0.0.1:9090/mcp`, header `Authorization: Bearer <token>`.
+
+**Tools.** Reading is always available; the action tools exist only while *Allow actions* is on (off by default), so an assistant in read-only mode cannot even see them.
+
+| Tool | What it does | |
+|---|---|---|
+| `skyguard_status` | Host, version, firewall backend and whether bans cover Docker's ports, auto-ban settings, totals, every service, container engines | read |
+| `get_summary` | One window (24h / 7d / 30d) against the one before: counters, where connections ended, busiest sources, services, countries, ports | read |
+| `list_connections` | The connection log, filtered by IP, country, service, outcome, last N hours | read |
+| `list_attackers` | IPs by threat score with counters, ports and ban state | read |
+| `get_ip` | One address: score, ban, whitelist, latest connections and logins | read |
+| `list_bans` | Active bans and when they lift | read |
+| `list_credentials` | Most tried usernames, passwords and pairs | read |
+| `get_firewall` | The SKYGUARD chain's rules and Docker coverage | read |
+| `list_containers` / `get_container` / `get_container_logs` | Containers, networks, port conflicts; one container; its last log lines | read |
+| `ban_ip` / `unban_ip` | Ban for a duration (default 24h, `0` permanent) or lift a ban | action |
+| `set_honeypot` | Open or close a honeypot's port | action |
+| `container_action` | Start, stop, restart, pause or resume a container | action |
+
+Deliberately not offered to an assistant: removing or creating containers, changing ports, network wiring, and SkyGuard's own settings.
+
+**Safety model.**
+- The token is separate from the dashboard password and stored only as a SHA-256 hash. *Make a new token* locks the old one out at once; switching MCP off answers every call with 404.
+- Wrong tokens are throttled per address (the same rule as the dashboard login), and all clients together are limited to about 240 calls a minute.
+- Browsers cannot drive the endpoint: cross-site requests and DNS-rebinding attempts (a loopback connection with a foreign `Host`) are refused with 403.
+- Bans requested over MCP go through the same rules as the dashboard: whitelisted and loopback addresses are refused. SkyGuard's own container cannot be stopped.
+- Attacker-supplied text is trimmed. The server's instructions and the tool descriptions tell the model that this text, and container logs, are data and never instructions (a defence against prompt injection through, say, a crafted HTTP path).
+- Every call is shown under *Recent calls* with its client address and result, and action calls are logged.
+
 ## Dashboard & REST API
 
 Access the dashboard via an SSH tunnel (never expose it directly):
@@ -468,6 +521,10 @@ State-changing `POST` endpoints require the header `X-SkyGuard-Request: 1` (CSRF
 | `POST` | `/api/containers/remove` | `engine`, `id` — stop and delete; volumes are kept |
 | `GET` | `/api/containers/logs?engine=&id=&lines=200` | The last lines of stdout/stderr (Docker) or the console log (Incus) |
 | `GET`/`POST` | `/api/containers/snapshots` | Incus: list; `action` = `take` \| `restore` \| `delete`, `name` |
+| `GET` | `/api/mcp` | MCP state: `enabled`, `allow_actions`, `token_set`, `token_created`, `tools`, recent `activity` |
+| `POST` | `/api/mcp` | `enabled`, `allow_actions`; switching on the first time returns a new `token` once |
+| `POST` | `/api/mcp/token` | Make a new token (returned once); the old one stops working |
+| `POST` | `/mcp` | The MCP endpoint itself: `Authorization: Bearer <token>`, not Basic Auth |
 
 ```bash
 curl -u admin:password http://localhost:9090/api/stats
@@ -493,7 +550,7 @@ SkyGuard/
 │   ├── containers/          # Docker Engine API and Incus REST API clients, the container manager
 │   ├── storage/             # SQLite (pure Go): connections, credentials, bans, scores, settings
 │   ├── netutil/             # IP normalisation, IP/CIDR sets
-│   └── dashboard/           # HTTP server, REST API, embedded UI (static/index.html, assets/*.js, *.css, fonts)
+│   └── dashboard/           # HTTP server, REST API, MCP server (mcp.go), embedded UI (static/index.html, assets/*.js, *.css, fonts)
 ├── configs/skyguard.example.yaml
 ├── docs/                    # logo and screenshots
 ├── scripts/                 # install-plugin.sh, enable-ssh-honeypot.sh
@@ -512,6 +569,7 @@ SkyGuard/
 > SkyGuard is a **detection and logging** layer. It complements — but does not replace — a properly configured host firewall and a patched OS.
 
 - **Container management is root on the host.** Enable `containers.docker` / `containers.incus` only with a strong dashboard password, keep the dashboard on loopback, and prefer `read_only: true` if you only want to look.
+- **An AI assistant with actions allowed can ban and stop things.** Leave *Allow actions* off unless you want that, and make a new MCP token if one may have leaked.
 - **Never expose the dashboard publicly.** It binds to `127.0.0.1` by default. Use an SSH tunnel or an mTLS reverse proxy.
 - **Add your own IP to `whitelist.ips`** before enabling auto-ban — you can lock yourself out.
 - **Rotate the default password.** The example config ships with `CHANGE_ME_NOW`.
@@ -570,6 +628,8 @@ curl -u admin:CHANGE_ME_NOW http://localhost:9090/api/stats
 | Variable | Default | Description |
 |---|---|---|
 | `SKYGUARD_CONFIG` | `/etc/skyguard/skyguard.yaml` | Config file path (used when `-config` is not given) |
+| `SKYGUARD_MCP_TOKEN` | — | The MCP token, for `-mcp-stdio` |
+| `SKYGUARD_MCP_URL` | from `dashboard.listen` | The MCP endpoint `-mcp-stdio` relays to |
 
 ### Command-line flags
 
@@ -579,6 +639,8 @@ curl -u admin:CHANGE_ME_NOW http://localhost:9090/api/stats
 | `-check-config` | Validate the config (ports, addresses, durations, CIDRs) and exit |
 | `-healthcheck` | Probe the running instance's `/healthz` (used by Docker) |
 | `-version` | Print the version |
+| `-mcp-stdio` | Relay MCP between stdin/stdout and the running instance's `/mcp` (for stdio-only clients) |
+| `-mcp-token-file PATH` | Read the MCP token for `-mcp-stdio` from a file instead of `SKYGUARD_MCP_TOKEN` |
 
 ---
 

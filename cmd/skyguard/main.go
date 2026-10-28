@@ -29,6 +29,8 @@ func main() {
 	checkOnly := flag.Bool("check-config", false, "validate the config file and exit")
 	healthcheck := flag.Bool("healthcheck", false, "probe the running instance's dashboard /healthz and exit 0/1 (for Docker HEALTHCHECK)")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	mcpStdio := flag.Bool("mcp-stdio", false, "relay MCP over stdin/stdout to the running instance's /mcp endpoint (token from SKYGUARD_MCP_TOKEN or -mcp-token-file)")
+	mcpTokenFile := flag.String("mcp-token-file", "", "file holding the MCP token, for -mcp-stdio")
 	flag.Parse()
 
 	if *showVersion {
@@ -45,6 +47,12 @@ func main() {
 	})
 	if envPath := os.Getenv("SKYGUARD_CONFIG"); envPath != "" && !flagSet {
 		*configPath = envPath
+	}
+
+	// The bridge needs no valid config (it only reads the dashboard address
+	// from it) and must keep stdout free of anything but protocol messages.
+	if *mcpStdio {
+		os.Exit(runMCPBridge(*configPath, *mcpTokenFile))
 	}
 
 	logger := setupLogger("info")

@@ -174,3 +174,58 @@ func (d *DB) ServiceOverride(name string, cfgEnabled bool) (enabled, ok bool, er
 func (d *DB) SetServiceOverride(name string, enabled, cfgEnabled bool) error {
 	return d.setSetting(serviceKey(name), fmt.Sprintf("%d;cfg=%d", boolToInt(enabled), boolToInt(cfgEnabled)))
 }
+
+// MCPSettings is the state of the MCP endpoint, switched from the dashboard.
+// Only a hash of the access token is stored; the token itself is shown once.
+type MCPSettings struct {
+	Enabled      bool
+	AllowActions bool // tools that change things (ban, unban, honeypot switch, container start/stop)
+	TokenHash    string
+	TokenCreated time.Time
+}
+
+const (
+	keyMCPEnabled      = "mcp_enabled"
+	keyMCPAllowActions = "mcp_allow_actions"
+	keyMCPTokenHash    = "mcp_token_hash"
+	keyMCPTokenCreated = "mcp_token_created"
+)
+
+// MCPSettings returns the stored MCP state (all off when never set).
+func (d *DB) MCPSettings() (MCPSettings, error) {
+	var m MCPSettings
+	for key, set := range map[string]func(string){
+		keyMCPEnabled:      func(v string) { m.Enabled = v == "1" },
+		keyMCPAllowActions: func(v string) { m.AllowActions = v == "1" },
+		keyMCPTokenHash:    func(v string) { m.TokenHash = v },
+		keyMCPTokenCreated: func(v string) { m.TokenCreated, _ = time.Parse(tsLayout, v) },
+	} {
+		v, ok, err := d.getSetting(key)
+		if err != nil {
+			return m, err
+		}
+		if ok {
+			set(v)
+		}
+	}
+	return m, nil
+}
+
+// SaveMCPSettings stores the MCP state.
+func (d *DB) SaveMCPSettings(m MCPSettings) error {
+	created := ""
+	if !m.TokenCreated.IsZero() {
+		created = formatTS(m.TokenCreated)
+	}
+	for key, v := range map[string]string{
+		keyMCPEnabled:      boolToStr(m.Enabled),
+		keyMCPAllowActions: boolToStr(m.AllowActions),
+		keyMCPTokenHash:    m.TokenHash,
+		keyMCPTokenCreated: created,
+	} {
+		if err := d.setSetting(key, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}

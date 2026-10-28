@@ -384,6 +384,7 @@
   // ── settings ────────────────────────────────────────────────────────────
   async function loadSettings() {
     loadEngineSwitches();
+    loadMCP();
     const [s, fw] = await Promise.allSettled([api('/api/settings'), api('/api/firewall')]);
     if (s.status === 'fulfilled') {
       const v = s.value;
@@ -1127,6 +1128,89 @@
     btn.disabled = false; btn.textContent = 'Create';
   }
 
+  // ── AI assistants (MCP) ─────────────────────────────────────────────────
+  // The token is shown once, right after it is made; the snippets carry it until the page is left.
+  const mcp = { data: null, token: '', tab: 'claude-code', stealth: 9911 };
+  async function loadMCP() {
+    try {
+      const [d, svcs] = await Promise.all([api('/api/mcp'), api('/api/services').catch(() => [])]);
+      mcp.data = d;
+      const st = svcs.find((x) => x.kind === 'stealth' && x.enabled);
+      if (st) mcp.stealth = st.port;
+      renderMCP();
+    } catch (e) { blockError($('#mcp-state'), 'the MCP settings', e); }
+  }
+  function mcpURL() {
+    const port = ((mcp.data && mcp.data.listen) || '127.0.0.1:9090').split(':').pop();
+    return { port, url: `http://127.0.0.1:${port}/mcp` };
+  }
+  function renderMCP() {
+    const d = mcp.data, { url } = mcpURL();
+    $('#mcp-enabled').checked = d.enabled;
+    $('#mcp-actions').checked = d.allow_actions;
+    $('#mcp-actions').disabled = !d.enabled;
+    $('#mcp-state').textContent = d.enabled ? `On at ${url} (through an SSH tunnel)` : 'Off: the endpoint answers 404';
+    $('#mcp-token-state').textContent = d.token_set ? `Made ${ago(d.token_created)}. Making a new one locks the old one out at once.` : 'None yet: one is made when you switch MCP on.';
+    $('[data-action="mcp-token"]').hidden = !d.enabled;
+    $('#mcp-token-box').hidden = !mcp.token;
+    $('#mcp-token-value').value = mcp.token;
+    $('#mcp-connect').hidden = !d.enabled;
+    $$('#mcp-tabs button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mcptab === mcp.tab)));
+    renderMCPSnippet();
+    const group = (action) => d.tools.filter((t) => t.action === action).map((t) => `<span class="chip tool-chip${action ? ' act' : ''}" title="${esc(t.description)}" translate="no">${esc(t.name)}</span>`).join('');
+    $('#mcp-tools').innerHTML = `<div><span class="muted">Read</span>${group(false)}</div><div><span class="muted">Act ${d.allow_actions ? '(allowed)' : '(off)'}</span>${group(true)}</div>`;
+    $('#mcp-activity').innerHTML = d.activity.length ? d.activity.slice(0, 12).map((c) => `<tr><td title="${esc(stamp(c.time))}">${esc(ago(c.time))}</td><td class="mono">${esc(c.client)}</td>
+      <td class="mono" translate="no">${esc(c.tool)}${c.action ? ' <span class="pill">action</span>' : ''}</td>
+      <td class="n" title="${esc(c.error || `${c.ms} ms`)}">${c.ok ? '<span class="pill pos"><span class="dot"></span>OK</span>' : '<span class="pill neg"><span class="dot"></span>Error</span>'}</td></tr>`).join('')
+      : emptyRow(4, d.enabled ? 'No calls yet. Connect an assistant with the snippet above.' : 'MCP is off.');
+  }
+  function renderMCPSnippet() {
+    const { port, url } = mcpURL(), tok = mcp.token || '<your token>', sp = mcp.stealth;
+    const tunnel = `ssh -N -L ${port}:127.0.0.1:${port} -p ${sp} you@your-server`;
+    const snippets = {
+      'claude-code': [`Keep an SSH tunnel open, then add SkyGuard to Claude Code once.`,
+        `${tunnel}
+
+claude mcp add --transport http skyguard ${url} \\\n  --header "Authorization: Bearer ${tok}"`],
+      desktop: [`Keep the SSH tunnel open; Claude Desktop reaches it through mcp-remote (needs Node.js). Add this to claude_desktop_config.json.`,
+        `${tunnel}
+
+${JSON.stringify({ mcpServers: { skyguard: { command: 'npx', args: ['-y', 'mcp-remote', url, '--header', 'Authorization:${SKYGUARD_AUTH}'], env: { SKYGUARD_AUTH: `Bearer ${tok}` } } } }, null, 2)}`],
+      ssh: [`No tunnel: the client starts SkyGuard's stdio bridge over SSH. Works with any client that runs local commands. Drop "docker exec -i -e …" if SkyGuard runs without Docker.`,
+        JSON.stringify({ mcpServers: { skyguard: { command: 'ssh', args: ['-p', String(sp), 'you@your-server', 'docker', 'exec', '-i', '-e', `SKYGUARD_MCP_TOKEN=${tok}`, 'skyguard', 'skyguard', '-mcp-stdio'] } } }, null, 2)],
+      other: [`Any client that speaks Streamable HTTP (Cursor, VS Code, ChatGPT connectors through a tunnel): the URL and one header.`,
+        `URL:     ${url}
+Header:  Authorization: Bearer ${tok}
+Tunnel:  ${tunnel}`],
+    };
+    const [howto, code] = snippets[mcp.tab];
+    $('#mcp-howto').textContent = howto + (mcp.token ? '' : ' Make a new token to have it filled in here.');
+    $('#mcp-snippet').textContent = code;
+  }
+  async function saveMCP(field, on) {
+    if (field === 'allow_actions' && on && !await confirmAction('Let the assistant act?', 'It will be able to ban and unban IPs, switch honeypots on and off, and start, stop and restart containers. Every call is logged here and in SkyGuard\'s log.', 'Allow actions')) {
+      $('#mcp-actions').checked = false; return;
+    }
+    try {
+      const d = await post('/api/mcp', { [field]: on ? '1' : '0' });
+      if (d.token) mcp.token = d.token;
+      mcp.data = d;
+      toast(field === 'enabled' ? (on ? 'AI assistants can connect' : 'MCP is off') : (on ? 'The assistant may act' : 'The assistant can only read'));
+    } catch (e) { toast(`MCP: ${e.message}`, false); }
+    renderMCP();
+  }
+  async function newMCPToken() {
+    if (mcp.data.token_set && !await confirmAction('Make a new token?', 'Assistants using the current token are locked out until you give them the new one.', 'Make a new token')) return;
+    try { const d = await post('/api/mcp/token', {}); mcp.token = d.token; mcp.data = d; toast('New token made: copy it now'); }
+    catch (e) { toast(`Token: ${e.message}`, false); }
+    renderMCP();
+  }
+  async function copyFrom(sel, btn) {
+    const el = $(sel), text = el.value != null && el.tagName === 'INPUT' ? el.value : el.textContent;
+    try { await navigator.clipboard.writeText(text); btn.textContent = 'Copied'; setTimeout(() => { btn.textContent = 'Copy'; }, 1500); }
+    catch { if (el.select) el.select(); toast('Copy it by hand: the browser blocked the clipboard', false); }
+  }
+
   // ── engine switches (settings) ──────────────────────────────────────────
   async function loadEngineSwitches() {
     const box = $('#engine-switches');
@@ -1276,6 +1360,8 @@
     if (ct.patch) { ev.preventDefault(); dropPatch(t); return; }
     const engBtn = t.closest('[data-engine]:not([data-action])');
     if (engBtn) { ct.engine = engBtn.dataset.engine; writeHash(); loadContainers(); return; }
+    const mt = t.closest('[data-mcptab]');
+    if (mt) { mcp.tab = mt.dataset.mcptab; renderMCP(); return; }
     const cv = t.closest('[data-ctview]');
     if (cv) { ct.view = cv.dataset.ctview; applyCtView(); writeHash(); if (ct.view === 'map' && ct.data) renderMap(); return; }
     const cf = t.closest('[data-ctfilter]');
@@ -1361,6 +1447,8 @@
         break;
       }
       case 'engine-on': switchEngine(a.dataset.engine, true); break;
+      case 'mcp-token': newMCPToken(); break;
+      case 'copy': copyFrom(a.dataset.copy, a); break;
       case 'port-remove': {
         a.closest('.port-row').remove();
         if (!$('.port-row', $('#port-rows'))) $('#port-rows').innerHTML = '<div class="empty small">No published ports. Save to unpublish them all.</div>';
@@ -1371,6 +1459,8 @@
   document.addEventListener('change', (ev) => {
     if (ev.target.matches('[data-action="toggle-service"]')) toggleService(ev.target);
     if (ev.target.matches('[data-action="engine-switch"]')) switchEngine(ev.target.dataset.engine, ev.target.checked, ev.target);
+    if (ev.target.id === 'mcp-enabled') saveMCP('enabled', ev.target.checked);
+    if (ev.target.id === 'mcp-actions') saveMCP('allow_actions', ev.target.checked);
     if (ev.target.closest('#conn-filters')) { state.conn.offset = 0; writeHash(); loadConnections(); }
     if (ev.target.id === 'set-enabled') $('#set-state').textContent = ev.target.checked ? 'On once you save' : 'Off once you save';
   });

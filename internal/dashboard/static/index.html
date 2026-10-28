@@ -336,6 +336,33 @@
           <div><h2>Container engines</h2><p>Let the dashboard manage this server's Docker containers and Incus instances. Either socket is equivalent to root, so this needs a strong dashboard password. With docker compose, mount the socket into SkyGuard's container first.</p></div>
           <div class="panel" id="engine-switches"><div class="muted">Loading…</div></div>
         </div>
+        <div class="setting" id="mcp-setting">
+          <div><h2>AI assistants (MCP)</h2><p>Let an AI assistant such as Claude, ChatGPT, Cursor or VS Code read what SkyGuard sees through the Model Context Protocol, and, if you allow it, act. It connects with its own token, never the dashboard password, on this dashboard's address at <code>/mcp</code>.</p></div>
+          <div class="panel mcp-panel">
+            <label class="switch-row"><span><b>Let AI assistants connect</b><br><span class="muted" id="mcp-state">—</span></span><input class="switch" type="checkbox" role="switch" id="mcp-enabled" aria-label="Let AI assistants connect"></label>
+            <label class="switch-row"><span><b>Allow actions</b><br><span class="muted" id="mcp-actions-state">Ban and unban IPs, switch honeypots, start and stop containers. Off: it can only read.</span></span><input class="switch" type="checkbox" role="switch" id="mcp-actions" aria-label="Allow the assistant to act"></label>
+            <div class="mcp-token">
+              <div class="switch-row"><span><b>Token</b><br><span class="muted" id="mcp-token-state">—</span></span><button class="btn small" type="button" data-action="mcp-token">Make a new token</button></div>
+              <div class="token-box" id="mcp-token-box" hidden>
+                <input class="input mono" id="mcp-token-value" readonly aria-label="The new token" spellcheck="false" translate="no">
+                <button class="btn small primary" type="button" data-action="copy" data-copy="#mcp-token-value">Copy</button>
+                <p class="hint">Shown once: copy it now. SkyGuard keeps only a hash of it.</p>
+              </div>
+            </div>
+            <div class="mcp-connect" id="mcp-connect">
+              <div class="sheet-form-head"><h3>Connect an assistant</h3><div class="choice" role="group" aria-label="Client" id="mcp-tabs">
+                <button type="button" data-mcptab="claude-code" aria-pressed="true">Claude Code</button>
+                <button type="button" data-mcptab="desktop" aria-pressed="false">Claude Desktop</button>
+                <button type="button" data-mcptab="ssh" aria-pressed="false">Over SSH</button>
+                <button type="button" data-mcptab="other" aria-pressed="false">Other</button>
+              </div></div>
+              <p class="hint" id="mcp-howto"></p>
+              <div class="snippet"><pre class="rules" id="mcp-snippet"></pre><button class="btn small" type="button" data-action="copy" data-copy="#mcp-snippet">Copy</button></div>
+            </div>
+            <div><h3>Tools the assistant gets</h3><div class="mcp-tools" id="mcp-tools"></div></div>
+            <div><h3>Recent calls</h3><div class="table-wrap"><table><thead><tr><th>Time</th><th>From</th><th>Tool</th><th class="n">Result</th></tr></thead><tbody id="mcp-activity"></tbody></table></div></div>
+          </div>
+        </div>
         <div class="setting">
           <div><h2>Firewall</h2><p id="fw-desc">The rules SkyGuard keeps in its own SKYGUARD chain.</p></div>
           <div class="panel"><div class="switch-row"><b>Backend</b><span class="pill" id="fw-method">—</span></div><pre class="rules" id="fw-rules">Loading…</pre></div>

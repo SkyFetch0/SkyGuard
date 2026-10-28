@@ -3,6 +3,7 @@ package dashboard
 import (
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -249,25 +250,40 @@ func (d *Dashboard) handleBan(w http.ResponseWriter, r *http.Request) {
 		}
 		duration = parsed
 	}
-	reason := strings.TrimSpace(r.FormValue("reason"))
+	if err := d.manualBan(ip, r.FormValue("reason"), duration, permanent, "dashboard"); err != nil {
+		if errors.Is(err, errWhitelisted) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ip": ip})
+}
+
+var errWhitelisted = errors.New("whitelisted (or loopback) and cannot be banned")
+
+// manualBan applies a ban an operator asked for, from the dashboard or an AI
+// assistant over MCP. ip must already be normalised. A zero duration is
+// permanent; whitelisted and loopback addresses are refused.
+func (d *Dashboard) manualBan(ip, reason string, duration time.Duration, permanent bool, via string) error {
+	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "manual"
 	}
 	if len(reason) > 200 {
 		reason = reason[:200]
 	}
-
 	if d.bans.IsWhitelisted(ip) {
-		writeError(w, http.StatusBadRequest, ip+" is whitelisted (or loopback) and cannot be banned")
-		return
+		return fmt.Errorf("%s is %w", ip, errWhitelisted)
 	}
-	if err := d.bans.BanIP(ip, reason, duration, permanent || duration == 0); err != nil {
-		d.logger.Error("manual ban failed", "ip", ip, "error", err)
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+	permanent = permanent || duration == 0
+	if err := d.bans.BanIP(ip, reason, duration, permanent); err != nil {
+		d.logger.Error("manual ban failed", "ip", ip, "via", via, "error", err)
+		return err
 	}
-	d.logger.Info("manual ban applied via dashboard", "ip", ip, "permanent", permanent || duration == 0, "duration", duration)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ip": ip})
+	d.logger.Info("manual ban applied", "ip", ip, "via", via, "permanent", permanent, "duration", duration, "reason", reason)
+	return nil
 }
 
 // handleUnban removes a ban from the database and the firewall and resets the score.
@@ -277,13 +293,21 @@ func (d *Dashboard) handleUnban(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid or missing ip")
 		return
 	}
-	if err := d.bans.UnbanIP(ip); err != nil {
-		d.logger.Error("manual unban failed", "ip", ip, "error", err)
+	if err := d.manualUnban(ip, "dashboard"); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	d.logger.Info("manual unban applied via dashboard", "ip", ip)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ip": ip})
+}
+
+// manualUnban lifts a ban and resets the IP's score.
+func (d *Dashboard) manualUnban(ip, via string) error {
+	if err := d.bans.UnbanIP(ip); err != nil {
+		d.logger.Error("manual unban failed", "ip", ip, "via", via, "error", err)
+		return err
+	}
+	d.logger.Info("manual unban applied", "ip", ip, "via", via)
+	return nil
 }
 
 func (d *Dashboard) internalError(w http.ResponseWriter, what string, err error) {
@@ -371,31 +395,35 @@ func parseRange(q url.Values) chartRange {
 // counters for this and the previous period, where connections ended up,
 // and the busiest sources, services, countries and ports.
 func (d *Dashboard) handleSummary(w http.ResponseWriter, r *http.Request) {
-	rg := parseRange(r.URL.Query())
-	cur, err := d.db.Summary(rg.Since, rg.Until)
+	out, err := d.summary(parseRange(r.URL.Query()), 8)
 	if err != nil {
 		d.internalError(w, "summary", err)
 		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// summary is the overview for one range; the dashboard and MCP share it.
+func (d *Dashboard) summary(rg chartRange, top int) (map[string]any, error) {
+	cur, err := d.db.Summary(rg.Since, rg.Until)
+	if err != nil {
+		return nil, err
 	}
 	prev, err := d.db.Summary(rg.Since.Add(-rg.Span), rg.Since)
 	if err != nil {
-		d.internalError(w, "summary", err)
-		return
+		return nil, err
 	}
 	stats, err := d.db.GetStats()
 	if err != nil {
-		d.internalError(w, "summary", err)
-		return
+		return nil, err
 	}
 	outcomes, err := d.db.Outcomes(rg.Since, rg.Until)
 	if err != nil {
-		d.internalError(w, "outcomes", err)
-		return
+		return nil, err
 	}
-	sources, err := d.db.TopSources(rg.Since, rg.Until, 8)
+	sources, err := d.db.TopSources(rg.Since, rg.Until, top)
 	if err != nil {
-		d.internalError(w, "top sources", err)
-		return
+		return nil, err
 	}
 	out := map[string]any{
 		"range":       rg,
@@ -406,14 +434,13 @@ func (d *Dashboard) handleSummary(w http.ResponseWriter, r *http.Request) {
 		"top_sources": sources,
 	}
 	for _, by := range []string{"service", "country", "port"} {
-		rows, err := d.db.Breakdown(by, rg.Since, rg.Until, 8)
+		rows, err := d.db.Breakdown(by, rg.Since, rg.Until, top)
 		if err != nil {
-			d.internalError(w, "breakdown", err)
-			return
+			return nil, err
 		}
 		out[by+"s"] = rows
 	}
-	writeJSON(w, http.StatusOK, out)
+	return out, nil
 }
 
 // handleSeries returns per-hour (24h, 7d) or per-day (30d) counts.

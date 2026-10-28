@@ -63,13 +63,16 @@ type Dashboard struct {
 	settings *storage.Settings
 	bans     Controller
 	ctr      *containers.Manager // nil unless the config enables an engine
+	mcp      *mcpService
 	logger   *slog.Logger
 	server   *http.Server
 }
 
 // New creates a Dashboard instance. Call Start to begin serving.
 func New(cfg config.DashboardConfig, db *storage.DB, fw firewall.Firewall, settings *storage.Settings, ctl Controller, logger *slog.Logger) *Dashboard {
-	return &Dashboard{cfg: cfg, db: db, fw: fw, settings: settings, bans: ctl, logger: logger}
+	d := &Dashboard{cfg: cfg, db: db, fw: fw, settings: settings, bans: ctl, logger: logger}
+	d.mcp = newMCPService(d)
+	return d
 }
 
 // Start launches the HTTP server in a background goroutine. It returns an
@@ -173,6 +176,7 @@ func (d *Dashboard) routes() http.Handler {
 	api.HandleFunc("POST /api/ban", d.csrf(d.handleBan))
 	api.HandleFunc("POST /api/unban", d.csrf(d.handleUnban))
 	d.containerRoutes(api)
+	d.mcpRoutes(api)
 
 	var protected http.Handler = api
 	if d.cfg.Auth.Username != "" && d.cfg.Auth.Password != "" {
@@ -186,6 +190,9 @@ func (d *Dashboard) routes() http.Handler {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	// The MCP endpoint has its own bearer token (an AI client cannot do the
+	// browser's Basic Auth dance) and is off until switched on in Settings.
+	root.Handle("/mcp", d.mcp)
 	root.Handle("/", protected)
 	return securityHeaders(root)
 }

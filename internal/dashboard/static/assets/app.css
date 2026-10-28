@@ -624,3 +624,22 @@ code { font-family: var(--mono); font-size: 12px; } /* taste-skill-ignore: data-
 /* a long detail line truncates itself, never the country code beside the IP */
 .rank .who > .muted:not(.detail) { flex: none; }
 .rank .who .detail { flex: 1 1 auto; min-width: 0; }
+
+/* AI assistants (MCP) */
+.mcp-panel h3 { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+.mcp-token { display: grid; gap: 12px; }
+.token-box { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px 10px; padding: 12px; border: 1px solid var(--accent); border-radius: var(--radius-card); }
+.token-box .input { width: 100%; }
+.token-box .hint { grid-column: 1 / -1; }
+.mcp-connect { display: grid; gap: 10px; }
+.mcp-connect .sheet-form-head { flex-wrap: wrap; gap: 8px 16px; }
+#mcp-tabs { flex-wrap: wrap; height: auto; row-gap: 2px; }
+#mcp-tabs button { height: 30px; }
+.snippet { position: relative; }
+.snippet pre { margin: 0; padding-right: 76px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.snippet .btn { position: absolute; top: 10px; right: 10px; }
+.mcp-tools { display: grid; gap: 10px; }
+.mcp-tools > div { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.mcp-tools > div > .muted { width: 100%; font-size: var(--fs-small); }
+.tool-chip { height: 24px; font-size: 11.5px; }
+.tool-chip.act { box-shadow: inset 0 0 0 1px var(--control); } /* taste-skill-ignore: an outline, not elevation */

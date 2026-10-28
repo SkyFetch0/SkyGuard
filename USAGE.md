@@ -959,6 +959,23 @@ the engine's own error message).
 | `GET /api/containers/logs?engine=&id=&lines=` | `text`, `lines` (10–2000) |
 | `GET /api/containers/snapshots?engine=incus&id=` | `name`, `created`, `stateful`; `POST` with `action` (`take`, `restore`, `delete`) and `name` |
 
+#### AI assistants (MCP)
+
+| Endpoint | Returns / takes |
+|---|---|
+| `GET /api/mcp` | `enabled`, `allow_actions`, `token_set`, `token_created`, `listen`, `tools` (`name`, `title`, `description`, `action`), `activity` (the last 50 calls: `time`, `client`, `tool`, `action`, `ok`, `error`, `ms`) |
+| `POST /api/mcp` | `enabled`, `allow_actions` (either may be left out). The first switch-on returns `token` once. |
+| `POST /api/mcp/token` | A new `token`, returned once; the previous token stops working |
+| `POST /mcp` | The Model Context Protocol endpoint (stateless Streamable HTTP, JSON responses). Authenticates with `Authorization: Bearer <token>` only. `404` while off, `401` for a wrong token (`429` after repeated ones), `403` for cross-site or DNS-rebinding requests, `405` for `GET`. |
+
+Turning it on from a shell (for example from an install script):
+
+```bash
+curl -s -u 'admin:<dashboard password>' -H 'X-SkyGuard-Request: 1' -d enabled=1 http://127.0.0.1:9090/api/mcp   # → {"token": "sgmcp_…", …}
+```
+
+See the README's *AI assistants (MCP)* section for client setups and the tool list.
+
 A honeypot switched from the dashboard stays that way across restarts. When
 you later change that honeypot's `enabled` value in the config file, the file
 wins again.

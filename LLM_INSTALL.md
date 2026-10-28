@@ -284,6 +284,21 @@ Docker starts. Confirm: `systemctl is-enabled docker` → `enabled`.
 
 ---
 
+## 10b. Optional: let an AI assistant watch SkyGuard (MCP)
+
+Only if the human asked for it. This switches on SkyGuard's MCP endpoint in **read-only** mode and
+returns a token once:
+
+```bash
+curl -s -u '<DASH_USER>:<DASH_PASS>' -H 'X-SkyGuard-Request: 1' -d enabled=1 http://127.0.0.1:9090/api/mcp
+# → {"enabled":true,"allow_actions":false,"token":"sgmcp_…", …}
+```
+
+Give the token to the human (do not store it anywhere else). Do **not** turn on `allow_actions` unless
+the human asks for it explicitly: it lets an assistant ban IPs and stop containers. Client setups are
+in the README, section "AI assistants (MCP)"; the dashboard's Settings screen shows them with the token
+filled in.
+
 ## 11. Report back
 
 Give the human a short summary in their language, with these facts filled in:
@@ -296,6 +311,7 @@ SkyGuard <commit> is running (healthy) on <hostname>.
 - Dashboard: ssh -L 9090:127.0.0.1:9090 -p <STEALTH_PORT> <user>@<server> → http://localhost:9090
   user <DASH_USER>, password <shown once here / where you stored it>.
 - Container management: <off | Docker | Incus>.
+- AI assistants (MCP): <off | on, read-only | on, actions allowed>.
 - Config: /opt/skyguard/configs/skyguard.yaml (mode 600). Data: /opt/skyguard/data.
 - Open in the cloud firewall if the server has one: <ports>.
 ```
