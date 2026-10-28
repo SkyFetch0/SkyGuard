@@ -486,7 +486,9 @@ SkyGuard finds these addresses itself (the host's routing table, the nat
 table, and the network namespaces of containers and instances) and lists them
 on the Ports screen under **Addresses**, each with what is behind it, how many
 ports listen there (read inside the instance's namespace; a VM's ports are its
-own and are not listed), and whether bans reach it.
+own and are not listed), and whether bans reach it. SkyGuard in Docker needs `pid: host`
+(commented in its `docker-compose.yml`) to look into other namespaces; without
+it the addresses are still found and covered, but not what is behind them.
 
 - **Bans cover them.** The ban chain sits at the top of `FORWARD`, before such
   ACCEPT rules, so a banned IP is cut off from every address the server

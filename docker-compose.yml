@@ -11,6 +11,10 @@ services:
     # Host networking: honeypots see real client IPs and iptables bans apply
     # to the host's INPUT chain.
     network_mode: host
+    # Lets the Ports screen see what runs behind the extra IPs this host
+    # routes to Incus instances or containers (their network namespaces and
+    # listening ports). Without it the addresses are still found and covered.
+    # pid: host
     cap_add:
       - NET_ADMIN
       - NET_RAW
