@@ -381,6 +381,177 @@
     loadServices();
   }
 
+  // ── ports and access ────────────────────────────────────────────────────
+  const pt = { data: null, scope: 'public', edit: null, timer: 0 };
+  const SCOPE_WORDS = { public: 'Internet', private: 'Internal networks', local: 'This server only' };
+  const RISK_WORDS = { database: 'Database', admin: 'Admin interface', remote: 'Remote login', files: 'File sharing' };
+  const protoOf = (r) => (r.proto === 'both' ? 'tcp+udp' : r.proto || 'tcp');
+  function ruleRange(r) { const [a, b] = String(r.ports).split('-').map(Number); return [a, b || a]; }
+  function rulesFor(l) {
+    return ((pt.data && pt.data.rules) || []).filter((r) => {
+      const [lo, hi] = ruleRange(r);
+      return r.enabled && (r.proto === 'both' || r.proto === l.proto) && l.port >= lo && l.port <= hi;
+    });
+  }
+  const srcWord = (s) => (s === 'private' ? 'internal networks' : s);
+  function ruleSummary(r) {
+    const s = r.sources || [], list = s.length <= 2 ? s.map(srcWord).join(', ') : `${s.length} sources`;
+    if (r.mode === 'deny') return `Everyone except ${list}`;
+    return s.length ? `Only ${list}` : 'Only this server';
+  }
+  // a wildcard bind says nothing beyond "Internet"; a specific address is worth showing
+  const addrDetail = (addrs) => addrs.filter((a) => a !== '0.0.0.0' && a !== '::').join(', ');
+
+  async function loadPorts() {
+    let d;
+    try { d = await api('/api/ports'); } catch (e) { blockError($('#pt-listeners'), 'the ports', e); return; }
+    pt.data = d;
+    renderPorts();
+  }
+  function renderPorts() {
+    const d = pt.data, ls = d.listeners || [], rules = d.rules || [];
+    const pub = ls.filter((l) => l.scope === 'public');
+    const exposed = pub.filter((l) => l.risk && l.risk !== 'remote' && !rulesFor(l).length && l.kind !== 'skyguard');
+    $('#pt-sub').textContent = `${num(pub.length)} of ${num(ls.length)} ports take connections from outside. `
+      + (exposed.length ? `${num(exposed.length)} of them ${exposed.length === 1 ? 'is a database or admin port' : 'are databases or admin ports'} anyone can reach.` : 'None of the risky ones is open to everyone.');
+    $('[data-stamp]', $('#screen-ports')).textContent = 'Updated ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const un = $('#pt-unavailable');
+    un.hidden = d.available !== false;
+    if (!un.hidden) un.textContent = `Rules can't be enforced here: ${d.reason}. They are shown, but changes are refused.`;
+    $('#rule-new').disabled = d.available === false;
+    renderTrial();
+
+    const shown = pt.scope === 'public' ? pub : ls;
+    $('#pt-listeners').innerHTML = shown.length ? shown.map((l) => {
+      const rs = rulesFor(l), r = rs[0];
+      const risk = l.risk && l.scope === 'public' && !r && l.kind !== 'skyguard' && l.risk !== 'remote'
+        ? `<span class="pill warn"><span class="dot"></span>${esc(RISK_WORDS[l.risk])} open to all</span>` : '';
+      const who = l.owner ? `${esc(l.owner)} <span class="chip">${esc(l.kind)}</span>` : `${esc(l.process || 'unknown')} <span class="chip">${esc(l.kind)}</span>`;
+      const access = l.scope === 'local' ? '<span class="muted">This server only</span>'
+        : r ? `${esc(ruleSummary(r))}${r.dropped ? ` <span class="muted">· <span class="num">${num(r.dropped)}</span> dropped</span>` : ''}`
+        : '<span class="muted">Everyone</span>';
+      const btn = l.scope === 'local' ? '' : r
+        ? `<button class="btn small" type="button" data-action="rule-edit" data-id="${esc(r.id)}">Edit rule</button>`
+        : `<button class="btn small" type="button" data-action="rule-for" data-port="${l.port}" data-proto="${esc(l.proto)}" ${d.available === false ? 'disabled' : ''}>Restrict…</button>`;
+      return `<tr><td class="n pt-port"><span class="num">${l.port}</span><span class="muted">/${esc(l.proto)}</span></td>
+        <td><span class="pt-svc">${esc(l.service || '—')}</span>${risk}</td>
+        <td class="pt-who">${who}</td>
+        <td class="pt-addr" title="${esc(l.addrs.join(', '))}">${esc(SCOPE_WORDS[l.scope])}${addrDetail(l.addrs) ? ` <span class="muted mono">${esc(addrDetail(l.addrs))}</span>` : ''}</td>
+        <td class="pt-access">${access}</td><td class="n pt-act">${btn}</td></tr>`;
+    }).join('') : emptyRow(6, pt.scope === 'public' ? 'Nothing on this server takes connections from outside.' : 'No listening ports were found.');
+
+    $('#pt-rules-meta').textContent = `This server and ${num((d.always_allowed || []).length - 2)} whitelisted ${(d.always_allowed || []).length - 2 === 1 ? 'address always gets' : 'addresses always get'} in`;
+    $('#pt-rules').innerHTML = rules.length ? rules.map((r) => {
+      const srcs = (r.sources || []).map((s) => `<span class="chip">${esc(srcWord(s))}</span>`).join('') || '<span class="muted">nobody but this server</span>';
+      return `<div class="rule${r.enabled ? '' : ' off'}">
+        <input class="switch" type="checkbox" role="switch" data-action="rule-toggle" data-id="${esc(r.id)}" ${r.enabled ? 'checked' : ''} ${d.available === false ? 'disabled' : ''} aria-label="Rule for port ${esc(r.ports)} in force">
+        <div><h3><span><span class="num">${esc(r.ports)}</span><span class="muted">/${esc(protoOf(r))}</span></span>${r.name ? `<span>${esc(r.name)}</span>` : ''}${r.protected ? `<span class="pill" title="A change here needs confirming: this port is ${esc(r.protected)}"><span class="dot"></span>Protected: ${esc(r.protected.replace(/^the /, ''))}</span>` : ''}</h3>
+          <div class="what">${r.mode === 'deny' ? 'Everyone except' : 'Only'} ${srcs}</div></div>
+        <div class="fig"><span class="num">${num(r.dropped)}</span><span class="lbl">dropped</span></div>
+        <button class="btn small" type="button" data-action="rule-edit" data-id="${esc(r.id)}" ${d.available === false ? 'disabled' : ''}>Edit</button></div>`;
+    }).join('') : '<div class="empty">No rules yet: every open port takes connections from anyone. Use Restrict… on a port above, or New rule.</div>';
+  }
+  function renderTrial() {
+    const d = pt.data, box = $('#pt-trial');
+    clearInterval(pt.timer);
+    if (!d.unsaved) {
+      box.hidden = true;
+      return;
+    }
+    box.hidden = false;
+    const ports = (d.trial_ports || []).join(', ');
+    const tick = () => {
+      const left = Math.max(0, Math.round((new Date(d.trial_deadline) - Date.now()) / 1000));
+      $('#pt-trial-text').textContent = `The new rules restrict port ${ports}, a way back into this server. They are in force now and are undone in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')} unless you keep them. If this page stops answering, wait: access comes back by itself.`;
+      if (!left) { clearInterval(pt.timer); setTimeout(loadPorts, 1500); }
+    };
+    tick();
+    pt.timer = setInterval(tick, 1000);
+  }
+
+  function openRule(r, preset) {
+    const f = $('#rule-form'), d = pt.data;
+    pt.edit = r ? r.id : null;
+    const v = r || Object.assign({ ports: '', name: '', proto: 'tcp', mode: 'allow', sources: ['private'], enabled: true }, preset);
+    $('#rule-title').textContent = r ? `Rule for port ${r.ports}` : 'New rule';
+    f.elements.ports.value = v.ports; f.elements.name.value = v.name || '';
+    f.elements.sources.value = (v.sources || []).join('\n'); f.elements.enabled.checked = v.enabled !== false;
+    pressOnly($('#rule-proto'), v.proto, 'proto'); pressOnly($('#rule-mode'), v.mode, 'mode');
+    $('#rule-delete').hidden = !r;
+    $('#rule-error').textContent = '';
+    const quick = [['private', 'Internal networks']];
+    if (d.client_ip && !/^(127\.|::1$)/.test(d.client_ip)) quick.push([d.client_ip, `Your address, ${d.client_ip}`]);
+    $('#rule-quick').innerHTML = '<span class="hint">Add:</span>' + quick.map(([s, label]) => `<button class="card-link" type="button" data-action="src-add" data-src="${esc(s)}">${esc(label)}</button>`).join('');
+    ruleHints();
+    $('#rule-dialog').showModal();
+  }
+  // what the form would change, said before it is saved
+  function ruleHints() {
+    const f = $('#rule-form'), d = pt.data;
+    const mode = $('#rule-mode [aria-pressed="true"]').dataset.mode, proto = $('#rule-proto [aria-pressed="true"]').dataset.proto;
+    $('#rule-src-label').textContent = mode === 'allow' ? 'Sources allowed in' : 'Sources kept out';
+    const [lo, hi] = ruleRange({ ports: f.elements.ports.value.trim().replace(/\s/g, '') });
+    const hit = lo ? (d.listeners || []).filter((l) => l.port >= lo && l.port <= hi && (proto === 'both' || l.proto === proto)) : [];
+    $('#rule-port-hint').textContent = !lo ? '' : hit.length
+      ? hit.slice(0, 3).map((l) => `${l.port}: ${l.service || l.process || 'unknown'}${l.owner ? ` (${l.owner})` : ''}`).join(' · ') + (hit.length > 3 ? ` and ${hit.length - 3} more` : '')
+      : 'Nothing listens there right now; the rule still applies once something does.';
+    const prot = (d.protected || []).find((p) => p.port >= lo && p.port <= hi && proto !== 'udp');
+    const always = `This server itself${(d.always_allowed || []).length > 2 ? ' and the whitelist' : ''} always ${mode === 'allow' ? 'gets in' : 'stays allowed unless listed'}.`;
+    $('#rule-note').innerHTML = prot
+      ? `<b>Port ${prot.port} is ${esc(prot.why)}.</b> A change here is undone after two minutes unless you keep it, so a mistake can't lock you out for good. ${esc(always)}`
+      : esc(always);
+  }
+  function ruleFromForm() {
+    const f = $('#rule-form');
+    return {
+      id: pt.edit || Math.random().toString(36).slice(2, 10).replace(/[^a-z0-9]/g, '') || 'r' + Date.now().toString(36),
+      name: f.elements.name.value.trim(),
+      ports: f.elements.ports.value.trim().replace(/\s/g, ''),
+      proto: $('#rule-proto [aria-pressed="true"]').dataset.proto,
+      mode: $('#rule-mode [aria-pressed="true"]').dataset.mode,
+      sources: f.elements.sources.value.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean),
+      enabled: f.elements.enabled.checked,
+    };
+  }
+  const bareRule = ({ id, name, ports, proto, mode, sources, enabled, note }) => ({ id, name, ports, proto, mode, sources: sources || [], enabled, note });
+  async function saveRules(rules, done) {
+    const res = await post('/api/ports', { rules: JSON.stringify(rules.map(bareRule)) });
+    toast(res.trial ? `${done}. Port ${res.ports.join(', ')} is protected: keep the change within two minutes` : done);
+    await loadPorts();
+    return res;
+  }
+  async function submitRule() {
+    const r = ruleFromForm(), btn = $('#rule-submit');
+    const rules = (pt.data.rules || []).filter((x) => x.id !== r.id);
+    const at = (pt.data.rules || []).findIndex((x) => x.id === r.id);
+    rules.splice(at < 0 ? rules.length : at, 0, r);
+    btn.disabled = true;
+    try { await saveRules(rules, `Rule for port ${r.ports} saved`); $('#rule-dialog').close(); }
+    catch (e) { $('#rule-error').textContent = e.message; }
+    btn.disabled = false;
+  }
+  async function deleteRule() {
+    const id = pt.edit, r = (pt.data.rules || []).find((x) => x.id === id);
+    $('#rule-dialog').close();
+    if (!r || !await confirmAction(`Delete the rule for port ${r.ports}?`, 'Everyone can connect to the port again, unless another rule covers it.', 'Delete')) return;
+    try { await saveRules(pt.data.rules.filter((x) => x.id !== id), `Rule for port ${r.ports} deleted`); }
+    catch (e) { toast(`Not deleted: ${e.message}`, false); }
+  }
+  async function toggleRule(input) {
+    const rules = (pt.data.rules || []).map((x) => (x.id === input.dataset.id ? Object.assign({}, x, { enabled: input.checked }) : x));
+    input.disabled = true;
+    try { await saveRules(rules, input.checked ? 'Rule in force' : 'Rule paused'); }
+    catch (e) { input.checked = !input.checked; toast(e.message, false); }
+    input.disabled = false;
+  }
+  async function trialAction(what) {
+    try {
+      await post(`/api/ports/${what}`, {});
+      toast(what === 'confirm' ? 'The rules are kept' : 'The previous rules are back');
+    } catch (e) { toast(e.message, false); }
+    loadPorts();
+  }
+
   // ── settings ────────────────────────────────────────────────────────────
   async function loadSettings() {
     loadEngineSwitches();
@@ -1289,6 +1460,7 @@ Tunnel:  ${tunnel}`],
     attackers: { title: 'Attackers and bans', load: loadAttackers, live: true },
     credentials: { title: 'Captured credentials', load: loadCredentials, live: true },
     services: { title: 'Honeypots and services', load: loadServices, live: true },
+    ports: { title: 'Ports and access', load: loadPorts, live: true },
     containers: { title: 'Containers', load: loadContainers, live: true },
     settings: { title: 'Auto-ban and firewall', load: loadSettings, live: false },
   };
@@ -1366,6 +1538,10 @@ Tunnel:  ${tunnel}`],
     if (cv) { ct.view = cv.dataset.ctview; applyCtView(); writeHash(); if (ct.view === 'map' && ct.data) renderMap(); return; }
     const cf = t.closest('[data-ctfilter]');
     if (cf) { ct.only = cf.dataset.ctfilter; applyCtView(); renderBay(); renderMap(); return; }
+    const ps = t.closest('[data-ptscope]');
+    if (ps) { pt.scope = ps.dataset.ptscope; pressOnly(ps.parentElement, pt.scope, 'ptscope'); renderPorts(); return; }
+    const rp = t.closest('[data-proto], [data-mode]');
+    if (rp && rp.closest('#rule-form')) { pressOnly(rp.parentElement, rp.dataset.proto || rp.dataset.mode, rp.dataset.proto ? 'proto' : 'mode'); ruleHints(); return; }
     const restart = t.closest('[data-restart]');
     if (restart) { pressOnly(restart.parentElement, restart.dataset.restart, 'restart'); return; }
     const range = t.closest('[data-range]');
@@ -1447,6 +1623,21 @@ Tunnel:  ${tunnel}`],
         break;
       }
       case 'engine-on': switchEngine(a.dataset.engine, true); break;
+      case 'rule-new': openRule(null); break;
+      case 'rule-edit': openRule((pt.data.rules || []).find((r) => r.id === a.dataset.id)); break;
+      case 'rule-for': {
+        const l = (pt.data.listeners || []).find((x) => x.port === Number(a.dataset.port) && x.proto === a.dataset.proto);
+        openRule(null, { ports: a.dataset.port, proto: a.dataset.proto, name: l ? (l.owner && !l.owner.includes(':') ? l.owner : l.service || '') : '' });
+        break;
+      }
+      case 'rule-delete': deleteRule(); break;
+      case 'rules-confirm': trialAction('confirm'); break;
+      case 'rules-revert': trialAction('revert'); break;
+      case 'src-add': {
+        const ta = $('#rule-form').elements.sources, have = ta.value.split(/[\s,]+/).filter(Boolean);
+        if (!have.includes(a.dataset.src)) ta.value = [...have, a.dataset.src].join('\n');
+        break;
+      }
       case 'mcp-token': newMCPToken(); break;
       case 'copy': copyFrom(a.dataset.copy, a); break;
       case 'port-remove': {
@@ -1458,6 +1649,7 @@ Tunnel:  ${tunnel}`],
   });
   document.addEventListener('change', (ev) => {
     if (ev.target.matches('[data-action="toggle-service"]')) toggleService(ev.target);
+    if (ev.target.matches('[data-action="rule-toggle"]')) toggleRule(ev.target);
     if (ev.target.matches('[data-action="engine-switch"]')) switchEngine(ev.target.dataset.engine, ev.target.checked, ev.target);
     if (ev.target.id === 'mcp-enabled') saveMCP('enabled', ev.target.checked);
     if (ev.target.id === 'mcp-actions') saveMCP('allow_actions', ev.target.checked);
@@ -1475,6 +1667,8 @@ Tunnel:  ${tunnel}`],
   $('#limits-form').addEventListener('submit', (ev) => { ev.preventDefault(); saveLimits(ev.target); });
   $('#net-form').addEventListener('submit', (ev) => { ev.preventDefault(); createNetwork(ev.target); });
   $('#create-form').addEventListener('submit', (ev) => { ev.preventDefault(); submitCreate(ev.target); });
+  $('#rule-form').addEventListener('submit', (ev) => { ev.preventDefault(); submitRule(); });
+  $('#rule-form').addEventListener('input', (ev) => { $('#rule-error').textContent = ''; if (ev.target.name === 'ports') ruleHints(); });
   $('#snap-form').addEventListener('submit', (ev) => { ev.preventDefault(); const n = ev.target.elements.name.value.trim(); if (n) snapshot('take', n); });
   let searchTimer;
   $('#ct-search').addEventListener('input', (ev) => {

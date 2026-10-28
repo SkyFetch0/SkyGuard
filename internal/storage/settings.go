@@ -229,3 +229,15 @@ func (d *DB) SaveMCPSettings(m MCPSettings) error {
 	}
 	return nil
 }
+
+const keyPortRules = "port_rules"
+
+// PortRules returns the saved port access rules as the JSON the port rules
+// manager wrote ("" when none were ever saved).
+func (d *DB) PortRules() (string, error) {
+	v, _, err := d.getSetting(keyPortRules)
+	return v, err
+}
+
+// SavePortRules stores the port access rules' JSON.
+func (d *DB) SavePortRules(js string) error { return d.setSetting(keyPortRules, js) }

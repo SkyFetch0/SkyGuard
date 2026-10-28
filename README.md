@@ -44,6 +44,8 @@ The dashboard on a server under a week of attack traffic, with 96 Docker contain
 | <img src="docs/screenshots/connections.png" alt="A day by hour heatmap of the last week above the filterable connection log"> **Connections** — day × hour heatmap and the filterable log | <img src="docs/screenshots/honeypots.png" alt="Honeypots with on and off switches and 24-hour activity strips; stealth and passthrough services shown read-only"> **Honeypots** — switched on and off at runtime |
 | <img src="docs/screenshots/containers-table.png" alt="The patch bay table view: containers in rows, networks in columns, cables from each container to its networks"> **Table view** — the patch bay for precise work | <img src="docs/screenshots/settings.png" alt="Auto-ban settings and the container engine switches with their sockets and versions"> **Settings** — auto-ban, container engines, firewall rules |
 
+<p align="center"><img src="docs/screenshots/ports.png" alt="Ports and access: every port the server listens on with the container or program behind it, databases open to the internet flagged, and the access rules with their drop counters" width="100%"></p>
+
 <p align="center"><img src="docs/screenshots/phone-overview.png" alt="The overview on a phone" width="240">&nbsp;&nbsp;&nbsp;<img src="docs/screenshots/phone-containers.png" alt="The network map on a phone" width="240"></p>
 
 ---
@@ -114,6 +116,7 @@ Passthrough services only apply steps 1–4 (real users must not be rate-limited
 | 📦 **Storage** | Single-file SQLite, WAL mode, auto-purge old records |
 | 🌐 **Dashboard** | Browser UI with live polling + JSON REST API |
 | 🤖 **MCP** | A built-in Model Context Protocol server: Claude, ChatGPT, Cursor or any MCP client can read attacks, bans, credentials and containers, and act when you allow it |
+| 🔒 **Port access** | Per-port rules for anything listening on the host (databases, admin panels, Docker and Incus ports): *only these sources* or *everyone except these*, IPv4 and IPv6, with a self-undoing trial on SSH and the dashboard |
 | 🧩 **Containers** | Opt-in Docker and Incus management, switched on from the panel: a network map to wire containers together, create / start / stop / pause / remove, published ports, restart policy, limits, logs, Incus snapshots |
 | 🐳 **Docker** | Multi-stage image (`golang:1.27` → `debian:trixie-slim` with iptables-legacy + iptables-nft), built-in health check |
 | ⚙️ **Config** | Single YAML file; hot-toggleable services (`enabled: false`) |
@@ -408,6 +411,92 @@ leaves those listeners off. Pick one of:
 SkyGuard's listeners bind every address (`:80`), so the proxy cannot keep
 `127.0.0.1:80` either: in option 2 it moves to other ports.
 
+## Port access rules
+
+A server usually listens on more than its web ports: a database published by
+a Compose file, Elasticsearch and Kibana, an admin panel, a game server.
+`ss -tulnp` shows them; anything on `0.0.0.0` or `[::]` is open to the whole
+internet unless something stops it. The **Ports** screen lists each of them
+with what is behind it and lets you put a rule in front of it:
+
+- **Only these sources**: the listed addresses and networks get in, everyone
+  else is dropped. `private` stands for every internal range (10/8,
+  172.16/12, 192.168/16, 100.64/10, fc00::/7, fe80::/10): containers, the
+  LAN, Tailscale and other VPNs. An empty list means *this server only*.
+- **Everyone except these**: the listed sources are dropped, the rest get in.
+
+The server itself (loopback) always gets in, and so does `whitelist.ips` from
+the config on every *only these* rule. Rules drop new connections only, so a
+session that is already open is never cut. A port can be one number or a
+range (`9200-9300`), TCP, UDP or both.
+
+**What a rule covers.** Host programs (sshd, pure-ftpd, a MySQL installed
+with apt), Incus proxy devices (the default kind; one with `nat=true` is
+forwarded by Incus's own nftables rules and is not covered), and Docker's
+published ports, which never
+pass through INPUT: Docker forwards them, so the rules also sit in
+`DOCKER-USER`, the place Docker keeps for this, and match the port as it is
+published on the host (`-p 27017:27017` → rule for 27017), before Docker
+rewrites it. Containers that talk to each other over a Docker network are
+not affected, and neither are a container's own outbound connections. Both
+IPv4 and IPv6 are covered (a `[::]:27017` listener is reached over IPv6 too).
+
+**You cannot lock yourself out for good.** Port 22, any other port sshd
+listens on (when SkyGuard can see the host's processes), the stealth ports and the dashboard's port are *protected*: a
+change that restricts one of them is put in force at once, but saved only
+when you press *Keep these rules*. If you don't within two minutes, because
+the change cut your own connection, the previous rules come back by
+themselves. The saved rules are applied again at every start, and checked
+every minute: if a `firewalld` reload or an `iptables -F` removed them, they
+are put back.
+
+Under the hood: two chains, `SKYGUARD-PORTS` (jumped to from `INPUT`) and
+`SKYGUARD-PORTS-FWD` (from `DOCKER-USER`), right after the ban chain, so a
+ban still wins and a rule comes before the host's own ACCEPT rules. Each
+rule's DROP carries the comment `sg:<id>`, which is where the *dropped*
+counters come from:
+
+```bash
+sudo iptables -S SKYGUARD-PORTS
+sudo iptables -L SKYGUARD-PORTS-FWD -n -v      # packet counts per rule
+```
+
+Port rules need `iptables` on the host (any backend, also when bans go
+through `ufw` or `auto_ban.method: none`); without it the screen says so and
+refuses changes. SkyGuard in Docker needs `network_mode: host` and
+`NET_ADMIN`, which the shipped compose file already has; it then sees the
+host's ports but not the programs behind them (those are named when SkyGuard
+runs natively, or for containers once container management is on).
+
+### Locking down a busy server
+
+1. **Open the Ports screen** (*Reachable from outside*). Everything there is
+   reachable from the internet; the yellow tags mark databases and admin
+   interfaces that anyone can reach.
+2. **Close what nobody outside needs at the source.** If only containers on
+   the same server use a database, don't publish its port, or publish it on
+   loopback only. In a Compose file:
+
+   ```yaml
+   ports:
+     - "127.0.0.1:27017:27017"   # instead of "27017:27017"
+   ```
+
+   Other containers reach it over their shared network by service name
+   (`mongodb://mongo:27017`), which needs no published port at all.
+3. **Put a rule on what must stay reachable from somewhere.** For example
+   MongoDB used by an app on another server and by your office:
+   *Restrict…* on 27017 → *Only these sources* → `198.51.100.20`,
+   `203.0.113.0/24`, `private`. For Elasticsearch and its cluster port, one
+   rule for `9200-9300`.
+4. **Leave public what is meant to be public** (80/443 of a reverse proxy, a
+   game server). Use *Everyone except these* there to keep known abusers out
+   of one service without banning them everywhere.
+5. **SSH**: leave 22 to the stealth port and the honeypot. If you do restrict
+   it, keep your own address in the list and press *Keep these rules*.
+6. **Check from outside** (another machine): `nc -vz your-server 27017` now
+   times out, and the rule's *dropped* counter goes up.
+
 ## AI assistants (MCP)
 
 SkyGuard has a built-in [Model Context Protocol](https://modelcontextprotocol.io) server, so an AI assistant can answer "who attacked me last night?", "is anything on port 80 besides the reverse proxy?" or "ban the address that keeps trying root" from SkyGuard's own data. It is built on the official Go SDK and served at `/mcp` on the dashboard's address as stateless Streamable HTTP.
@@ -445,6 +534,7 @@ SkyGuard has a built-in [Model Context Protocol](https://modelcontextprotocol.io
 | `list_bans` | Active bans and when they lift | read |
 | `list_credentials` | Most tried usernames, passwords and pairs | read |
 | `get_firewall` | The SKYGUARD chain's rules and Docker coverage | read |
+| `list_ports` | Every listening port with its owner, reach and risk, and the port access rules with their drop counts | read |
 | `list_containers` / `get_container` / `get_container_logs` | Containers, networks, port conflicts; one container; its last log lines | read |
 | `ban_ip` / `unban_ip` | Ban for a duration (default 24h, `0` permanent) or lift a ban | action |
 | `set_honeypot` | Open or close a honeypot's port | action |
@@ -477,6 +567,7 @@ ssh -L 9090:127.0.0.1:9090 user@your-server
 - **Captured credentials** — most tried usernames and passwords, attempts per honeypot and over time, the most frequent pairs.
 - **Honeypots and services** — switch each honeypot on or off at runtime (the listener opens or closes at once; the choice survives restarts until you change that honeypot in the config file), with 24-hour activity per service. Stealth and passthrough services are shown read-only: turning them off from a panel you usually reach through them could cut your own session.
 - **Containers** (opt-in, see [Containers](#containers-docker-and-incus)) — a *network map* in the manner of a network simulator: networks are switches, containers are devices, memberships are cables. Select a container and pull a cable from its plug: drop it on a switch to join that network, or on another container to give the two a network in common (join one of the other's, or a new one for the pair); clicking *Connect…* and then the target works too. Click a cable to unplug it. Built to stay readable with a hundred containers: a force layout that keeps each Compose project together on a soft outline, numbered replicas (`queue-worker-1…40`) folded into one stacked device until you expand them, labels that give way to each other as you zoom out, search that dims everything else and brings the first match into view, a minimap, focus on a node's own cables when selected, and dragged positions remembered per browser. A *Table* view keeps the patch bay for precise work. *New container* pulls an image (Docker) or downloads one from images.linuxcontainers.org (Incus) and starts it with ports, network, environment, restart policy and limits. The side sheet starts, stops, restarts, pauses and removes; edits ports, restart policy and memory/CPU limits; shows the last 200 log lines; and for Incus takes, rolls back and deletes snapshots. A host-port table names whoever holds each port (SkyGuard listeners included) and flags conflicts; *Open to the internet* lists every container port bound on all addresses and whether a ban stops traffic there.
+- **Ports and access** — every port that takes connections on the host, who is behind it (program, container, SkyGuard service) and whether the internet can reach it, with databases and admin panels that anyone can reach flagged; the access rules with their drop counters, a rule editor, and the trial banner that undoes a change to SSH or the dashboard unless you keep it. See [Port access rules](#port-access-rules).
 - **Auto-ban and firewall** — switch, threshold stepper, ban length, and the SKYGUARD chain's current rules.
 - **IP detail** — a side sheet with score, daily activity, credentials and connections for any address.
 
@@ -507,6 +598,10 @@ State-changing `POST` endpoints require the header `X-SkyGuard-Request: 1` (CSRF
 | `GET`/`POST` | `/api/settings` | Auto-ban settings (partial updates) |
 | `POST` | `/api/ban` | `ip`, `duration` (`24h`, `7d`, `0` = permanent), `permanent`, `reason` — whitelisted IPs are refused |
 | `POST` | `/api/unban` | `ip` — also resets the IP's score |
+| `GET` | `/api/ports` | Listening ports (`listeners`), the access rules with `dropped` counts, `protected` ports, a running trial (`unsaved`, `trial_deadline`), `always_allowed`, `client_ip` |
+| `POST` | `/api/ports` | `rules` — the whole rule list as JSON (`id`, `name`, `ports` `27017` or `9200-9300`, `proto` `tcp`/`udp`/`both`, `mode` `allow`/`deny`, `sources`, `enabled`); returns `trial` and its `deadline` when a protected port changed |
+| `POST` | `/api/ports/confirm` | Keep the rules of a running trial |
+| `POST` | `/api/ports/revert` | End a running trial now and bring the saved rules back |
 | `GET` | `/api/containers` | `enabled`, engines and their state, containers, networks, `host_ports` (every claimant per port, conflicts first), `ban_coverage` |
 | `GET` | `/api/containers/inspect?engine=&id=` | One container with restart policy, limits, mounts |
 | `POST` | `/api/containers/action` | `engine`, `id`, `action` = `start` \| `stop` \| `restart` |

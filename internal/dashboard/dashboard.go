@@ -19,6 +19,7 @@ import (
 	"github.com/skyguard/skyguard/internal/containers"
 	"github.com/skyguard/skyguard/internal/firewall"
 	"github.com/skyguard/skyguard/internal/netutil"
+	"github.com/skyguard/skyguard/internal/portrules"
 	"github.com/skyguard/skyguard/internal/storage"
 )
 
@@ -63,9 +64,12 @@ type Dashboard struct {
 	settings *storage.Settings
 	bans     Controller
 	ctr      *containers.Manager // nil unless the config enables an engine
+	ports    *portrules.Manager  // nil until the server sets it
 	mcp      *mcpService
 	logger   *slog.Logger
 	server   *http.Server
+
+	portListeners func(context.Context) []portrules.Listener
 }
 
 // New creates a Dashboard instance. Call Start to begin serving.
@@ -176,6 +180,7 @@ func (d *Dashboard) routes() http.Handler {
 	api.HandleFunc("POST /api/ban", d.csrf(d.handleBan))
 	api.HandleFunc("POST /api/unban", d.csrf(d.handleUnban))
 	d.containerRoutes(api)
+	d.portRoutes(api)
 	d.mcpRoutes(api)
 
 	var protected http.Handler = api

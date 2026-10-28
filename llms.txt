@@ -11,3 +11,4 @@
 
 - [USAGE.md](USAGE.md): configuration reference, dashboard, REST API, troubleshooting.
 - [configs/skyguard.example.yaml](configs/skyguard.example.yaml): the annotated configuration file.
+- [README.md#port-access-rules](README.md#port-access-rules): per-port allow/deny rules for any service on the host (databases, Docker ports), and a guide to locking down a busy server.

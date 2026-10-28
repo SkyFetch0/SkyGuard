@@ -786,9 +786,9 @@ Authenticate using the `username` and `password` values from `dashboard.auth` in
 
 ### Dashboard Features
 
-Seven screens, reached from the icon rail (a bottom bar on a phone). Each screen's state lives in the URL
+Eight screens, reached from the icon rail (a bottom bar on a phone). Each screen's state lives in the URL
 hash, so a view can be bookmarked (`#overview?range=7d`, `#connections?ip=203.0.113.9&action=dropped`,
-`#containers?engine=incus&view=table`). The overview, bans, credentials, honeypots and containers screens
+`#containers?engine=incus&view=table`). The overview, bans, credentials, honeypots, ports and containers screens
 refresh every 30 seconds while the tab is visible.
 
 | Screen | What it answers | |
@@ -798,6 +798,7 @@ refresh every 30 seconds while the tab is visible.
 | **Attackers and bans** | Who is the biggest threat? Scores against the auto-ban threshold, active bans with unban, ban reasons. | [picture](docs/screenshots/attackers.png) |
 | **Captured credentials** | What are bots trying? Top usernames and passwords, attempts per honeypot over time, frequent pairs. | [picture](docs/screenshots/credentials.png) |
 | **Honeypots** | Which traps are open? A switch per honeypot (applies at once, survives restarts), 24-hour activity. | [picture](docs/screenshots/honeypots.png) |
+| **Ports and access** | What can the internet reach, and who may? Every listening port with its owner and reach, databases and admin panels open to all flagged, per-port access rules with drop counts, the trial that undoes a change to SSH or the dashboard unless kept. See [README › Port access rules](README.md#port-access-rules). | [picture](docs/screenshots/ports.png) |
 | **Containers** | What runs next to SkyGuard and how is it wired? The network map, the patch-bay table, host ports, open ports and ban coverage. | [picture](docs/screenshots/containers-map.png) |
 | **Settings** | Auto-ban switch, threshold and ban length; container engines; the SKYGUARD chain's rules. | [picture](docs/screenshots/settings.png) |
 

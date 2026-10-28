@@ -323,6 +323,9 @@ SkyGuard <commit> is running (healthy) on <hostname>.
 ```bash
 cd /opt/skyguard && docker compose down
 iptables -D INPUT -j SKYGUARD; iptables -D DOCKER-USER -j SKYGUARD 2>/dev/null; iptables -F SKYGUARD; iptables -X SKYGUARD
+# port access rules (the Ports screen), if any were made:
+iptables -D INPUT -j SKYGUARD-PORTS; iptables -D DOCKER-USER -j SKYGUARD-PORTS-FWD 2>/dev/null
+iptables -F SKYGUARD-PORTS; iptables -X SKYGUARD-PORTS; iptables -F SKYGUARD-PORTS-FWD; iptables -X SKYGUARD-PORTS-FWD
 # if you blocked 22 in step 9:
 iptables -D INPUT ! -i lo -p tcp --dport 22 -j DROP
 ```

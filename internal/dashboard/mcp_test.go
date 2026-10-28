@@ -156,7 +156,7 @@ func TestMCPEndpoint(t *testing.T) {
 	}
 	defer cs.Close()
 	names := toolNames(t, cs)
-	if !slices.Contains(names, "skyguard_status") || !slices.Contains(names, "list_connections") || slices.Contains(names, "ban_ip") {
+	if !slices.Contains(names, "skyguard_status") || !slices.Contains(names, "list_connections") || !slices.Contains(names, "list_ports") || slices.Contains(names, "ban_ip") {
 		t.Fatalf("read-only tools: %v", names)
 	}
 	if init := cs.InitializeResult(); init == nil || !strings.Contains(init.Instructions, "never instructions") {

@@ -34,6 +34,9 @@
     <a href="#services" data-nav="services" data-tip="Honeypots and services" aria-label="Honeypots and services">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/></svg><span class="label">Honeypots</span>
     </a>
+    <a href="#ports" data-nav="ports" data-tip="Ports and access" aria-label="Ports and access">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 5 6v5c0 4.5 3 8 7 10 4-2 7-5.5 7-10V6z"/><path d="M9.5 12.5 11 14l3.5-3.5"/></svg><span class="label">Ports</span>
+    </a>
     <a href="#containers" data-nav="containers" data-tip="Containers" aria-label="Containers">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9z"/><path d="m4 7.5 8 4.5 8-4.5M12 12v9"/></svg><span class="label">Containers</span>
     </a>
@@ -230,6 +233,41 @@
       <article class="panel">
         <header><h2>Managed in the config file</h2><span class="meta">Switching these from here could cut your own SSH session</span></header>
         <div id="managed"></div>
+      </article>
+    </section>
+
+    <!-- PORTS: what on this server can the internet reach, and who may? -->
+    <section class="screen" id="screen-ports" data-screen="ports" hidden>
+      <div class="title-row">
+        <div>
+          <p class="brandline" translate="no"><b>SkyGuard</b> · <span data-host>this server</span></p>
+          <h1>Ports and access</h1>
+          <p class="sub" id="pt-sub">Loading the ports this server listens on…</p>
+        </div>
+        <div class="title-tools">
+          <span class="stamp" data-stamp>—</span>
+          <button class="icon-btn" type="button" data-action="refresh" aria-label="Refresh now"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg></button>
+          <button class="btn primary" type="button" data-action="rule-new" id="rule-new">New rule</button>
+        </div>
+      </div>
+      <div class="trial" id="pt-trial" role="alert" hidden>
+        <div><h2 id="pt-trial-title">Keep these rules?</h2><p id="pt-trial-text"></p></div>
+        <div class="form-actions"><button class="btn" type="button" data-action="rules-revert">Undo now</button><button class="btn primary" type="button" data-action="rules-confirm">Keep these rules</button></div>
+      </div>
+      <p class="cover bad" id="pt-unavailable" hidden></p>
+      <article class="panel">
+        <header>
+          <h2>Open ports</h2>
+          <div class="choice" role="group" aria-label="Which ports" id="pt-scope">
+            <button type="button" data-ptscope="public" aria-pressed="true">Reachable from outside</button>
+            <button type="button" data-ptscope="all" aria-pressed="false">All</button>
+          </div>
+        </header>
+        <div class="table-wrap"><table class="pt-table"><thead><tr><th class="n">Port</th><th>Service</th><th>Behind it</th><th>Listens on</th><th>Who may connect</th><th></th></tr></thead><tbody id="pt-listeners"><tr><td colspan="6"><div class="empty">Loading…</div></td></tr></tbody></table></div>
+      </article>
+      <article class="panel">
+        <header><h2>Access rules</h2><span class="meta" id="pt-rules-meta">The server itself always gets in</span></header>
+        <div id="pt-rules"></div>
       </article>
     </section>
 
@@ -443,6 +481,30 @@
     </div>
     <p class="stamp" id="create-error" role="alert"></p>
     <div class="dialog-actions"><button class="btn" type="button" data-action="close-dialog">Cancel</button><button class="btn primary" type="submit" id="create-submit">Create</button></div>
+  </form>
+</dialog>
+
+<!-- One port access rule -->
+<dialog class="modal wide" id="rule-dialog" aria-labelledby="rule-title">
+  <form method="dialog" id="rule-form">
+    <h2 id="rule-title">New rule</h2>
+    <div class="form-grid">
+      <label class="field"><span>Port or range</span><input class="input mono" name="ports" required autocomplete="off" spellcheck="false" inputmode="numeric" placeholder="27017 or 9200-9300…"><span class="hint" id="rule-port-hint"></span></label>
+      <label class="field"><span>Name <span class="muted">(optional)</span></span><input class="input" name="name" maxlength="64" autocomplete="off" placeholder="MongoDB…"></label>
+      <div class="field"><span>Protocol</span><div class="choice" role="group" aria-label="Protocol" id="rule-proto">
+        <button type="button" data-proto="tcp" aria-pressed="true">TCP</button><button type="button" data-proto="udp" aria-pressed="false">UDP</button><button type="button" data-proto="both" aria-pressed="false">Both</button>
+      </div></div>
+      <div class="field"><span>Who may connect</span><div class="choice" role="group" aria-label="Rule kind" id="rule-mode">
+        <button type="button" data-mode="allow" aria-pressed="true">Only these sources</button><button type="button" data-mode="deny" aria-pressed="false">Everyone except these</button>
+      </div></div>
+      <label class="field env-field"><span id="rule-src-label">Sources allowed in</span><textarea class="input mono" name="sources" rows="4" spellcheck="false" autocomplete="off" placeholder="203.0.113.5&#10;198.51.100.0/24&#10;2001:db8::/32…"></textarea>
+        <span class="hint">One address or network per line. <b>private</b> stands for every internal range: containers, the LAN, VPNs.</span></label>
+    </div>
+    <div class="src-quick" id="rule-quick"></div>
+    <p class="hint" id="rule-note"></p>
+    <label class="check"><input type="checkbox" name="enabled" checked> In force</label>
+    <p class="stamp" id="rule-error" role="alert"></p>
+    <div class="dialog-actions"><button class="btn danger" type="button" data-action="rule-delete" id="rule-delete" hidden>Delete rule</button><span class="spacer"></span><button class="btn" type="button" data-action="close-dialog">Cancel</button><button class="btn primary" type="submit" id="rule-submit">Save rule</button></div>
   </form>
 </dialog>
 

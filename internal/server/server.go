@@ -14,10 +14,12 @@ import (
 
 	"github.com/skyguard/skyguard/internal/analysis"
 	"github.com/skyguard/skyguard/internal/config"
+	"github.com/skyguard/skyguard/internal/containers"
 	"github.com/skyguard/skyguard/internal/dashboard"
 	"github.com/skyguard/skyguard/internal/firewall"
 	"github.com/skyguard/skyguard/internal/honeypot"
 	"github.com/skyguard/skyguard/internal/netutil"
+	"github.com/skyguard/skyguard/internal/portrules"
 	"github.com/skyguard/skyguard/internal/proxy"
 	"github.com/skyguard/skyguard/internal/stealth"
 	"github.com/skyguard/skyguard/internal/storage"
@@ -69,6 +71,9 @@ type Server struct {
 	logger    *slog.Logger
 	whitelist *netutil.IPSet
 	blacklist *netutil.IPSet
+	ports     *portrules.Manager
+	portGuard *firewall.PortGuard // nil without a usable iptables
+	ctr       *containers.Manager // nil without the dashboard
 
 	eventLogger *honeypot.EventLogger
 
@@ -129,9 +134,12 @@ func New(cfg *config.Config, db *storage.DB, logger *slog.Logger) (*Server, erro
 		sem:       make(chan struct{}, maxConcurrentConns),
 	}
 
+	s.ports = s.portRules()
 	if cfg.Dashboard.Enabled {
 		s.dash = dashboard.New(cfg.Dashboard, db, fw, settings, s, logger)
-		s.dash.SetContainers(s.containerManager())
+		s.ctr = s.containerManager()
+		s.dash.SetContainers(s.ctr)
+		s.dash.SetPortRules(s.ports, s.PortListeners)
 	}
 	s.warnRiskyConfig()
 	return s, nil
@@ -206,6 +214,11 @@ func (s *Server) Start(ctx context.Context) error {
 	// Re-apply bans that are still active: firewall rules do not survive a
 	// reboot (or a container restart without persistence), the database does.
 	s.syncBans()
+	// A rule set the firewall refuses is reported, not fatal: the honeypots
+	// and the dashboard (where it can be fixed) still start.
+	if err := s.ports.Start(); err != nil {
+		s.logger.Error("port access rules are not in force", "error", err)
+	}
 
 	if s.dash != nil {
 		if err := s.dash.Start(ctx); err != nil {
@@ -287,8 +300,8 @@ func (s *Server) untrack(conn net.Conn, rt *svcRuntime) {
 	s.mu.Unlock()
 }
 
-// maintenanceLoop lifts expired bans every minute and enforces data
-// retention every hour.
+// maintenanceLoop lifts expired bans and re-checks the port rules every
+// minute, and enforces data retention every hour.
 func (s *Server) maintenanceLoop(ctx context.Context) {
 	defer s.wg.Done()
 
@@ -306,6 +319,7 @@ func (s *Server) maintenanceLoop(ctx context.Context) {
 			return
 		case <-banTicker.C:
 			s.releaseExpiredBans()
+			s.ports.Maintain()
 		case <-retentionTicker.C:
 			s.enforceRetention()
 		}

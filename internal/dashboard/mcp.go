@@ -466,6 +466,15 @@ func (m *mcpService) register() {
 			return map[string]any{"coverage": d.banCoverage(), "rules": rules}, nil
 		})
 
+	addTool(m, false, &mcp.Tool{Name: "list_ports", Title: "Ports and access rules",
+		Description: "Every port that takes connections on this server (bound addresses, the program or container behind it, whether it is reachable from outside, and a risk hint such as \"database\"), and the port access rules in force: which sources may reach which ports, with how many packets each rule dropped. Read-only: rules are changed by the operator in the dashboard."},
+		func(ctx context.Context, _ string, _ mcpNoInput) (any, error) {
+			if d.ports == nil {
+				return nil, errors.New("port rules are not available on this server")
+			}
+			return map[string]any{"rules": d.ports.View(), "listeners": d.listeners(ctx)}, nil
+		})
+
 	addTool(m, false, &mcp.Tool{Name: "list_containers", Title: "Containers and networks",
 		Description: "The Docker containers and Incus instances on this server with their state, image, Compose project, published ports and networks (with addresses); the networks; and host-port conflicts. Needs container management to be switched on in SkyGuard's settings."},
 		func(ctx context.Context, _ string, in mcpEngineIn) (any, error) {
