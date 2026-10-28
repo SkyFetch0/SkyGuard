@@ -473,17 +473,14 @@ runs natively, or for containers once container management is on).
 1. **Open the Ports screen** (*Reachable from outside*). Everything there is
    reachable from the internet; the yellow tags mark databases and admin
    interfaces that anyone can reach.
-2. **Close what nobody outside needs at the source.** If only containers on
-   the same server use a database, don't publish its port, or publish it on
-   loopback only. In a Compose file:
-
-   ```yaml
-   ports:
-     - "127.0.0.1:27017:27017"   # instead of "27017:27017"
-   ```
-
-   Other containers reach it over their shared network by service name
-   (`mongodb://mongo:27017`), which needs no published port at all.
+2. **Close what nobody outside needs at the source.** If only programs and
+   containers on the same server use a database, it does not need to be
+   published on every address. *Close…* on its row (see
+   [Closing a container port](#closing-a-container-port)) offers:
+   - **This server only**: published on `127.0.0.1`, the way
+     `"127.0.0.1:27017:27017"` in a Compose file does it;
+   - **Not published**: other containers reach it over their shared network
+     by service name (`mongodb://mongo:27017`), nothing else does.
 3. **Put a rule on what must stay reachable from somewhere.** For example
    MongoDB used by an app on another server and by your office:
    *Restrict…* on 27017 → *Only these sources* → `198.51.100.20`,
@@ -496,6 +493,51 @@ runs natively, or for containers once container management is on).
    it, keep your own address in the list and press *Keep these rules*.
 6. **Check from outside** (another machine): `nc -vz your-server 27017` now
    times out, and the rule's *dropped* counter goes up.
+
+### Closing a container port
+
+A rule filters who reaches a port; often the port should not be open at all.
+For a Docker container or an Incus instance (with container management on),
+*Close…* on the Ports screen, in the container's sheet next to each published
+port, or in the containers screen's *Open to the internet* list, changes the
+publication itself:
+
+| Choice | What changes | Who still connects |
+|---|---|---|
+| This server only | published on `127.0.0.1` | programs on the server (`127.0.0.1:27017`), containers by name |
+| Not published | no host port | containers on its networks, as `service:port` |
+| Everyone (for a port that is local only) | published on every address again | anyone, unless a rule says otherwise |
+
+The dialog says beforehand which containers share a network with it and the
+name they reach it by; on Docker's default `bridge` network names do not
+resolve, and it tells you to put the containers on a shared network first.
+Docker cannot change an existing container's ports, so the container is
+recreated from the same image with the same settings, volumes and networks
+(it restarts once; if the new one fails, the old one is put back). Incus
+changes the proxy device on the running instance.
+
+**Compose projects.** `docker compose up` recreates a container from its
+compose file, which would bring the old port back. So for a container that
+Compose made, the same change is made in the file it came from (Compose
+records the path and the service in the container's labels): only that
+port's line, with comments and formatting kept, quoted as Compose advises,
+and the file as it was saved next to it as `docker-compose.yml.skyguard.bak`.
+The dialog shows the exact lines before anything is written, and the box can
+be unticked. Removing a service's last port removes its `ports:` key too.
+
+```diff
+     ports:
+-      - "27017:27017"   # database
++      - "127.0.0.1:27017:27017"   # database
+```
+
+The file is left alone, and the dialog shows the line to write by hand,
+when the edit cannot be made with certainty: the port comes from a variable
+(`"${PORT}:27017"`), is part of a range, the list is written on one line
+(`ports: ["27017:27017"]`), or the file is not visible to SkyGuard. Running
+SkyGuard in Docker, it sees only what is mounted into it: mount the folder
+your projects live in at the same path (`- /opt:/opt` in SkyGuard's
+`docker-compose.yml`, commented there).
 
 ## AI assistants (MCP)
 
@@ -567,7 +609,7 @@ ssh -L 9090:127.0.0.1:9090 user@your-server
 - **Captured credentials** — most tried usernames and passwords, attempts per honeypot and over time, the most frequent pairs.
 - **Honeypots and services** — switch each honeypot on or off at runtime (the listener opens or closes at once; the choice survives restarts until you change that honeypot in the config file), with 24-hour activity per service. Stealth and passthrough services are shown read-only: turning them off from a panel you usually reach through them could cut your own session.
 - **Containers** (opt-in, see [Containers](#containers-docker-and-incus)) — a *network map* in the manner of a network simulator: networks are switches, containers are devices, memberships are cables. Select a container and pull a cable from its plug: drop it on a switch to join that network, or on another container to give the two a network in common (join one of the other's, or a new one for the pair); clicking *Connect…* and then the target works too. Click a cable to unplug it. Built to stay readable with a hundred containers: a force layout that keeps each Compose project together on a soft outline, numbered replicas (`queue-worker-1…40`) folded into one stacked device until you expand them, labels that give way to each other as you zoom out, search that dims everything else and brings the first match into view, a minimap, focus on a node's own cables when selected, and dragged positions remembered per browser. A *Table* view keeps the patch bay for precise work. *New container* pulls an image (Docker) or downloads one from images.linuxcontainers.org (Incus) and starts it with ports, network, environment, restart policy and limits. The side sheet starts, stops, restarts, pauses and removes; edits ports, restart policy and memory/CPU limits; shows the last 200 log lines; and for Incus takes, rolls back and deletes snapshots. A host-port table names whoever holds each port (SkyGuard listeners included) and flags conflicts; *Open to the internet* lists every container port bound on all addresses and whether a ban stops traffic there.
-- **Ports and access** — every port that takes connections on the host, who is behind it (program, container, SkyGuard service) and whether the internet can reach it, with databases and admin panels that anyone can reach flagged; the access rules with their drop counters, a rule editor, and the trial banner that undoes a change to SSH or the dashboard unless you keep it. See [Port access rules](#port-access-rules).
+- **Ports and access** — every port that takes connections on the host, who is behind it (program, container, SkyGuard service) and whether the internet can reach it, with databases and admin panels that anyone can reach flagged; *Close…* to publish a container's port on this server only or not at all (the compose file included), the access rules with their drop counters, a rule editor, and the trial banner that undoes a change to SSH or the dashboard unless you keep it. See [Port access rules](#port-access-rules).
 - **Auto-ban and firewall** — switch, threshold stepper, ban length, and the SKYGUARD chain's current rules.
 - **IP detail** — a side sheet with score, daily activity, credentials and connections for any address.
 
@@ -603,6 +645,8 @@ State-changing `POST` endpoints require the header `X-SkyGuard-Request: 1` (CSRF
 | `POST` | `/api/ports/confirm` | Keep the rules of a running trial |
 | `POST` | `/api/ports/revert` | End a running trial now and bring the saved rules back |
 | `GET` | `/api/containers` | `enabled`, engines and their state, containers, networks, `host_ports` (every claimant per port, conflicts first), `ban_coverage` |
+| `GET` | `/api/containers/port-plan?engine=&id=&host_port=&proto=&action=` | What a port action would do: the ports afterwards, who reaches it by name, and the `compose` edit (`file`, `line`, `before`, `after`, `ok`, `reason`, `manual`) |
+| `POST` | `/api/containers/port` | `engine`, `id`, `host_port`, `proto`, `action` = `local` \| `public` \| `remove`, `compose=1` to edit the compose file too; returns `container` and `plan` |
 | `GET` | `/api/containers/inspect?engine=&id=` | One container with restart policy, limits, mounts |
 | `POST` | `/api/containers/action` | `engine`, `id`, `action` = `start` \| `stop` \| `restart` |
 | `POST` | `/api/containers/connect` | `engine`, `id`, `network`, `create=1` to create the network first |

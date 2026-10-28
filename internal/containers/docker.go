@@ -11,6 +11,7 @@ import (
 	"maps"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -362,6 +363,20 @@ func (d *Docker) Inspect(ctx context.Context, id string) (*Container, error) {
 		Created: in.Created,
 		Project: project,
 		Self:    d.selfID != "" && in.ID == d.selfID,
+	}
+	if project != "" {
+		c.ComposeService, _ = labels["com.docker.compose.service"].(string)
+		dir, _ := labels["com.docker.compose.project.working_dir"].(string)
+		files, _ := labels["com.docker.compose.project.config_files"].(string)
+		for _, f := range strings.Split(files, ",") {
+			if f = strings.TrimSpace(f); f == "" {
+				continue
+			}
+			if !filepath.IsAbs(f) && dir != "" {
+				f = filepath.Join(dir, f)
+			}
+			c.ComposeFiles = append(c.ComposeFiles, f)
+		}
 	}
 	if m := str(in.HostConfig, "NetworkMode"); m == "host" || m == "none" || strings.HasPrefix(m, "container:") {
 		c.NetworkMode = m

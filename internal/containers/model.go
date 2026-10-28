@@ -69,11 +69,13 @@ type Container struct {
 	Self        bool       `json:"self,omitempty"`         // SkyGuard's own container
 
 	// Filled in by Inspect only.
-	Restart  string   `json:"restart,omitempty"`
-	MemoryMB int64    `json:"memory_mb"` // 0 = no limit
-	CPUs     float64  `json:"cpus"`      // 0 = no limit
-	Mounts   []string `json:"mounts,omitempty"`
-	EnvCount int      `json:"env_count,omitempty"`
+	Restart        string   `json:"restart,omitempty"`
+	ComposeService string   `json:"compose_service,omitempty"`
+	ComposeFiles   []string `json:"compose_files,omitempty"` // as Compose recorded them, on the host
+	MemoryMB       int64    `json:"memory_mb"`               // 0 = no limit
+	CPUs           float64  `json:"cpus"`                    // 0 = no limit
+	Mounts         []string `json:"mounts,omitempty"`
+	EnvCount       int      `json:"env_count,omitempty"`
 }
 
 // Network is a Docker network or an Incus network.

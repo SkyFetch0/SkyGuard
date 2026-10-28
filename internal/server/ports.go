@@ -84,7 +84,7 @@ func (s *Server) PortListeners(ctx context.Context) []portrules.Listener {
 		for _, c := range s.ctr.Snapshot(ctx).Containers {
 			for _, p := range c.Ports {
 				if p.HostPort > 0 && c.Running {
-					claims = append(claims, portrules.Claim{Proto: p.Proto, Port: p.HostPort, HostIP: p.HostIP, Owner: c.Name, Kind: c.Engine})
+					claims = append(claims, portrules.Claim{Proto: p.Proto, Port: p.HostPort, HostIP: p.HostIP, Owner: c.Name, Kind: c.Engine, ID: c.ID})
 				}
 			}
 		}

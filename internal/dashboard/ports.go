@@ -40,7 +40,10 @@ func (d *Dashboard) handlePorts(w http.ResponseWriter, r *http.Request) {
 		portrules.View
 		Listeners []portrules.Listener `json:"listeners"`
 		ClientIP  string               `json:"client_ip"`
-	}{d.ports.View(), d.listeners(r.Context()), netutil.HostIP(r.RemoteAddr)})
+		// container ports can be closed at the source: published on
+		// loopback only, or not at all
+		ContainersManaged bool `json:"containers_managed"`
+	}{d.ports.View(), d.listeners(r.Context()), netutil.HostIP(r.RemoteAddr), d.ctr != nil && d.ctr.AnyEnabled() && !d.ctr.ReadOnly()})
 }
 
 // handleSetPorts replaces the rule set with the JSON list in "rules".

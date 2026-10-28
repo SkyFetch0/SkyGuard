@@ -381,6 +381,88 @@
     loadServices();
   }
 
+  // ── closing a container port at the source ──────────────────────────────
+  // One published port of one container: on this server only (127.0.0.1), on every address again,
+  // or not published at all; for a Compose container the compose file gets the same change.
+  const cp = { arg: null, plan: null, seq: 0 };
+  const CLOSE_OPTS = {
+    local: { label: 'This server only', what: (p) => `Published on 127.0.0.1. Programs on this server still reach it at 127.0.0.1:${p.host_port}; nobody outside can.` },
+    public: { label: 'Everyone', what: () => 'Published on every address again: anyone who reaches this server can connect, unless an access rule says otherwise.' },
+    remove: {
+      label: 'Not published',
+      what: (p) => (p.default_bridge || !(p.reach || []).length
+        ? `Nothing on the host or outside reaches it, and other containers can't either: it is only on Docker's default network, where names don't resolve. Put it and the containers that use it on a shared network first (Containers screen), then unpublish.`
+        : `Nothing on the host or outside reaches it. ${p.siblings && p.siblings.length ? `Containers on its networks (${p.siblings.slice(0, 4).join(', ')}${p.siblings.length > 4 ? ` and ${p.siblings.length - 4} more` : ''}) still do,` : 'Containers you put on its networks still do,'} as ${p.reach.join(' or ')}.`),
+    },
+  };
+  async function openClose(arg) {
+    cp.arg = arg; cp.plan = null;
+    const local = arg.host_ip === '127.0.0.1';
+    $('#close-title').textContent = `Port ${arg.port}${arg.proto === 'udp' ? '/udp' : ''} of ${arg.name}`;
+    $('#close-now').textContent = local ? 'Published on 127.0.0.1: only this server can connect.'
+      : arg.host_ip ? `Published on ${arg.host_ip} only.` : 'Published on every address: anyone on the internet can connect.';
+    const opts = (local ? ['public', 'remove'] : ['local', 'remove']);
+    $('#close-options').innerHTML = opts.map((k, i) => `<label class="option"><input type="radio" name="action" value="${k}" ${i === 0 ? 'checked' : ''}>
+        <span><b>${CLOSE_OPTS[k].label}</b><span class="muted" data-what="${k}">…</span></span></label>`).join('')
+      + (arg.rules && !local ? `<label class="option"><input type="radio" name="action" value="rule">
+        <span><b>Keep it published, choose who may connect</b><span class="muted">An access rule in front of the port: only the addresses you list, or everyone but them. Nothing is recreated.</span></span></label>` : '');
+    $('#close-error').textContent = '';
+    $('#close-dialog').showModal();
+    await planClose();
+  }
+  async function planClose() {
+    const f = $('#close-form'), action = f.elements.action.value, a = cp.arg, seq = ++cp.seq;
+    const box = $('#close-compose'), btn = $('#close-submit');
+    if (action === 'rule') {
+      box.hidden = true; $('#close-note').textContent = ''; btn.textContent = 'Next'; btn.disabled = false;
+      return;
+    }
+    btn.disabled = true;
+    let p;
+    try {
+      p = await api(`/api/containers/port-plan?${new URLSearchParams({ engine: a.engine, id: a.id, host_port: a.port, proto: a.proto, action })}`);
+    } catch (e) { if (seq === cp.seq) { $('#close-error').textContent = e.message; } return; }
+    if (seq !== cp.seq) return;
+    cp.plan = p;
+    $$('[data-what]', f).forEach((el) => { el.textContent = CLOSE_OPTS[el.dataset.what].what(p); });
+    if (p.compose) {
+      const c = p.compose;
+      box.hidden = false;
+      box.innerHTML = c.ok
+        ? `<label class="check"><input type="checkbox" name="compose" checked> Also change the compose file, so <code>docker compose up</code> keeps it</label>
+           <div class="hint mono" translate="no">${esc(c.file)} · line ${c.line} · service ${esc(c.service)}</div>
+           <pre class="diff" translate="no">${(c.before || []).map((l) => `<del>- ${esc(l)}</del>`).join('\n')}${(c.after || []).length ? '\n' + c.after.map((l) => `<ins>+ ${esc(l)}</ins>`).join('\n') : ''}</pre>
+           <div class="hint">The file as it was is kept next to it as <span class="mono">${esc(c.file.split('/').pop())}.skyguard.bak</span>.</div>`
+        : `<p class="cover bad">The compose file is left as it is: ${esc(c.reason)}. The next <code>docker compose up</code> brings the old port back unless you change it there${c.file ? ` (<span class="mono">${esc(c.file)}</span>, service ${esc(c.service)})` : ''}:</p>
+           <div class="copy-line"><code id="close-manual" translate="no">${esc(c.manual)}</code>${c.manual.startsWith('- ') ? '<button class="card-link" type="button" data-action="copy" data-copy="#close-manual">Copy</button>' : ''}</div>`;
+    } else box.hidden = true;
+    $('#close-note').textContent = p.recreate
+      ? `${p.container} is recreated from the same image with the same settings, volumes and networks, and restarts once. If the new one fails to start, the old one is put back.`
+      : 'Incus changes the proxy device on the running instance; nothing restarts.';
+    btn.textContent = p.recreate ? `Recreate ${p.container}` : 'Apply';
+    btn.disabled = false;
+  }
+  async function submitClose() {
+    const f = $('#close-form'), action = f.elements.action.value, a = cp.arg, btn = $('#close-submit');
+    if (action === 'rule') {
+      $('#close-dialog').close();
+      openRule(null, { ports: String(a.port), proto: a.proto, name: a.name });
+      return;
+    }
+    const label = btn.textContent;
+    btn.disabled = true; btn.textContent = cp.plan && cp.plan.recreate ? 'Recreating…' : 'Applying…';
+    try {
+      const res = await post('/api/containers/port', { engine: a.engine, id: a.id, host_port: a.port, proto: a.proto, action, compose: f.elements.compose && f.elements.compose.checked ? '1' : '0' });
+      const c = res.plan.compose;
+      $('#close-dialog').close();
+      const what = action === 'local' ? 'now this server only' : action === 'public' ? 'open to everyone again' : 'no longer published';
+      toast(`${a.name}: port ${a.port} is ${what}${c ? (c.written ? `; ${c.file.split('/').pop()} updated` : '; the compose file still has the old port') : ''}`, !c || c.written);
+      if ($('#ct-sheet').open && ct.cur && ct.cur.name === res.container.name) renderSheet(res.container);
+      refresh();
+    } catch (e) { $('#close-error').textContent = e.message; }
+    btn.disabled = false; btn.textContent = label;
+  }
+
   // ── ports and access ────────────────────────────────────────────────────
   const pt = { data: null, scope: 'public', edit: null, timer: 0 };
   const SCOPE_WORDS = { public: 'Internet', private: 'Internal networks', local: 'This server only' };
@@ -400,7 +482,7 @@
     return s.length ? `Only ${list}` : 'Only this server';
   }
   // a wildcard bind says nothing beyond "Internet"; a specific address is worth showing
-  const addrDetail = (addrs) => addrs.filter((a) => a !== '0.0.0.0' && a !== '::').join(', ');
+  const addrDetail = (addrs) => addrs.filter((a) => !['0.0.0.0', '::', '127.0.0.1', '::1'].includes(a)).join(', ');
 
   async function loadPorts() {
     let d;
@@ -430,9 +512,14 @@
       const access = l.scope === 'local' ? '<span class="muted">This server only</span>'
         : r ? `${esc(ruleSummary(r))}${r.dropped ? ` <span class="muted">· <span class="num">${num(r.dropped)}</span> dropped</span>` : ''}`
         : '<span class="muted">Everyone</span>';
-      const btn = l.scope === 'local' ? '' : r
+      const ruleBtn = l.scope === 'local' ? '' : r
         ? `<button class="btn small" type="button" data-action="rule-edit" data-id="${esc(r.id)}">Edit rule</button>`
         : `<button class="btn small" type="button" data-action="rule-for" data-port="${l.port}" data-proto="${esc(l.proto)}" ${d.available === false ? 'disabled' : ''}>Restrict…</button>`;
+      // a managed container's port can be closed where it is published
+      const closable = d.containers_managed && l.container_id && (l.kind === 'docker' || l.kind === 'incus');
+      const local = l.addrs.length && l.addrs.every((x) => x === '127.0.0.1');
+      const closeBtn = closable ? `<button class="btn small" type="button" data-action="port-close" data-engine="${esc(l.kind)}" data-id="${esc(l.container_id)}" data-name="${esc(l.owner)}" data-port="${l.port}" data-proto="${esc(l.proto)}" data-host-ip="${local ? '127.0.0.1' : l.addrs.length === 1 && l.addrs[0] !== '0.0.0.0' && l.addrs[0] !== '::' ? esc(l.addrs[0]) : ''}">${local ? 'Open…' : 'Close…'}</button>` : '';
+      const btn = `<span class="row-acts">${closeBtn}${ruleBtn}</span>`;
       return `<tr><td class="n pt-port"><span class="num">${l.port}</span><span class="muted">/${esc(l.proto)}</span></td>
         <td><span class="pt-svc">${esc(l.service || '—')}</span>${risk}</td>
         <td class="pt-who">${who}</td>
@@ -1127,7 +1214,7 @@
     $('#open-meta').textContent = open.length ? `${num(open.length)} ${open.length === 1 ? 'port' : 'ports'}` : '';
     $('#open-ports').innerHTML = open.map((u) => {
       const o = u.owners.find((x) => x.kind !== 'skyguard' && x.running && !x.host_ip);
-      return `<li><span class="who"><span class="num">${u.port}${u.proto === 'udp' ? '/udp' : ''}</span><button class="ip-link" type="button" data-action="ct-open-any" data-engine="${esc(o.kind)}" data-id="${esc(o.id)}" translate="no">${esc(o.name)}</button><span class="muted">${esc(engineName(o.kind))} · to ${esc(o.target)}</span></span><span></span><span></span></li>`;
+      return `<li><span class="who"><span class="num">${u.port}${u.proto === 'udp' ? '/udp' : ''}</span><button class="ip-link" type="button" data-action="ct-open-any" data-engine="${esc(o.kind)}" data-id="${esc(o.id)}" translate="no">${esc(o.name)}</button><span class="muted">${esc(engineName(o.kind))} · to ${esc(o.target)}</span></span><span></span><span class="act">${ct.data.read_only ? '' : `<button class="btn small" type="button" data-action="port-close" data-engine="${esc(o.kind)}" data-id="${esc(o.id)}" data-name="${esc(o.name)}" data-port="${u.port}" data-proto="${esc(u.proto)}" data-host-ip="">Close…</button>`}</span></li>`;
     }).join('');
   }
   async function createNetwork(f) {
@@ -1407,11 +1494,12 @@ Tunnel:  ${tunnel}`],
   function portRow(p = {}, c = ct.cur) {
     const inherited = p.inherited ? ' <span class="muted">from a profile</span>' : '';
     return `<div class="port-row">
-      <input class="input mono" name="host_ip" value="${esc(p.host_ip || '')}" placeholder="All addresses" aria-label="Host address" spellcheck="false" autocomplete="off">
+      <input class="input mono" name="host_ip" value="${esc(p.host_ip || '')}" placeholder="All" title="Host address: empty for every address, 127.0.0.1 for this server only" aria-label="Host address" spellcheck="false" autocomplete="off">
       <input class="input mono" name="host_port" type="number" min="${c && c.engine === 'docker' ? 0 : 1}" max="65535" value="${p.host_port == null ? '' : p.host_port}" placeholder="8080" aria-label="Host port" required>
       <span class="arrow" aria-hidden="true">→</span>
       <input class="input mono" name="container_port" type="number" min="1" max="65535" value="${p.container_port || ''}" placeholder="80" aria-label="Container port" required>
       <select class="input" name="proto" aria-label="Protocol"><option value="tcp"${p.proto === 'udp' ? '' : ' selected'}>TCP</option><option value="udp"${p.proto === 'udp' ? ' selected' : ''}>UDP</option></select>
+      ${p.host_port && c && !c.self ? `<button class="btn small port-close" type="button" data-action="port-close" data-engine="${esc(c.engine)}" data-id="${esc(c.id)}" data-name="${esc(c.name)}" data-port="${p.host_port}" data-proto="${esc(p.proto)}" data-host-ip="${esc(p.host_ip || '')}" title="Publish it on this server only, or not at all, without editing the list">${p.host_ip === '127.0.0.1' ? 'Open…' : 'Close…'}</button>` : ''}
       <button class="icon-btn small" type="button" data-action="port-remove" aria-label="Remove this port"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>${inherited}
     </div>`;
   }
@@ -1624,6 +1712,9 @@ Tunnel:  ${tunnel}`],
       }
       case 'engine-on': switchEngine(a.dataset.engine, true); break;
       case 'rule-new': openRule(null); break;
+      case 'port-close':
+        openClose({ engine: a.dataset.engine, id: a.dataset.id, name: a.dataset.name, port: Number(a.dataset.port), proto: a.dataset.proto, host_ip: a.dataset.hostIp || '', rules: current === 'ports' && pt.data && pt.data.available !== false });
+        break;
       case 'rule-edit': openRule((pt.data.rules || []).find((r) => r.id === a.dataset.id)); break;
       case 'rule-for': {
         const l = (pt.data.listeners || []).find((x) => x.port === Number(a.dataset.port) && x.proto === a.dataset.proto);
@@ -1668,6 +1759,8 @@ Tunnel:  ${tunnel}`],
   $('#net-form').addEventListener('submit', (ev) => { ev.preventDefault(); createNetwork(ev.target); });
   $('#create-form').addEventListener('submit', (ev) => { ev.preventDefault(); submitCreate(ev.target); });
   $('#rule-form').addEventListener('submit', (ev) => { ev.preventDefault(); submitRule(); });
+  $('#close-form').addEventListener('submit', (ev) => { ev.preventDefault(); submitClose(); });
+  $('#close-form').addEventListener('change', (ev) => { if (ev.target.name === 'action') { $('#close-error').textContent = ''; planClose(); } });
   $('#rule-form').addEventListener('input', (ev) => { $('#rule-error').textContent = ''; if (ev.target.name === 'ports') ruleHints(); });
   $('#snap-form').addEventListener('submit', (ev) => { ev.preventDefault(); const n = ev.target.elements.name.value.trim(); if (n) snapshot('take', n); });
   let searchTimer;

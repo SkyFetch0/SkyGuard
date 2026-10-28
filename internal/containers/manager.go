@@ -65,6 +65,9 @@ func (m *Manager) Enabled(engine string) bool {
 	return m.enabled[engine]
 }
 
+// ReadOnly reports whether containers.read_only forbids changes.
+func (m *Manager) ReadOnly() bool { return m.readOnly }
+
 // AnyEnabled reports whether at least one engine is switched on.
 func (m *Manager) AnyEnabled() bool {
 	for _, e := range m.engines {
@@ -358,6 +361,124 @@ func (m *Manager) SetPorts(ctx context.Context, engine, id string, ports []Port)
 		}
 		return e.SetPorts(ctx, c.ID, ports)
 	})
+}
+
+// PortPlan is what one port action will do, shown before it is done.
+type PortPlan struct {
+	Container string   `json:"container"`
+	Engine    string   `json:"engine"`
+	HostPort  int      `json:"host_port"`
+	Proto     string   `json:"proto"`
+	Target    int      `json:"target"`             // the port inside the container
+	HostIP    string   `json:"host_ip"`            // where it is published now; "" = every address
+	Ports     []Port   `json:"ports"`              // the container's ports afterwards
+	Recreate  bool     `json:"recreate"`           // Docker: the container is recreated
+	Reach     []string `json:"reach,omitempty"`    // how containers on its networks reach it, e.g. mongo:27017
+	Siblings  []string `json:"siblings,omitempty"` // containers that share a network with it
+	// DefaultBridge: it is only on Docker's default network, where containers
+	// cannot find each other by name
+	DefaultBridge bool         `json:"default_bridge,omitempty"`
+	Compose       *ComposeEdit `json:"compose,omitempty"` // set for a Compose container
+}
+
+// PlanPort works out one port action on a container without doing it.
+func (m *Manager) PlanPort(ctx context.Context, engine, id string, hostPort int, proto, action string) (*PortPlan, error) {
+	c, err := m.Inspect(ctx, engine, id)
+	if err != nil {
+		return nil, err
+	}
+	return m.plan(ctx, c, hostPort, proto, action)
+}
+
+func (m *Manager) plan(ctx context.Context, c *Container, hostPort int, proto, action string) (*PortPlan, error) {
+	if c.Self {
+		return nil, ErrSelf
+	}
+	ports, err := ApplyPortAction(c.Ports, hostPort, proto, action)
+	if err != nil {
+		return nil, err
+	}
+	p := &PortPlan{Container: c.Name, Engine: c.Engine, HostPort: hostPort, Proto: proto, Ports: ports, Recreate: c.Engine == "docker"}
+	for _, x := range c.Ports {
+		if x.HostPort == hostPort && x.Proto == proto {
+			p.Target, p.HostIP = x.ContainerPort, x.HostIP
+			break
+		}
+	}
+	names := []string{c.Name}
+	if c.ComposeService != "" && c.ComposeService != c.Name {
+		names = append([]string{c.ComposeService}, names...)
+	}
+	for _, n := range names {
+		p.Reach = append(p.Reach, fmt.Sprintf("%s:%d", n, p.Target))
+	}
+	// Names resolve only on user-defined networks: Docker's default "bridge"
+	// has no DNS, so a container there is reached by name from nowhere.
+	mine := map[string]bool{}
+	for _, n := range c.Networks {
+		if !(c.Engine == "docker" && n.Network == "bridge") {
+			mine[n.Network] = true
+		}
+	}
+	if len(mine) == 0 {
+		p.Reach = nil
+		p.DefaultBridge = c.Engine == "docker" && len(c.Networks) > 0
+	}
+	if e, err := m.engine(c.Engine); err == nil {
+		if cs, _, err := e.List(ctx); err == nil {
+			for _, o := range cs {
+				if o.ID == c.ID {
+					continue
+				}
+				for _, n := range o.Networks {
+					if mine[n.Network] {
+						p.Siblings = append(p.Siblings, o.Name)
+						break
+					}
+				}
+			}
+		}
+	}
+	sort.Strings(p.Siblings)
+	if c.Engine == "docker" && c.Project != "" {
+		e := ComposePortEdit(c.ComposeFiles, c.ComposeService, hostPort, p.Target, proto, action, false)
+		p.Compose = &e
+	}
+	return p, nil
+}
+
+// PortAction makes one published host port local only, public again, or
+// unpublished, and with compose also changes the Compose file the
+// container comes from, so the next "docker compose up" keeps it.
+func (m *Manager) PortAction(ctx context.Context, engine, id string, hostPort int, proto, action string, compose bool) (*Container, *PortPlan, error) {
+	var plan *PortPlan
+	c, err := m.change(ctx, engine, id, "port "+action, func(e Engine, c *Container) error {
+		var err error
+		if plan, err = m.plan(ctx, c, hostPort, proto, action); err != nil {
+			return err
+		}
+		if action != PortRemove {
+			if err := m.checkPorts(ctx, c, plan.Ports); err != nil {
+				return err
+			}
+		}
+		return e.SetPorts(ctx, c.ID, plan.Ports)
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if plan.Compose != nil {
+		if compose && plan.Compose.OK {
+			e := ComposePortEdit(c.ComposeFiles, c.ComposeService, hostPort, plan.Target, proto, action, true)
+			plan.Compose = &e
+			if e.Written {
+				m.logger.Info("compose file changed from the dashboard", "file", e.File, "service", e.Service, "port", hostPort, "action", action)
+			}
+		} else if !compose {
+			plan.Compose.OK, plan.Compose.Reason = false, "you chose to leave the compose file as it is"
+		}
+	}
+	return c, plan, nil
 }
 
 // overlaps reports whether two host addresses can collide ("" is every address).

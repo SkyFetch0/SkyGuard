@@ -22,6 +22,8 @@ func (d *Dashboard) containerRoutes(api *http.ServeMux) {
 	api.HandleFunc("POST /api/containers/connect", d.csrf(d.containerChange(d.doContainerConnect)))
 	api.HandleFunc("POST /api/containers/disconnect", d.csrf(d.containerChange(d.doContainerDisconnect)))
 	api.HandleFunc("POST /api/containers/ports", d.csrf(d.containerChange(d.doContainerPorts)))
+	api.HandleFunc("GET /api/containers/port-plan", d.handlePortPlan)
+	api.HandleFunc("POST /api/containers/port", d.csrf(d.handlePortAction))
 	api.HandleFunc("POST /api/containers/settings", d.csrf(d.containerChange(d.doContainerSettings)))
 	api.HandleFunc("POST /api/containers/networks", d.csrf(d.handleCreateNetwork))
 	api.HandleFunc("POST /api/containers/networks/delete", d.csrf(d.handleDeleteNetwork))
@@ -161,6 +163,75 @@ func (d *Dashboard) doContainerPorts(ctx context.Context, engine, id string, for
 		return nil, badRequest{err.Error()}
 	}
 	return d.ctr.SetPorts(ctx, engine, id, ports)
+}
+
+// portActionArgs reads engine, id, host_port, proto and action.
+func portActionArgs(get func(string) string) (engine, id string, port int, proto, action string, err error) {
+	engine, id, proto, action = get("engine"), strings.TrimSpace(get("id")), get("proto"), get("action")
+	if proto == "" {
+		proto = "tcp"
+	}
+	port, perr := strconv.Atoi(get("host_port"))
+	switch {
+	case engine == "" || id == "":
+		err = errors.New("engine and id are required")
+	case perr != nil || port < 1 || port > 65535:
+		err = errors.New("host_port must be a port number")
+	case proto != "tcp" && proto != "udp":
+		err = errors.New("proto must be tcp or udp")
+	case action != containers.PortLocal && action != containers.PortPublic && action != containers.PortRemove:
+		err = errors.New("action must be local, public or remove")
+	}
+	return
+}
+
+// handlePortPlan says what a port action would do, Compose file included.
+func (d *Dashboard) handlePortPlan(w http.ResponseWriter, r *http.Request) {
+	if d.ctr == nil {
+		writeError(w, http.StatusNotFound, "container management is not enabled")
+		return
+	}
+	engine, id, port, proto, action, err := portActionArgs(r.URL.Query().Get)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	plan, err := d.ctr.PlanPort(r.Context(), engine, id, port, proto, action)
+	if err != nil {
+		writeContainerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, plan)
+}
+
+// handlePortAction makes one published port local only (action=local),
+// public (public) or unpublished (remove); compose=1 also edits the
+// container's Compose file.
+func (d *Dashboard) handlePortAction(w http.ResponseWriter, r *http.Request) {
+	if d.ctr == nil {
+		writeError(w, http.StatusNotFound, "container management is not enabled")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid form")
+		return
+	}
+	get := func(k string) string { return strings.TrimSpace(r.PostForm.Get(k)) }
+	engine, id, port, proto, action, err := portActionArgs(get)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(4 * time.Minute))
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Minute)
+	defer cancel()
+	d.logger.Info("container port change requested", "remote", netutil.HostIP(r.RemoteAddr), "engine", engine, "id", id, "port", port, "proto", proto, "action", action)
+	c, plan, err := d.ctr.PortAction(ctx, engine, id, port, proto, action, get("compose") == "1")
+	if err != nil {
+		writeContainerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"container": c, "plan": plan})
 }
 
 // doContainerSettings takes restart, memory_mb and cpus; a field left out

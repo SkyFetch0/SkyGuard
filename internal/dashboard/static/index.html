@@ -484,6 +484,19 @@
   </form>
 </dialog>
 
+<!-- Close one published container port at the source -->
+<dialog class="modal wide" id="close-dialog" aria-labelledby="close-title">
+  <form method="dialog" id="close-form">
+    <h2 id="close-title">Port</h2>
+    <p id="close-now"></p>
+    <div class="options" id="close-options" role="radiogroup" aria-labelledby="close-title"></div>
+    <div id="close-compose" class="compose-edit" hidden></div>
+    <p class="hint" id="close-note"></p>
+    <p class="stamp" id="close-error" role="alert"></p>
+    <div class="dialog-actions"><button class="btn" type="button" data-action="close-dialog">Cancel</button><button class="btn primary" type="submit" id="close-submit">Apply</button></div>
+  </form>
+</dialog>
+
 <!-- One port access rule -->
 <dialog class="modal wide" id="rule-dialog" aria-labelledby="rule-title">
   <form method="dialog" id="rule-form">

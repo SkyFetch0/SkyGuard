@@ -18,13 +18,14 @@ import (
 type Listener struct {
 	Proto   string   `json:"proto"`
 	Port    int      `json:"port"`
-	Addrs   []string `json:"addrs"`             // bound addresses; 0.0.0.0 and :: mean every address
-	Scope   string   `json:"scope"`             // public, private (internal addresses only) or local (loopback only)
-	Process string   `json:"process,omitempty"` // the program holding the socket
-	Owner   string   `json:"owner,omitempty"`   // container or SkyGuard service behind it
-	Kind    string   `json:"kind,omitempty"`    // docker, incus, skyguard or host
-	Service string   `json:"service,omitempty"` // what usually runs on this port
-	Risk    string   `json:"risk,omitempty"`    // database, admin, remote or files: worth closing to the internet
+	Addrs   []string `json:"addrs"`                  // bound addresses; 0.0.0.0 and :: mean every address
+	Scope   string   `json:"scope"`                  // public, private (internal addresses only) or local (loopback only)
+	Process string   `json:"process,omitempty"`      // the program holding the socket
+	Owner   string   `json:"owner,omitempty"`        // container or SkyGuard service behind it
+	Kind    string   `json:"kind,omitempty"`         // docker, incus, skyguard or host
+	ID      string   `json:"container_id,omitempty"` // the container's ID, when the engine is managed
+	Service string   `json:"service,omitempty"`      // what usually runs on this port
+	Risk    string   `json:"risk,omitempty"`         // database, admin, remote or files: worth closing to the internet
 }
 
 // Known describes what usually listens on a port.
@@ -163,6 +164,7 @@ type Claim struct {
 	HostIP string // "" for every address
 	Owner  string
 	Kind   string // docker, incus, skyguard
+	ID     string // container ID
 }
 
 // Listeners merges the sockets, Docker's nat-only ports and the known
@@ -217,7 +219,7 @@ func Listeners(socks []Socket, owners map[string]string, nat []firewall.NATPort,
 			continue // claimed but not listening: nothing to protect
 		}
 		if l.Kind == "" || (l.Kind == "docker" && strings.Contains(l.Owner, ":")) {
-			l.Owner, l.Kind = c.Owner, c.Kind
+			l.Owner, l.Kind, l.ID = c.Owner, c.Kind, c.ID
 		}
 	}
 	out := make([]Listener, 0, len(byKey))
