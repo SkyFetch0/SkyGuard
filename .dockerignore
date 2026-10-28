@@ -1,0 +1,19 @@
+# Only the Go sources and the embedded dashboard are needed to build the image.
+# The data folder (the database can grow to gigabytes) and the config with its
+# passwords must never be sent to the build.
+data/
+configs/skyguard.yaml
+bin/
+*.db
+*.db-shm
+*.db-wal
+*.mmdb
+ssh_honeypot_*_key
+.git/
+.github/
+.agents/
+.claude/
+.taste-skill/
+docs/
+*.md
+!README.md
