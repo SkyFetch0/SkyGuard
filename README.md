@@ -282,6 +282,10 @@ a tag with a hyphen (`v1.3.0-rc.1`) becomes a pre-release, offered only where
 git tag v1.2.0 && git push origin v1.2.0
 ```
 
+Without a local clone, *Actions → release → Run workflow* with the version
+(`1.2.0`) does the same: it tags the chosen branch's latest commit and
+publishes it.
+
 Sign releases, once:
 
 1. `go run ./cmd/skyguard -update-keygen` on your own computer prints a key
