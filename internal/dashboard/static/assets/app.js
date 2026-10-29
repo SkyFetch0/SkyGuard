@@ -728,6 +728,101 @@
     loadPorts();
   }
 
+  // ── software and vulnerabilities ────────────────────────────────────────
+  const sw = { data: null, filter: 'all', cur: null, poll: 0 };
+  const SEV = { critical: ['neg', 'Critical'], high: ['neg', 'High'], medium: ['warn', 'Medium'], low: ['', 'Low'], unknown: ['', 'Unrated'] };
+  const KIND_WORDS = { host: 'this server', docker: 'docker', incus: 'incus' };
+  const nvdSearch = (q) => `https://nvd.nist.gov/vuln/search/results?form_type=Basic&results_type=overview&search_type=all&query=${encodeURIComponent(q)}`;
+  const ext = (href, label) => `<a class="card-link" href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`;
+  function sevPills(sev, empty) {
+    const parts = ['critical', 'high', 'medium', 'low', 'unknown'].filter((k) => sev && sev[k]).map((k) => `<span class="pill ${SEV[k][0]}"><span class="dot"></span><span class="num">${num(sev[k])}</span> ${SEV[k][1].toLowerCase()}</span>`);
+    return parts.length ? `<span class="sev-pills">${parts.join('')}</span>` : empty;
+  }
+  async function loadSoftware() {
+    let d;
+    try { d = await api('/api/software'); } catch (e) { blockError($('#sw-targets'), 'the software inventory', e); return; }
+    sw.data = d;
+    renderSoftware();
+    clearTimeout(sw.poll);
+    if (d.status && d.status.phase !== 'idle') sw.poll = setTimeout(loadSoftware, 2000);
+  }
+  function renderSoftware() {
+    const d = sw.data;
+    if (d.enabled === false) { $('#sw-sub').textContent = 'The software inventory needs the dashboard.'; return; }
+    const ts = d.targets || [], st = d.status || { phase: 'idle' }, busy = st.phase !== 'idle';
+    const scanned = ts.filter((t) => !t.error || t.packages);
+    const sum = (f) => ts.reduce((a, t) => a + f(t), 0);
+    const vulns = sum((t) => Object.values(t.severity || {}).reduce((a, x) => a + x, 0));
+    const crit = sum((t) => (t.severity || {}).critical || 0), high = sum((t) => (t.severity || {}).high || 0);
+    const checked = ts.some((t) => t.vuln_checked_at);
+    $('#sw-sub').textContent = !ts.length ? 'Nothing scanned yet. Scan now reads the software of this server and of its containers.'
+      : `${num(scanned.length)} ${scanned.length === 1 ? 'place' : 'places'} scanned${d.containers ? '' : ' (switch on container management in Settings to include the containers)'}. `
+        + (!d.osv ? 'Versions are not checked against a vulnerability database until you switch that on below.'
+          : !checked ? 'Not checked against OSV.dev yet.'
+          : crit + high ? `${num(crit)} critical and ${num(high)} high known vulnerabilities.` : 'No critical or high known vulnerabilities.');
+    $('#sw-kpis').innerHTML = [
+      ['Places', num(scanned.length)], ['Packages', num(sum((t) => t.packages || 0))],
+      ['Known vulnerabilities', d.osv && checked ? num(vulns) : '—'], ['With a fix available', d.osv && checked ? num(sum((t) => t.fixable || 0)) : '—'],
+    ].map(([k, v]) => `<div><dt>${k}</dt><dd class="num">${v}</dd></div>`).join('');
+    $('#sw-osv').checked = !!d.osv;
+    $('#sw-check').hidden = !d.osv;
+    $('#sw-check').disabled = busy || !ts.length;
+    $('#sw-scan').disabled = busy;
+    $('#sw-progress').textContent = st.phase === 'scanning' ? `Scanning ${st.current || ''} (${num(st.done)} of ${num(st.total)})…`
+      : st.phase === 'checking' ? `Checking ${num(st.total)} packages against OSV.dev…`
+      : st.error ? `Last run failed: ${st.error}` : '';
+    let shown = ts;
+    if (sw.filter === 'vuln') shown = ts.filter((t) => Object.keys(t.severity || {}).length);
+    $('#sw-targets').innerHTML = shown.length ? shown.map((t) => {
+      const apps = (t.apps || []).filter((a) => a.kind !== 'library' && a.kind !== 'image').slice(0, 6);
+      const main = apps.length ? apps.map((a) => `<span class="chip" title="${esc(a.where)}">${esc(a.name)}${a.version ? ` <span class="mono">${esc(a.version)}</span>` : ''}</span>`).join('')
+        : `<span class="muted">${esc(t.error || 'nothing notable found')}</span>`;
+      const os = t.os ? esc(t.os.name || `${t.os.id} ${t.os.version_id}`) : '<span class="muted">—</span>';
+      const vul = !d.osv ? '<span class="muted">not checked</span>' : !t.vuln_checked_at ? '<span class="muted">not checked yet</span>'
+        : sevPills(t.severity, '<span class="muted">none known</span>');
+      return `<tr><td class="sw-where"><b>${esc(t.name)}</b> <span class="chip">${esc(KIND_WORDS[t.kind] || t.kind)}</span>${t.image ? `<span class="muted detail mono">${esc(t.image)}</span>` : ''}${t.notes && t.notes.length ? `<span class="detail warn-text">${esc(t.notes.length === 1 ? t.notes[0] : `${t.notes.length} things to look at`)}</span>` : ''}</td>
+        <td class="sw-os">${os}</td><td class="sw-main">${main}</td><td class="n num">${t.packages ? num(t.packages) : '—'}</td><td>${vul}</td>
+        <td class="n" title="${esc(stamp(t.scanned_at))}">${esc(ago(t.scanned_at))}</td>
+        <td class="n">${t.packages || (t.apps || []).length ? `<button class="btn small" type="button" data-action="sw-open" data-key="${esc(t.key)}">Details</button>` : ''}</td></tr>`;
+    }).join('') : emptyRow(7, ts.length ? 'No known vulnerabilities anywhere.' : 'Nothing scanned yet.');
+  }
+  async function openSoftware(key) {
+    let t;
+    try { t = await api('/api/software/target?key=' + encodeURIComponent(key)); } catch (e) { toast(e.message, false); return; }
+    sw.cur = t;
+    $('#sw-title').textContent = t.name;
+    $('#sw-tags').innerHTML = `<span class="pill">${esc(KIND_WORDS[t.kind] || t.kind)}</span>${t.running ? '' : ' <span class="pill">stopped</span>'}`;
+    $('#sw-facts').innerHTML = [['System', t.os ? (t.os.name || t.os.id) : '—'], ['Image', t.image || '—'], ['Packages', num((t.packages || []).length)], ['Scanned', ago(t.scanned_at)]]
+      .map(([k, v]) => `<div><dt>${k}</dt><dd title="${esc(v)}">${esc(v)}</dd></div>`).join('');
+    $('#sw-notes').innerHTML = (t.via ? `<p class="muted">${esc(t.via.charAt(0).toUpperCase() + t.via.slice(1))}.</p>` : '')
+      + ((t.notes || []).length || t.error ? `<p class="cover">${[t.error, ...(t.notes || [])].filter(Boolean).map(esc).join('<br>')}</p>` : '');
+    $('#sw-apps').innerHTML = (t.apps || []).length ? t.apps.map((a) => `<tr><td>${esc(a.name)} <span class="muted">${esc(a.kind)}</span></td><td class="mono">${esc(a.version || '—')}</td><td class="data mono" title="${esc(a.where)}">${esc(a.where)}</td>
+        <td class="n">${ext(nvdSearch(`${a.name.replace(/ \(.*\)$/, '')} ${a.version || ''}`.trim()), 'NVD')}</td></tr>`).join('') : emptyRow(4, 'Nothing notable found.');
+    $('#sw-pkg-q').value = '';
+    renderSoftwareSheet();
+    if (!$('#sw-sheet').open) $('#sw-sheet').showModal();
+  }
+  function renderSoftwareSheet() {
+    const t = sw.cur, onlyFix = $('#sw-fixable').checked;
+    const fs = (t.findings || []).filter((f) => !onlyFix || f.fixed);
+    $('#sw-findings').innerHTML = !sw.data.osv ? emptyRow(3, 'Switch on the OSV.dev check on the Software screen to see known vulnerabilities.')
+      : !t.vuln_checked_at ? emptyRow(3, 'Not checked against OSV.dev yet.')
+      : fs.length ? fs.slice(0, 400).map((f) => `<tr>
+          <td><span class="pill ${SEV[f.severity] ? SEV[f.severity][0] : ''}"><span class="dot"></span>${esc(SEV[f.severity] ? SEV[f.severity][1] : f.severity)}</span>${f.score ? ` <span class="num muted">${f.score.toFixed(1)}</span>` : ''}</td>
+          <td class="sw-sum">${ext(f.url, f.id)}${(f.cves || []).map((c) => ` ${ext('https://nvd.nist.gov/vuln/detail/' + c, c)}`).join('')}<span class="detail">${esc(f.summary || '—')}</span>${f.note ? `<span class="detail muted">${esc(f.note)}</span>` : ''}</td>
+          <td class="mono">${esc(f.package)} ${esc(f.version)}<span class="detail ${f.fixed ? 'pos-text' : 'muted'}">${f.fixed ? `fixed in ${esc(f.fixed)}` : 'no fix yet'}</span></td></tr>`).join('') + (fs.length > 400 ? emptyRow(3, `and ${num(fs.length - 400)} more`) : '')
+      : emptyRow(3, onlyFix ? 'None with a fix available.' : 'No known vulnerabilities.');
+    const q = $('#sw-pkg-q').value.trim().toLowerCase();
+    const ps = (t.packages || []).filter((p) => !q || p.name.toLowerCase().includes(q) || (p.binary || '').toLowerCase().includes(q));
+    $('#sw-pkg-title').textContent = `Packages (${num((t.packages || []).length)})`;
+    $('#sw-pkgs').innerHTML = ps.length ? ps.slice(0, 300).map((p) => `<tr><td class="mono">${esc(p.name)}${p.binary && p.binary !== p.name ? ` <span class="muted">${esc(p.binary)}</span>` : ''}</td><td class="mono">${esc(p.version)}</td><td>${esc(p.manager)}${p.ecosystem ? ` <span class="muted">${esc(p.ecosystem)}</span>` : ''}</td></tr>`).join('')
+      + (ps.length > 300 ? emptyRow(3, `and ${num(ps.length - 300)} more: narrow the search`) : '') : emptyRow(3, q ? 'No package matches.' : 'No packages found.');
+  }
+  async function swPost(url, data, done) {
+    try { sw.data = await post(url, data || {}); renderSoftware(); if (done) toast(done); } catch (e) { toast(e.message, false); }
+    loadSoftware();
+  }
+
   // ── version and updates ─────────────────────────────────────────────────
   const upd = { data: null, waiting: '' };
   const PHASES = [['downloading', 'Download'], ['verifying', 'Check checksum and signature'], ['testing', 'Try it with your config'], ['backing-up', 'Back up the database and config'], ['restarting', 'Restart'], ['done', 'Running the new version']];
@@ -1752,6 +1847,7 @@ Tunnel:  ${tunnel}`],
     credentials: { title: 'Captured credentials', load: loadCredentials, live: true },
     services: { title: 'Honeypots and services', load: loadServices, live: true },
     ports: { title: 'Ports and access', load: loadPorts, live: true },
+    software: { title: 'Software and vulnerabilities', load: loadSoftware, live: false },
     containers: { title: 'Containers', load: loadContainers, live: true },
     settings: { title: 'Settings', load: loadSettings, live: false },
   };
@@ -1829,6 +1925,8 @@ Tunnel:  ${tunnel}`],
     if (cv) { ct.view = cv.dataset.ctview; applyCtView(); writeHash(); if (ct.view === 'map' && ct.data) renderMap(); return; }
     const cf = t.closest('[data-ctfilter]');
     if (cf) { ct.only = cf.dataset.ctfilter; applyCtView(); renderBay(); renderMap(); return; }
+    const swf = t.closest('[data-swfilter]');
+    if (swf) { sw.filter = swf.dataset.swfilter; pressOnly(swf.parentElement, sw.filter, 'swfilter'); renderSoftware(); return; }
     const ps = t.closest('[data-ptscope]');
     if (ps) { pt.scope = ps.dataset.ptscope; pressOnly(ps.parentElement, pt.scope, 'ptscope'); renderPorts(); return; }
     const rp = t.closest('[data-proto], [data-mode], [data-where]');
@@ -1921,6 +2019,9 @@ Tunnel:  ${tunnel}`],
       }
       case 'engine-on': switchEngine(a.dataset.engine, true); break;
       case 'rule-new': openRule(null); break;
+      case 'sw-scan': swPost('/api/software/scan', {}, 'Scan started'); break;
+      case 'sw-check': swPost('/api/software/check', {}, 'Checking against OSV.dev'); break;
+      case 'sw-open': openSoftware(a.dataset.key); break;
       case 'port-close':
         openClose({ engine: a.dataset.engine, id: a.dataset.id, name: a.dataset.name, port: Number(a.dataset.port), proto: a.dataset.proto, host_ip: a.dataset.hostIp || '', rules: current === 'ports' && pt.data && pt.data.available !== false });
         break;
@@ -1956,6 +2057,8 @@ Tunnel:  ${tunnel}`],
     if (ev.target.matches('[data-action="toggle-service"]')) toggleService(ev.target);
     if (ev.target.matches('[data-action="rule-toggle"]')) toggleRule(ev.target);
     if (ev.target.matches('[data-action="addr-follow"]')) setFollow(ev.target);
+    if (ev.target.id === 'sw-osv') swPost('/api/software/osv', { enabled: ev.target.checked ? '1' : '0' }, ev.target.checked ? 'OSV.dev check is on: press Check for vulnerabilities, or scan' : 'OSV.dev check is off');
+    if (ev.target.id === 'sw-fixable') renderSoftwareSheet();
     if (ev.target.closest('#rule-addrs')) ruleHints();
     if (ev.target.matches('[data-action="engine-switch"]')) switchEngine(ev.target.dataset.engine, ev.target.checked, ev.target);
     if (ev.target.id === 'mcp-enabled') saveMCP('enabled', ev.target.checked);
@@ -1975,6 +2078,8 @@ Tunnel:  ${tunnel}`],
   $('#net-form').addEventListener('submit', (ev) => { ev.preventDefault(); createNetwork(ev.target); });
   $('#create-form').addEventListener('submit', (ev) => { ev.preventDefault(); submitCreate(ev.target); });
   $('#rule-form').addEventListener('submit', (ev) => { ev.preventDefault(); submitRule(); });
+  $('#sw-pkg-q').addEventListener('input', () => renderSoftwareSheet());
+  $('#sw-sheet').addEventListener('click', (ev) => { if (ev.target === ev.currentTarget) ev.currentTarget.close(); });
   $('#close-form').addEventListener('submit', (ev) => { ev.preventDefault(); submitClose(); });
   $('#close-form').addEventListener('change', (ev) => { if (ev.target.name === 'action') { $('#close-error').textContent = ''; planClose(); } });
   $('#rule-form').addEventListener('input', (ev) => { $('#rule-error').textContent = ''; if (ev.target.name === 'ports') ruleHints(); });

@@ -318,6 +318,7 @@ type dockerInspect struct {
 		Status  string
 		Running bool
 		Paused  bool
+		Pid     int
 	}
 	Config          map[string]any
 	HostConfig      map[string]any

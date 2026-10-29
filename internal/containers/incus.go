@@ -120,6 +120,7 @@ type incusInstance struct {
 	Devices         map[string]incusDevice `json:"devices"`
 	ExpandedDevices map[string]incusDevice `json:"expanded_devices"`
 	State           *struct {
+		Pid     int `json:"pid"`
 		Network map[string]struct {
 			Addresses []struct {
 				Family  string `json:"family"`
@@ -143,6 +144,9 @@ func (x *Incus) toContainer(in incusInstance) Container {
 	}
 	ec := in.ExpandedConfig
 	c.Image = cmpOr(ec["image.description"], strings.TrimSpace(ec["image.os"]+" "+ec["image.release"]))
+	if in.State != nil {
+		c.PID = in.State.Pid
+	}
 	for _, key := range slices.Sorted(maps.Keys(in.ExpandedDevices)) {
 		dev := in.ExpandedDevices[key]
 		_, local := in.Devices[key]

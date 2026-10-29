@@ -46,6 +46,8 @@ The dashboard on a server under a week of attack traffic, with 96 Docker contain
 
 <p align="center"><img src="docs/screenshots/ports.png" alt="Ports and access: every port the server listens on with the container or program behind it, databases open to the internet flagged, and the access rules with their drop counters" width="100%"></p>
 
+<p align="center"><img src="docs/screenshots/software.png" alt="Software and vulnerabilities: every place scanned (this server, Docker containers, Incus instances) with its system, the main software and versions found, and the known vulnerabilities by severity from OSV.dev" width="100%"></p>
+
 <p align="center"><img src="docs/screenshots/phone-overview.png" alt="The overview on a phone" width="240">&nbsp;&nbsp;&nbsp;<img src="docs/screenshots/phone-containers.png" alt="The network map on a phone" width="240"></p>
 
 ---
@@ -117,6 +119,7 @@ Passthrough services only apply steps 1–4 (real users must not be rate-limited
 | 🌐 **Dashboard** | Browser UI with live polling + JSON REST API |
 | 🤖 **MCP** | A built-in Model Context Protocol server: Claude, ChatGPT, Cursor or any MCP client can read attacks, bans, credentials and containers, and act when you allow it |
 | 🔒 **Port access** | Per-port rules for anything listening on the host (databases, admin panels, Docker and Incus ports): *only these sources* or *everyone except these*, IPv4 and IPv6, with a self-undoing trial on SSH and the dashboard |
+| 🧬 **Software** | Finds what runs on the server and inside every Docker container and Incus instance (system packages, Next.js, Node, Go binaries, nginx, CyberPanel, WordPress and more) with its version, without running anything inside them; opt-in check against OSV.dev for known CVEs and the version that fixes each |
 | 🧩 **Containers** | Opt-in Docker and Incus management, switched on from the panel: a network map to wire containers together, create / start / stop / pause / remove, published ports, restart policy, limits, logs, Incus snapshots |
 | 🐳 **Docker** | Multi-stage image (`golang:1.27` → `debian:trixie-slim` with iptables-legacy + iptables-nft), built-in health check |
 | ⚙️ **Config** | Single YAML file; hot-toggleable services (`enabled: false`) |
@@ -663,6 +666,65 @@ SkyGuard in Docker, it sees only what is mounted into it: mount the folder
 your projects live in at the same path (`- /opt:/opt` in SkyGuard's
 `docker-compose.yml`, commented there).
 
+## Software and vulnerabilities
+
+The **Software** screen lists what is installed on the server itself and inside
+every Docker container and Incus instance SkyGuard manages, with versions:
+the system packages (dpkg on Debian and Ubuntu, apk on Alpine), and by name the
+things people ask about: Next.js and the other Node frameworks from
+`package.json` and its lockfile, Node.js, Go (and the modules compiled into any
+Go binary, read from its build info), Python packages, PHP, Java, nginx,
+OpenResty, OpenLiteSpeed, CyberPanel, WordPress sites, databases, Docker,
+containerd and Incus. It scans 3 minutes after start when the last results are
+older than a day, then once a day; *Scan now* runs it at once.
+
+**Known vulnerabilities.** Switch on *Check versions against OSV.dev* and every
+package is compared with [OSV.dev](https://osv.dev), the open database that
+gathers the advisories of Debian, Ubuntu, Alpine, GitHub (npm, PyPI) and the Go
+project. Each finding shows its CVE and advisory, a CVSS score where there is
+one, and the version that fixes it; *Only those with a fix* leaves the ones you
+can act on today. Only package names, versions and ecosystems are sent (no
+addresses, no file contents), and each advisory is cached until OSV.dev
+changes it, so a daily check fetches only new or updated ones. Off (the default), nothing leaves the server; each
+app still has an NVD link to look it up by hand.
+
+**Safe against what it scans.** A container is someone else's file system,
+and whoever controls it may plant traps for a scanner. SkyGuard assumes so:
+
+- Nothing is ever run inside a container or instance (no `docker exec`, no
+  `incus exec`, no package manager): files are only read.
+- Every file is opened with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`
+  under the container's own root (`/proc/<pid>/root`). The kernel resolves
+  every symbolic link and `..` inside that root, so a link to `/etc/shadow`
+  leads to the container's file, never the server's.
+- A path is first opened without reading (`O_PATH`) and checked to be a
+  regular file; only then is it read, non-blocking. A device, FIFO or socket
+  planted in place of `/etc/os-release` is skipped and named in the
+  container's notes.
+- Sizes are capped (1 MiB for small files, 32 MiB for package databases), as
+  are packages per place (20 000) and every string, which is stripped of
+  control characters and shown escaped. Each place has 90 seconds; a file
+  system that never answers is left behind, and after three of those scans
+  stop until SkyGuard restarts.
+- After opening a container's root, SkyGuard checks the process still belongs
+  to that container, so a recycled PID cannot point it at another one.
+- A stopped Docker container is read through the Docker API instead, which
+  resolves paths inside the container; links are followed by path only.
+- What is found is data, never instructions: the MCP tool says so to the
+  model, like it does for logs.
+
+Not read: virtual machines (their disks are not SkyGuard's to open), stopped
+Incus instances, and RPM-based systems (Rocky, Alma, Fedora), whose package
+database is a SQLite or Berkeley DB file. The OSV check uses each
+distribution's own advisories, so a Debian or Ubuntu package is matched by its
+source package and its exact Debian version.
+
+**SkyGuard in Docker.** Inside a container SkyGuard sees only what is shared
+with it. Mount the server's root read-only (`- /:/host:ro`) for its own
+packages, and give it `pid: host` to read running containers and Incus
+instances; both are in `docker-compose.yml`, commented. Without `pid: host`,
+Docker containers are still read through the Docker API.
+
 ## AI assistants (MCP)
 
 SkyGuard has a built-in [Model Context Protocol](https://modelcontextprotocol.io) server, so an AI assistant can answer "who attacked me last night?", "is anything on port 80 besides the reverse proxy?" or "ban the address that keeps trying root" from SkyGuard's own data. It is built on the official Go SDK and served at `/mcp` on the dashboard's address as stateless Streamable HTTP.
@@ -701,6 +763,7 @@ SkyGuard has a built-in [Model Context Protocol](https://modelcontextprotocol.io
 | `list_credentials` | Most tried usernames, passwords and pairs | read |
 | `get_firewall` | The SKYGUARD chain's rules and Docker coverage | read |
 | `list_ports` | Every listening port with its owner, reach and risk, and the port access rules with their drop counts | read |
+| `list_software` | Every scanned place with its system, main software and known vulnerabilities; with `key`, one place's findings | read |
 | `list_containers` / `get_container` / `get_container_logs` | Containers, networks, port conflicts; one container; its last log lines | read |
 | `ban_ip` / `unban_ip` | Ban for a duration (default 24h, `0` permanent) or lift a ban | action |
 | `set_honeypot` | Open or close a honeypot's port | action |
@@ -734,6 +797,7 @@ ssh -L 9090:127.0.0.1:9090 user@your-server
 - **Honeypots and services** — switch each honeypot on or off at runtime (the listener opens or closes at once; the choice survives restarts until you change that honeypot in the config file), with 24-hour activity per service. Stealth and passthrough services are shown read-only: turning them off from a panel you usually reach through them could cut your own session.
 - **Containers** (opt-in, see [Containers](#containers-docker-and-incus)) — a *network map* in the manner of a network simulator: networks are switches, containers are devices, memberships are cables. Select a container and pull a cable from its plug: drop it on a switch to join that network, or on another container to give the two a network in common (join one of the other's, or a new one for the pair); clicking *Connect…* and then the target works too. Click a cable to unplug it. Built to stay readable with a hundred containers: a force layout that keeps each Compose project together on a soft outline, numbered replicas (`queue-worker-1…40`) folded into one stacked device until you expand them, labels that give way to each other as you zoom out, search that dims everything else and brings the first match into view, a minimap, focus on a node's own cables when selected, and dragged positions remembered per browser. A *Table* view keeps the patch bay for precise work. *New container* pulls an image (Docker) or downloads one from images.linuxcontainers.org (Incus) and starts it with ports, network, environment, restart policy and limits. The side sheet starts, stops, restarts, pauses and removes; edits ports, restart policy and memory/CPU limits; shows the last 200 log lines; and for Incus takes, rolls back and deletes snapshots. A host-port table names whoever holds each port (SkyGuard listeners included) and flags conflicts; *Open to the internet* lists every container port bound on all addresses and whether a ban stops traffic there.
 - **Ports and access** — the server's addresses (its own, and those it passes on to Incus instances, VMs or DNAT) with whether bans reach them and a switch for the server-wide rules; every port that takes connections on the host and behind those addresses, who is behind it (program, container, SkyGuard service) and whether the internet can reach it, with databases and admin panels that anyone can reach flagged; *Close…* to publish a container's port on this server only or not at all (the compose file included), the access rules with their drop counters, a rule editor, and the trial banner that undoes a change to SSH or the dashboard unless you keep it. See [Port access rules](#port-access-rules).
+- **Software** — every place scanned (this server, each container and instance) with its system, main software and versions, and its known vulnerabilities by severity; a sheet per place with each advisory, its CVE and the version that fixes it, and every package found. See [Software and vulnerabilities](#software-and-vulnerabilities).
 - **Settings** — version and updates (the running build, the newest release with its notes, one-click update with automatic rollback, history), the auto-ban switch, threshold stepper and ban length, container engines, AI assistants, and the SKYGUARD chain's current rules.
 - **IP detail** — a side sheet with score, daily activity, credentials and connections for any address.
 
@@ -785,6 +849,11 @@ State-changing `POST` endpoints require the header `X-SkyGuard-Request: 1` (CSRF
 | `POST` | `/api/containers/remove` | `engine`, `id` — stop and delete; volumes are kept |
 | `GET` | `/api/containers/logs?engine=&id=&lines=200` | The last lines of stdout/stderr (Docker) or the console log (Incus) |
 | `GET`/`POST` | `/api/containers/snapshots` | Incus: list; `action` = `take` \| `restore` \| `delete`, `name` |
+| `GET` | `/api/software` | Every scanned place (`targets`: `key`, `kind`, `os`, `apps`, `packages`, `severity`, `fixable`, `notes`), the scan `status` (`phase` idle, scanning or checking), `osv`, `host_reason` |
+| `GET` | `/api/software/target?key=` | One place with every package (`packages`) and finding (`findings`: `id`, `cves`, `package`, `version`, `fixed`, `severity`, `score`) |
+| `POST` | `/api/software/scan` | Scan now (and check, when OSV.dev is on) |
+| `POST` | `/api/software/check` | Check what was found against OSV.dev again |
+| `POST` | `/api/software/osv` | `enabled` — whether package names and versions may be sent to OSV.dev |
 | `GET` | `/api/update` | Running version (`running`: `version`, `commit`, `date`), the newest release (`latest`, `available`), `status` of an update in progress, `state` (current, previous, `failure`, `history`), `can_rollback`, `backups` |
 | `POST` | `/api/update/check` | Ask GitHub now |
 | `POST` | `/api/update/apply` | `version` — install that release (the newest found); SkyGuard restarts at the end |
@@ -816,6 +885,7 @@ SkyGuard/
 │   ├── analysis/            # GeoIP · rate limiter · scorer · port-scan detector
 │   ├── firewall/            # iptables / ip6tables (SKYGUARD chain in INPUT, FORWARD, DOCKER-USER; port rule chains) · ufw · none
 │   ├── containers/          # Docker Engine API and Incus REST API clients, the container manager, compose file edits
+│   ├── inventory/           # software inventory: confined file reads, detectors, OSV.dev check
 │   ├── portrules/           # port access rules: the server's addresses, listeners, trials
 │   ├── update/              # releases from GitHub, verification, staging, the launcher and rollback
 │   ├── storage/             # SQLite (pure Go): connections, credentials, bans, scores, settings
@@ -924,7 +994,7 @@ curl -u admin:CHANGE_ME_NOW http://localhost:9090/api/stats
 - [ ] CrowdSec bouncer integration
 - [ ] Reading sshd and reverse-proxy (Nginx Proxy Manager) logs
 - [ ] HTTP lures for `/.git/config`, `/.env` and LLM API paths
-- [ ] Vulnerability scan of container images (Trivy)
+- [ ] RPM-based systems in the software inventory
 - [ ] TOTP two-factor login for the dashboard
 - [ ] Prometheus metrics endpoint (`/metrics`)
 - [ ] WebSocket / SSE live-push for the dashboard

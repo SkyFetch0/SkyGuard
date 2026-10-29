@@ -37,6 +37,9 @@
     <a href="#ports" data-nav="ports" data-tip="Ports and access" aria-label="Ports and access">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 5 6v5c0 4.5 3 8 7 10 4-2 7-5.5 7-10V6z"/><path d="M9.5 12.5 11 14l3.5-3.5"/></svg><span class="label">Ports</span>
     </a>
+    <a href="#software" data-nav="software" data-tip="Software and vulnerabilities" aria-label="Software and vulnerabilities">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h7"/><circle cx="17.5" cy="16.5" r="3"/><path d="m20 19 2 2"/></svg><span class="label">Software</span>
+    </a>
     <a href="#containers" data-nav="containers" data-tip="Containers" aria-label="Containers">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9z"/><path d="m4 7.5 8 4.5 8-4.5M12 12v9"/></svg><span class="label">Containers</span>
     </a>
@@ -272,6 +275,37 @@
       <article class="panel">
         <header><h2>Access rules</h2><span class="meta" id="pt-rules-meta">The server itself always gets in</span></header>
         <div id="pt-rules"></div>
+      </article>
+    </section>
+
+    <!-- SOFTWARE: what runs here, in which versions, and is any of it known to be vulnerable? -->
+    <section class="screen" id="screen-software" data-screen="software" hidden>
+      <div class="title-row">
+        <div>
+          <p class="brandline" translate="no"><b>SkyGuard</b> · <span data-host>this server</span></p>
+          <h1>Software and vulnerabilities</h1>
+          <p class="sub" id="sw-sub">Loading…</p>
+        </div>
+        <div class="title-tools">
+          <span class="stamp" id="sw-progress" role="status"></span>
+          <button class="btn" type="button" data-action="sw-check" id="sw-check">Check for vulnerabilities</button>
+          <button class="btn primary" type="button" data-action="sw-scan" id="sw-scan">Scan now</button>
+        </div>
+      </div>
+      <dl class="facts sw-kpis" id="sw-kpis"></dl>
+      <article class="panel">
+        <label class="switch-row"><span><b>Check versions against OSV.dev</b><br><span class="muted" id="sw-osv-text">OSV.dev is the open vulnerability database that gathers the advisories of Debian, Ubuntu, Alpine, GitHub (npm, PyPI) and the Go project. Switched on, SkyGuard sends it the names, versions and ecosystems of the packages it found, and nothing else: no addresses, no file contents. Off, the inventory stays on this server.</span></span><input class="switch" type="checkbox" role="switch" id="sw-osv" aria-label="Check versions against OSV.dev"></label>
+      </article>
+      <article class="panel">
+        <header>
+          <h2>Where it runs</h2>
+          <div class="choice" role="group" aria-label="Which places" id="sw-filter">
+            <button type="button" data-swfilter="all" aria-pressed="true">All</button>
+            <button type="button" data-swfilter="vuln" aria-pressed="false">With known vulnerabilities</button>
+          </div>
+        </header>
+        <div class="table-wrap"><table class="sw-table"><thead><tr><th>Where</th><th>System</th><th>Main software</th><th class="n">Packages</th><th>Known vulnerabilities</th><th class="n">Scanned</th><th></th></tr></thead><tbody id="sw-targets"><tr><td colspan="7"><div class="empty">Loading…</div></td></tr></tbody></table></div>
+        <p class="hint sw-safety">The scan only reads files (package databases, version files, lockfiles, the build info in Go binaries) and never runs anything from a container. Paths are resolved by the kernel inside each container's own root, so a planted link cannot reach the server's files, and devices and pipes under well-known names are not opened.</p>
       </article>
     </section>
 
@@ -542,6 +576,24 @@
     <p class="stamp" id="rule-error" role="alert"></p>
     <div class="dialog-actions"><button class="btn danger" type="button" data-action="rule-delete" id="rule-delete" hidden>Delete rule</button><span class="spacer"></span><button class="btn" type="button" data-action="close-dialog">Cancel</button><button class="btn primary" type="submit" id="rule-submit">Save rule</button></div>
   </form>
+</dialog>
+
+<!-- One scanned place, in detail -->
+<dialog class="sheet" id="sw-sheet" aria-labelledby="sw-title">
+  <div class="sheet-body">
+    <div class="sheet-head"><h2 id="sw-title">—</h2><span id="sw-tags"></span><button class="icon-btn" type="button" data-action="close-dialog" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+    <dl class="facts" id="sw-facts"></dl>
+    <div id="sw-notes"></div>
+    <div>
+      <div class="sheet-form-head"><h3>Known vulnerabilities</h3><label class="check"><input type="checkbox" id="sw-fixable"> Only those with a fix</label></div>
+      <div class="table-wrap"><table class="sw-find"><thead><tr><th>Severity</th><th>Advisory</th><th>Package</th></tr></thead><tbody id="sw-findings"></tbody></table></div>
+    </div>
+    <div><h3>Software</h3><div class="table-wrap"><table><thead><tr><th>Name</th><th>Version</th><th>Found in</th><th class="n">Look up</th></tr></thead><tbody id="sw-apps"></tbody></table></div></div>
+    <div>
+      <div class="sheet-form-head"><h3 id="sw-pkg-title">Packages</h3><label class="search"><span class="sr-only">Find a package</span><input class="input" id="sw-pkg-q" type="search" placeholder="Find a package…" autocomplete="off" spellcheck="false"></label></div>
+      <div class="table-wrap"><table><thead><tr><th>Package</th><th>Version</th><th>From</th></tr></thead><tbody id="sw-pkgs"></tbody></table></div>
+    </div>
+  </div>
 </dialog>
 
 <!-- One container, in detail -->

@@ -137,6 +137,20 @@ func (d *DB) migrate() error {
 			value TEXT NOT NULL
 		)`,
 
+		// The software inventory: one row per scanned target, and the OSV
+		// advisories already fetched (refetched only when they change).
+		`CREATE TABLE IF NOT EXISTS inventory (
+			key        TEXT PRIMARY KEY,
+			data       TEXT NOT NULL,
+			scanned_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS vuln_cache (
+			id         TEXT PRIMARY KEY,
+			modified   TEXT NOT NULL DEFAULT '',
+			data       TEXT NOT NULL,
+			fetched_at TEXT NOT NULL
+		)`,
+
 		// Older versions wrote a mix of "YYYY-MM-DD HH:MM:SS" and RFC3339.
 		// Rewrite anything not already in tsLayout; no-op on clean databases.
 		`UPDATE connections SET timestamp = strftime('%Y-%m-%dT%H:%M:%SZ', timestamp)

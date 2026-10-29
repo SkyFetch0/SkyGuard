@@ -67,6 +67,7 @@ type Container struct {
 	NetworkMode string     `json:"network_mode,omitempty"` // Docker: host, none, container:<id>
 	Project     string     `json:"project,omitempty"`      // Docker Compose project
 	Self        bool       `json:"self,omitempty"`         // SkyGuard's own container
+	PID         int        `json:"-"`                      // its first process on the host, 0 when not running (Incus lists it)
 
 	// Filled in by Inspect only.
 	Restart        string   `json:"restart,omitempty"`

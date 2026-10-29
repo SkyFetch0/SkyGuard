@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/skyguard/skyguard/internal/dashboard"
 	"github.com/skyguard/skyguard/internal/firewall"
 	"github.com/skyguard/skyguard/internal/honeypot"
+	"github.com/skyguard/skyguard/internal/inventory"
 	"github.com/skyguard/skyguard/internal/netutil"
 	"github.com/skyguard/skyguard/internal/portrules"
 	"github.com/skyguard/skyguard/internal/proxy"
@@ -75,6 +77,7 @@ type Server struct {
 	portGuard *firewall.PortGuard // nil without a usable iptables
 	addrs     addrCache
 	ctr       *containers.Manager // nil without the dashboard
+	inv       *inventory.Manager  // nil without the dashboard
 
 	eventLogger *honeypot.EventLogger
 
@@ -141,6 +144,10 @@ func New(cfg *config.Config, db *storage.DB, logger *slog.Logger) (*Server, erro
 		s.ctr = s.containerManager()
 		s.dash.SetContainers(s.ctr)
 		s.dash.SetPortRules(s.ports, s.PortListeners)
+		root, reason := hostRoot()
+		s.inv = inventory.NewManager(inventory.Options{Store: db, Containers: s.ctr, HostRoot: root, HostReason: reason,
+			Logger: logger.With("component", "inventory")})
+		s.dash.SetSoftware(s.inv)
 	}
 	s.warnRiskyConfig()
 	return s, nil
@@ -229,7 +236,33 @@ func (s *Server) Start(ctx context.Context) error {
 
 	s.wg.Add(1)
 	go s.maintenanceLoop(ctx)
+	if s.inv != nil {
+		go s.inv.Run(ctx)
+	}
 	return nil
+}
+
+// hostRoot is where the server's own files are for the software scan: "/"
+// natively; from a container, the server's root mounted at /host, else the
+// host's first process's root, visible only when the container shares the
+// host's PID namespace and may look into that process.
+func hostRoot() (string, string) {
+	if _, err := os.Stat("/.dockerenv"); err != nil {
+		return "/", ""
+	}
+	// the server's root mounted read-only at /host is the surest way in
+	if fi, err := os.Stat("/host/etc"); err == nil && fi.IsDir() {
+		return "/host", ""
+	}
+	const hint = "mount it read-only in SkyGuard's docker-compose.yml (- /:/host:ro)"
+	comm, _ := os.ReadFile("/proc/1/comm")
+	if strings.TrimSpace(string(comm)) == "skyguard" {
+		return "", "SkyGuard runs in a container that cannot see the server's files: " + hint
+	}
+	if _, err := os.Stat("/proc/1/root/etc"); err != nil {
+		return "", "the server's files are not readable from SkyGuard's container (" + err.Error() + "): " + hint
+	}
+	return "/proc/1/root", ""
 }
 
 // listenHint turns the two most common listen failures into actionable advice.

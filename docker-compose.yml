@@ -14,6 +14,9 @@ services:
     # Lets the Ports screen see what runs behind the extra IPs this host
     # routes to Incus instances or containers (their network namespaces and
     # listening ports). Without it the addresses are still found and covered.
+    # The Software screen also reads running containers and Incus instances
+    # through it; without it only Docker containers are read, through the
+    # Docker API.
     # pid: host
     cap_add:
       - NET_ADMIN
@@ -32,6 +35,9 @@ services:
       # that SkyGuard must see the file at the same path as the host does.
       # Mount the folder your projects live in, e.g.:
       # - /opt:/opt
+      # The Software screen reads the server's own installed packages from
+      # here. Read-only; nothing in it is ever run.
+      # - /:/host:ro
     environment:
       - SKYGUARD_CONFIG=/etc/skyguard/skyguard.yaml
       - TZ=Europe/Istanbul   # only affects log display; data is stored in UTC

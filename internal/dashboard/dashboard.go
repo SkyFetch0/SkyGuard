@@ -18,6 +18,7 @@ import (
 	"github.com/skyguard/skyguard/internal/config"
 	"github.com/skyguard/skyguard/internal/containers"
 	"github.com/skyguard/skyguard/internal/firewall"
+	"github.com/skyguard/skyguard/internal/inventory"
 	"github.com/skyguard/skyguard/internal/netutil"
 	"github.com/skyguard/skyguard/internal/portrules"
 	"github.com/skyguard/skyguard/internal/storage"
@@ -67,6 +68,7 @@ type Dashboard struct {
 	ctr      *containers.Manager // nil unless the config enables an engine
 	ports    *portrules.Manager  // nil until the server sets it
 	upd      *update.Manager     // nil until main sets it
+	inv      *inventory.Manager  // nil until the server sets it
 	mcp      *mcpService
 	logger   *slog.Logger
 	server   *http.Server
@@ -184,6 +186,7 @@ func (d *Dashboard) routes() http.Handler {
 	d.containerRoutes(api)
 	d.portRoutes(api)
 	d.updateRoutes(api)
+	d.softwareRoutes(api)
 	d.mcpRoutes(api)
 
 	var protected http.Handler = api
